@@ -1,4 +1,4 @@
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 from abc import ABC, abstractmethod
 from typing import ClassVar, Any
@@ -20,6 +20,11 @@ from .callbacks import OpCallbacks, ForLoopCallbacks
 from .patch import patch_lang, unpatch_lang
 from .frontend.base import get_frontend
 from .config import config as cfg
+
+
+# (jit_fn, args, kwargs) -> (args, kwargs): the arguments a real compile of
+# one JITFunction call must see, supplied by the trace.
+RealArgs = Callable[[Any, tuple, dict], tuple[tuple, dict]]
 
 
 class Client(ABC):
@@ -116,6 +121,43 @@ class Client(ABC):
         self._set_thread_local("grid_idx", value)
 
 
+class _WarmupGate:
+    """The warmup one ClientManager.patch_warmup scope puts on a jit_fn.
+
+    It calls through to ``inner``, the warmup it found, and hides
+    ``below``, the instance-level warmup it replaced (None: there was none,
+    so the class's). Overlapping scopes on one jit_fn (e.g. on two host
+    threads) stack their gates and may close in any order: ``remove`` takes
+    a gate out wherever it sits, so once every scope has closed, jit_fn
+    holds exactly the warmup it held before the first one opened.
+    """
+
+    def __init__(self, jit_fn: Any, vote: Callable[[Any, tuple, dict], Any]):
+        self.inner = jit_fn.warmup
+        self.below = vars(jit_fn).get("warmup")
+        self._vote = vote
+
+    def __call__(self, *args, **kwargs):
+        return self._vote(self.inner, args, kwargs)
+
+    def remove(self, jit_fn: Any) -> None:
+        top = vars(jit_fn).get("warmup")
+        if top is self:
+            # Leave no bound method behind in the instance dict: it would
+            # hide a later class-level change to JITFunction.warmup.
+            if self.below is None:
+                del jit_fn.warmup
+            else:
+                jit_fn.warmup = self.below
+            return
+        # A gate put on later sits above this one: route it past this one.
+        while isinstance(top, _WarmupGate):
+            if top.below is self:
+                top.inner, top.below = self.inner, self.below
+                return
+            top = top.below
+
+
 class ClientManager:
     def __init__(self, clients: list[Client] | None = None):
         self.clients: dict[str, Client] = {}
@@ -143,59 +185,78 @@ class ClientManager:
                 self.clients[new_client.NAME] = new_client
 
     @contextmanager
-    def patch_warmup(self, jit_fn):
+    def patch_warmup(
+        self,
+        jit_fn,
+        compile_context: Callable[[], AbstractContextManager] = nullcontext,
+        real_args: RealArgs | None = None,
+    ):
+        """Gate ``jit_fn.warmup`` on this manager's warmup votes for the
+        scope. The real compile, and only it, runs inside
+        ``compile_context()``, on the arguments ``real_args`` maps the call
+        to. On exit the scope takes its gate out again (see _WarmupGate).
+        """
         if not hasattr(jit_fn, "warmup"):
             yield
             return
 
-        def patcher(fn):
-            @wraps(fn)
-            def wrapped(*args, **kwargs):
-                if all(
-                    not client.pre_warmup_callback(jit_fn, *args, **kwargs)
-                    for client in self.clients.values()
-                ):
-                    return None
-                kwargs.pop("warmup", None)
-                ret = fn(*args, **kwargs)
-                for client in self.clients.values():
-                    client.post_warmup_callback(jit_fn, ret)
-                return ret
+        def vote(warmup, args, kwargs):
+            # Poll every client, also after a True vote, so each one sees
+            # pre_warmup_callback before the post_warmup_callback all get.
+            votes = [
+                client.pre_warmup_callback(jit_fn, *args, **kwargs)
+                for client in self.clients.values()
+            ]
+            if not any(votes):
+                return None
+            kwargs.pop("warmup", None)
+            if real_args is not None:
+                args, kwargs = real_args(jit_fn, args, kwargs)
+            with compile_context():
+                ret = warmup(*args, **kwargs)
+            for client in self.clients.values():
+                client.post_warmup_callback(jit_fn, ret)
+            return ret
 
-            return wrapped
-
-        jit_fn.warmup = patcher(jit_fn.warmup)
+        gate = _WarmupGate(jit_fn, vote)
+        jit_fn.warmup = gate
         try:
             yield
         finally:
-            jit_fn.warmup = jit_fn.warmup.__wrapped__
+            gate.remove(jit_fn)
 
     @contextmanager
     def patch_run(self, fn, frontend_name: str):
         frontend = get_frontend(frontend_name)
         namespaces = frontend.namespaces
+        # Every launch gets its own Launch, so the entries TraceInterface
+        # appends to `launches` stay distinct.
+        self.launch = Launch()
         with patch_calls(frontend_name):
-            # Collect all for-loop callbacks from clients
-            all_loop_callbacks = []
-            for client in self.clients.values():
-                for namespace, attrs in namespaces.items():  # patch ops
-                    for attr, op in attrs.items():
-                        callbacks = client.register_op_callback(op)
-                        patch_op(
-                            namespace,
-                            attr,
-                            callbacks,
-                            frontend_name=frontend_name,
-                        )
-                all_loop_callbacks.append(client.register_for_loop_callback())
-
-            self._populate_loop_hooks(all_loop_callbacks)
-            patch_for_loop(frontend_name)
-            patch_lang(fn, frontend_name, client_manager=self)
+            lang_patched = False
             try:
+                # Collect all for-loop callbacks from clients
+                all_loop_callbacks = []
+                for client in self.clients.values():
+                    for namespace, attrs in namespaces.items():  # patch ops
+                        for attr, op in attrs.items():
+                            callbacks = client.register_op_callback(op)
+                            patch_op(
+                                namespace,
+                                attr,
+                                callbacks,
+                                frontend_name=frontend_name,
+                            )
+                    all_loop_callbacks.append(client.register_for_loop_callback())
+
+                self._populate_loop_hooks(all_loop_callbacks)
+                patch_for_loop(frontend_name)
+                patch_lang(fn, frontend_name, client_manager=self)
+                lang_patched = True
                 yield
             finally:
-                unpatch_lang(frontend_name)
+                if lang_patched:
+                    unpatch_lang(frontend_name)
                 for namespace, attrs in namespaces.items():
                     for attr, op in attrs.items():
                         unpatch_op(namespace, attr, frontend_name)
@@ -215,10 +276,20 @@ class ClientManager:
     def finalize(self) -> None:
         with self._lock_context():
             self.launch.records = []
+            # Finalize every client even if a peer raises (SystemExit
+            # included), so none carries this launch's state into the next;
+            # then re-raise the first failure.
+            first_exc: BaseException | None = None
             for client in self.clients.values():
-                # client may introduce tensors not declared in kernel args (e.g. tracer recording a tensor allocation)
-                self.launch.tensors.update(getattr(client, "tensors", []) or [])
-                self.launch.records += client.finalize()
+                try:
+                    # client may introduce tensors not declared in kernel args (e.g. tracer recording a tensor allocation)
+                    self.launch.tensors.update(getattr(client, "tensors", []) or [])
+                    self.launch.records += client.finalize()
+                except BaseException as exc:
+                    if first_exc is None:
+                        first_exc = exc
+            if first_exc is not None:
+                raise first_exc
 
     def arg_callback(self, name, arg, arg_cvt):
         with self._lock_context():
