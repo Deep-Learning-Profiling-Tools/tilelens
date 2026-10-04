@@ -9,6 +9,7 @@ tensors where a view's layout matters.
 
 from __future__ import annotations
 
+import gc
 import pickle
 import subprocess
 import sys
@@ -929,6 +930,67 @@ def test_a_value_also_read_directly_is_checked_unguarded():
     assert (f.kind, f.line_no) == ("integer-overflow", _line(text, "arith.muli"))
 
 
+# A loop bound (the step; the lower bound) wraps in the arm of a select on
+# %m, taken where m < 100; the loop reads the bound itself.
+_BOUND_IN_ARM = {
+    "step truncated": (
+        """
+        %c0 = arith.constant 0 : i32
+        %c100 = arith.constant 100 : i32
+        %c1000 = arith.constant 1000 : i32
+        %small = arith.cmpi slt, %m, %c100 : i32
+        %t = arith.trunci %n : i32 to i8
+        %e = arith.extsi %t : i8 to i32
+        %sel = arith.select %small, %e, %c0 : i32
+        scf.for %i = %c0 to %c1000 step %n : i32 {
+          %o = arith.addi %i, %sel : i32
+          %a = tt.addptr %p, %o : !tt.ptr<i32>, i32
+          tt.store %a, %c0 : !tt.ptr<i32>
+        }""",
+        300,
+        "arith.trunci",
+    ),
+    "lower bound read unsigned": (
+        """
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        %c8 = arith.constant 8 : i32
+        %c64 = arith.constant 64 : i32
+        %c100 = arith.constant 100 : i32
+        %hi = arith.addi %n, %c8 : i32
+        %small = arith.cmpi slt, %m, %c100 : i32
+        %u = arith.minui %n, %c8 : i32
+        %sel = arith.select %small, %u, %c0 : i32
+        scf.for %i = %n to %hi step %c1 : i32 {
+          %j = arith.addi %i, %c64 : i32
+          %o = arith.addi %j, %sel : i32
+          %a = tt.addptr %p, %o : !tt.ptr<i32>, i32
+          tt.store %a, %c0 : !tt.ptr<i32>
+        }""",
+        -10,
+        "arith.minui",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_BOUND_IN_ARM))
+def test_a_loop_bound_wrapping_in_a_discarded_arm_is_no_finding(case):
+    """A wrap in a select's untaken arm, now in a loop bound: the loop
+    reads the bound itself, but that read is the loop's (checked with the
+    loop's obligations), so the access reads the wrapping op only through
+    the arm: its wrap matters only where the select takes the arm."""
+    body, n, op = _BOUND_IN_ARM[case]
+    g, text = _module(body, "%p: !tt.ptr<i32>, %n: i32, %m: i32")
+
+    def at(m):
+        return check_graph(g, _bind(params={"arg1": n, "arg2": m}, arg0=_facts(1300)))
+
+    _clean(at(500))
+    (f,) = at(5).findings
+    assert (f.kind, f.line_no) == ("integer-overflow", _line(text, op))
+    assert f.witness["value"] == n
+
+
 def test_undefined_divisions_count_in_either_arm():
     """where(n != 0, pid // n, 0) divides by zero in the discarded arm too
     (the GPU run faults), and so does INT_MIN // -1."""
@@ -1148,6 +1210,45 @@ def test_a_real_ctrl_c_stops_a_hard_query():
         "interrupted KeyboardInterrupt('Z3 query"
     ), proc.stdout
     assert int(proc.stdout.split()[-1]) < 30
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        # a loop (its iteration lowers the bounds) and a finding's witness
+        _MATMUL_PARAMS,
+        # the loop refused: its bound reads K, which has no binding
+        {name: v for name, v in _MATMUL_PARAMS.items() if name != "K"},
+    ],
+    ids=["finding", "refused-loop"],
+)
+def test_a_check_leaves_no_z3_object_to_the_cyclic_gc(params):
+    """A check's Z3 context and terms are freed by reference counting when
+    check_graph returns: the cyclic GC would free them later, on whichever
+    host thread it runs, inside that thread's own Z3 call."""
+    tensors = _all(128 * 128, "a_ptr", "b_ptr", "c_ptr", elem_size=2)
+    graph = _graph(MATMUL)
+    binding = _bind((3, 2, 1), params, **tensors)
+
+    def z3_objects() -> int:
+        # type(): isinstance would read __class__, which some objects warn on
+        z3_types = (z3.Context, z3.AstRef)
+        return sum(issubclass(type(o), z3_types) for o in gc.get_objects())
+
+    check_graph(graph, binding)
+    gc.collect()
+    gc.disable()
+    try:
+        before = z3_objects()
+        result = check_graph(graph, binding)
+        after = z3_objects()
+    finally:
+        gc.enable()
+    if "K" in params:
+        assert result.findings
+    else:
+        assert K.MISSING_BINDING in {kind for _, kind in result.abstained}
+    assert after == before
 
 
 _THREADS_SCRIPT = """
