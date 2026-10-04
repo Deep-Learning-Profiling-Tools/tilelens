@@ -14,6 +14,16 @@ SANITIZER_COMMAND = "tile-sanitizer"
 PROFILER_COMMAND = "tile-profiler"
 RACE_DETECTOR_COMMAND = "tile-race"
 
+# tile-sanitizer's flag for the compiled sanitizer, given before the script
+# name.
+COMPILE_FLAG = "--compile"
+COMPILE_NOTE = (
+    f"[{COMPILE_FLAG}] kernel launches are compiled and checked, not run: "
+    "their outputs are never written, so the script sees them unchanged, and "
+    "a launch whose arguments it computes from them is checked with those "
+    "values"
+)
+
 # Former Triton-Viz command names, still installed as aliases.
 LEGACY_COMMANDS = {
     SANITIZER_COMMAND: "triton-sanitizer",
@@ -31,6 +41,14 @@ def sanitizer_wrapper(kernel, *, frontend: str = "triton"):
     abort_on_error = True
     tracer = tilelens.trace(
         client=Sanitizer(abort_on_error=abort_on_error),
+        frontend=frontend,
+    )
+    return tracer(kernel)
+
+
+def compiled_sanitizer_wrapper(kernel, *, frontend: str = "triton"):
+    tracer = tilelens.trace(
+        client=Sanitizer(compile=True, abort_on_error=True),
         frontend=frontend,
     )
     return tracer(kernel)
@@ -78,9 +96,11 @@ def create_patched_autotune(wrapper_func):
     return _patched_autotune
 
 
-def _apply_wrapper(wrapper_func, command_name, usage_msg):
+def _apply_wrapper(wrapper_func, command_name, usage_msg, compile_wrapper=None):
     """
     Generic function to apply a wrapper to triton.jit and run the user script.
+    A command with a ``compile_wrapper`` uses it instead when its first
+    argument is COMPILE_FLAG.
     """
     legacy_command = LEGACY_COMMANDS[command_name]
     if os.path.basename(sys.argv[0]) not in (command_name, legacy_command):
@@ -90,6 +110,11 @@ def _apply_wrapper(wrapper_func, command_name, usage_msg):
         )
 
     cfg.cli_active = True
+
+    if compile_wrapper is not None and sys.argv[1:2] == [COMPILE_FLAG]:
+        del sys.argv[1]
+        wrapper_func = compile_wrapper
+        print(COMPILE_NOTE, file=sys.stderr)
 
     # Patch Triton kernels with the Triton frontend.
     _patched_jit = create_patched_jit(
@@ -149,12 +174,21 @@ def _apply_wrapper(wrapper_func, command_name, usage_msg):
 
 def apply_sanitizer():
     """
-    Apply the sanitizer wrapper to triton.jit and run the user script.
+    Apply the sanitizer wrapper to triton.jit and run the user script; with
+    ``--compile`` before the script, the compiled sanitizer's.
     """
     _apply_wrapper(
         sanitizer_wrapper,
         SANITIZER_COMMAND,
-        f"Usage: {SANITIZER_COMMAND} <script.py> [args...]",
+        f"Usage: {SANITIZER_COMMAND} [{COMPILE_FLAG}] <script.py> [args...]\n"
+        f"  {COMPILE_FLAG}  check each launch against the compiled kernel "
+        "(Sanitizer(compile=True)) instead of interpreting it; kernels are not "
+        "run, so their outputs are never written. An 'ok' holds for the "
+        "arguments each launch was called with. Kernels are compiled on the "
+        "host (no GPU needed) for TILELENS_IR_TARGET, by default cuda:89 "
+        "(e.g. cuda:90, hip:gfx942); a config that fails to compile for it is "
+        "reported as not checked, and the script goes on.",
+        compile_wrapper=compiled_sanitizer_wrapper,
     )
 
 
