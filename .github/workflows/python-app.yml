@@ -21,6 +21,10 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # Keep `uv run` from re-syncing the environment to the lockfile, which
+      # would undo the Triton 3.8 pin installed with `uv pip install`.
+      UV_NO_SYNC: "1"
 
     steps:
     - uses: actions/checkout@v3
@@ -48,11 +52,11 @@ jobs:
         cd tilelens
         uv sync --extra test
 
-    - name: Upgrade Triton to latest from main
+    - name: Install Triton 3.8
       run: |
         cd tilelens
-        uv pip install --pre -U triton
-        uv pip install "git+https://github.com/triton-lang/triton.git#subdirectory=python/triton_kernels"
+        uv pip install triton==3.8.0
+        uv pip install "git+https://github.com/triton-lang/triton.git@v3.8.0#subdirectory=python/triton_kernels"
 
     - name: Run frontend tests
       run: |
@@ -70,11 +74,11 @@ jobs:
         cd tilelens
         uv sync --extra test --extra nki
 
-    - name: Upgrade Triton to latest from main (NKI)
+    - name: Install Triton 3.8 (NKI)
       run: |
         cd tilelens
-        uv pip install --pre -U triton
-        uv pip install "git+https://github.com/triton-lang/triton.git#subdirectory=python/triton_kernels"
+        uv pip install triton==3.8.0
+        uv pip install "git+https://github.com/triton-lang/triton.git@v3.8.0#subdirectory=python/triton_kernels"
 
     - name: Run full (Triton + NKI) pytest suite
       run: |

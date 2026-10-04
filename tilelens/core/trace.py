@@ -2,13 +2,14 @@ import copy
 import inspect
 from contextlib import contextmanager
 from collections.abc import Callable
+from types import MappingProxyType
 from typing import Any
 from ..utils.traceback_utils import CODE_KEYS, get_code_key
 
 from .config import config as cfg
 from ..clients import Sanitizer, Profiler, RaceDetector, Tracer
 from ..clients.race_detector.race_detector import NullRaceDetector
-from .client import ClientManager, Client
+from .client import ClientManager, Client, LaunchCall, LanguagePatchedError
 from .data import Launch
 import types
 
@@ -19,6 +20,20 @@ launches: list[Launch] = []
 def _without_warmup(kwargs: dict[str, Any]) -> dict[str, Any]:
     # Launch kwargs carry warmup=False; the warmup entry points set their own.
     return {k: v for k, v in kwargs.items() if k != "warmup"}
+
+
+def _launch_call(
+    jit_fn: Any, args: tuple, kwargs: dict[str, Any], *, capture: bool
+) -> LaunchCall:
+    return LaunchCall(
+        jit_fn=jit_fn,
+        args=tuple(args),
+        kwargs=MappingProxyType(
+            {k: v for k, v in kwargs.items() if k not in ("grid", "warmup")}
+        ),
+        grid=kwargs.get("grid"),
+        capture=capture,
+    )
 
 
 def _rebind_closure(fn: Any, old: Any, new: Any) -> Any:
@@ -69,8 +84,24 @@ class TraceInterface:
         self.client_manager.add_clients([self._normalize_client(new_client)])
 
     def finalize(self):
+        # Take the Launch first: once finalize ends the launch, another host
+        # thread may begin the next one on this manager.
+        launch = self.client_manager.launch
         self.client_manager.finalize()
-        launches.append(self.client_manager.launch)
+        launches.append(launch)
+
+    @contextmanager
+    def _launch_scope(self, call: LaunchCall):
+        """begin_launch, then abort_launch if the launch raises. A refused or
+        failing begin_launch cleans up after itself and is not aborted: the
+        refusal must not reach the clients of another thread's launch."""
+        mgr = self.client_manager
+        mgr.begin_launch(call)
+        try:
+            yield
+        except BaseException as exc:
+            mgr.abort_launch(exc)
+            raise
 
 
 class LaunchInterface:
@@ -119,25 +150,84 @@ class KernelTraceSupport:
             return None
         return self._rebuild_runner(runner, jit_fn, interpreted=False)
 
-    def _rebuild_runner(self, runner: Any, leaf: Any, *, interpreted: bool) -> Any:
+    def _ir_runner(self, runner: Any, jit_fn: Any | None) -> Any | None:
+        if jit_fn is None:
+            return None
+        return self._rebuild_runner(runner, _IRLeaf(jit_fn), interpreted=False, ir=True)
+
+    def _autotuned(self, runner: Any) -> bool:
+        """Whether an Autotuner layer sits anywhere in ``runner``'s chain."""
+        while self._is_autotuner(runner) or self._is_heuristics(runner):
+            if self._is_autotuner(runner):
+                return True
+            runner = runner.fn
+        return False
+
+    def _drop_autotuner_args(self, runner: Any) -> None:
+        """Clear the per-call tensors Autotuner layers in ``runner``'s chain
+        of copies may still hold: ``nargs`` and ``restore_copies``.
+
+        Autotuner.run and .warmup keep the call's arguments in ``nargs``
+        until they return, and a benchmark call keeps its restore_value
+        clones in ``restore_copies`` until its post_hook, which _bench skips
+        for a KeyboardInterrupt. So a launch that raises would leave the
+        caller's tensors, or device clones of them, on a copy that outlives
+        the launch.
+        """
+        while self._is_autotuner(runner) or self._is_heuristics(runner):
+            if self._is_autotuner(runner):
+                runner.nargs = None
+                if hasattr(runner, "restore_copies"):
+                    runner.restore_copies = {}
+            runner = runner.fn
+
+    def _rebuild_runner(
+        self, runner: Any, leaf: Any, *, interpreted: bool, ir: bool = False
+    ) -> Any:
         """Rebuild the Autotuner/Heuristics chain of ``runner`` on top of ``leaf``.
 
         Every layer is shallow-copied down to the kernel, which ``leaf``
         replaces, so the user's runner is never mutated. No deepcopy: a real
         JITFunction holds an RLock. A nested trace is looked through so the
-        layers it wraps are kept.
+        layers it wraps are kept. ``ir``: the chain whose warmup stands in
+        for the launch's autotuning (the IR clients' compiles).
         """
         if isinstance(runner, (TritonTrace, GluonTrace)):
             runner = runner.fn
         if not (self._is_autotuner(runner) or self._is_heuristics(runner)):
             return leaf
         layer = copy.copy(runner)
-        layer.fn = self._rebuild_runner(runner.fn, leaf, interpreted=interpreted)
+        layer.fn = self._rebuild_runner(runner.fn, leaf, interpreted=interpreted, ir=ir)
         if self._is_autotuner(layer):
             self._isolate_autotuner(runner, layer, interpreted=interpreted)
+            if ir:
+                layer.prune_configs = self._refusing_conflicts(layer)
         elif not interpreted:
             layer.warmup = self._heuristics_warmup(layer)
         return layer
+
+    @staticmethod
+    def _refusing_conflicts(layer: Any) -> Callable:
+        # The launch's autotuning benchmarks each pruned config first, and
+        # Autotuner._bench refuses a call that passes one of the config's
+        # meta-parameters itself, with this ValueError (as Triton words it).
+        # Autotuner.warmup, through which the IR clients' compiles
+        # go instead, would pass the keyword twice (a TypeError naming the
+        # IR leaf), so the IR chain's copy checks the pruned configs first.
+        prune = layer.prune_configs
+
+        def prune_configs(kwargs):
+            pruned = prune(kwargs)
+            for config in pruned:
+                conflicts = kwargs.keys() & config.kwargs.keys()
+                if conflicts:
+                    raise ValueError(
+                        f"Conflicting meta-parameters: {', '.join(conflicts)}."
+                        " Make sure that you don't re-define auto-tuned symbols."
+                    )
+            return pruned
+
+        return prune_configs
 
     def _isolate_autotuner(
         self, original: Any, layer: Any, *, interpreted: bool
@@ -232,7 +322,10 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
         else:
             self.jit_fn, self.base_fn, self.interpreted_fn = unpack_kernel(runner)
         self.runner = self._interpreter_runner(runner, self.interpreted_fn)
+        # The real chain for the interpreted launches' warmup votes, and one
+        # for the IR clients' host compiles, which no warmup patch gates.
         self.warmup_runner = self._warmup_runner(runner, self.jit_fn)
+        self.ir_runner = self._ir_runner(runner, self.jit_fn)
 
         self.arg_names = runner.arg_names
 
@@ -243,12 +336,85 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
         self._copy_callable_attrs(runner, self.base_fn, src_fallback=self.jit_fn)
 
     def run(self, *args, **kwargs):
+        mgr = self.client_manager
+        has_ir = bool(mgr.ir_clients())
+        capture = has_ir and self.jit_fn is not None
+        call = _launch_call(self.jit_fn, args, kwargs, capture=capture)
+        with self._launch_scope(call):
+            if not has_ir:
+                return self._run_interpreted(*args, **kwargs)
+            if mgr.interpreting_clients():
+                if capture:
+                    # Mixed trace: host-compile every config for the IR
+                    # clients, then the interpreter produces the outputs (no
+                    # real launch, no device). A call that does not bind the
+                    # kernel's parameters raises here, as in an IR-only trace,
+                    # before the interpreter runs: the interpreted run would
+                    # fail on the same call (with Python's own TypeError for
+                    # the kernel function), and the error raised is the one
+                    # the untraced JIT raises.
+                    self._compile_for_ir(args, kwargs)
+                return self._run_interpreted(*args, **kwargs)
+            # Only IR clients, none of which runs the real kernel (see
+            # Client.LAUNCH). Without a JITFunction (TRITON_INTERPRET / an
+            # InterpretedFunction runner; call.capture is False) there is no
+            # compiled kernel for them either, so nothing runs.
+            ret = self._run_compiled(*args, **kwargs) if capture else None
+            self.finalize()
+            return ret
+
+    def _compile_for_ir(self, args, kwargs):
+        """Compile every (pruned) config through the IR runner's warmup; the
+        capture host-compiles each call for the IR clients' target and turns
+        it into an IR event, or a compile_failed event, without launching or
+        touching a device. Returns the warmup result and the capture window:
+        for a plain or @heuristics kernel the host-compiled kernel (None if
+        it failed to compile).
+        """
+        runner = self.ir_runner
+        assert runner is not None  # built whenever jit_fn is set
+        try:
+            with (
+                self._real_compile_window(),
+                self.client_manager.ir_capture(
+                    self.jit_fn, real_args=_untraced_call_args
+                ) as window,
+            ):
+                ret = runner.warmup(*args, **_without_warmup(kwargs))
+        finally:
+            self._drop_autotuner_args(runner)
+        return ret, window
+
+    def _run_compiled(self, *args, **kwargs):
+        """IR-only trace: no interpreter, no real launch.
+
+        Returns what it can of the untraced return value: the host-compiled
+        kernel when no Autotuner is involved (its only config; never loaded,
+        it cannot launch; None if it failed to compile), None for an
+        autotuned kernel (no config was picked). Only a compile refused
+        while an interpreted traced launch has the language patched
+        (LanguagePatchedError, no compile's outcome: concurrent traced
+        launches that mix interpretation and host compiles are unsupported)
+        fails the launch, and a call that does not bind the kernel's
+        parameters, which raises the JIT binder's error as the untraced call
+        does.
+        """
+        ret, window = self._compile_for_ir(args, kwargs)
+        refused = [e for e in window.failures if isinstance(e, LanguagePatchedError)]
+        if refused:
+            raise refused[0]
+        return None if self._autotuned(self.ir_runner) else ret
+
+    def _run_interpreted(self, *args, **kwargs):
         self._voted_warmup(*args, **kwargs)
 
         with self.client_manager.patch_run(self.base_fn, frontend_name="triton"):
             kwargs.update({"client_manager": self.client_manager})
             kwargs.update({"jit_fn": self.jit_fn})
-            ret = self.runner.run(*args, **kwargs)
+            try:
+                ret = self.runner.run(*args, **kwargs)
+            finally:
+                self._drop_autotuner_args(self.runner)
             self.finalize()
             return ret
 
@@ -281,9 +447,9 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
                 "tilelens does not unwrap; use its JITFunction "
                 f"({self.__name__}.jit_fn) there instead."
             )
-        # check that client sets match for calling and called functions
-        outer_clients = set(outer_client_manager.clients)
-        inner_clients = set(self.client_manager.clients)
+        # Only interpreting clients take part in the interpreted run.
+        outer_clients = {c.NAME for c in outer_client_manager.interpreting_clients()}
+        inner_clients = {c.NAME for c in self.client_manager.interpreting_clients()}
         if outer_clients != inner_clients:
             raise RuntimeError(
                 "nested traced calls require matching clients; "
@@ -304,7 +470,38 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
             compile_context=self._real_compile_window,
             real_args=_untraced_call_args,
         ):
-            return self.warmup_runner.warmup(*args, **_without_warmup(kwargs))
+            try:
+                return self.warmup_runner.warmup(*args, **_without_warmup(kwargs))
+            finally:
+                self._drop_autotuner_args(self.warmup_runner)
+
+
+class _IRLeaf:
+    """The traced JITFunction at the bottom of the IR runner chain.
+
+    Its warmup is the JITFunction class's, so no instance-level warmup patch
+    (patch_warmup's vote gate, or anyone else's) decides whether an IR
+    config compiles; everything else, ``run`` (where ir_capture sits, and
+    host-compiles instead of entering JITFunction.run) included, is the
+    JITFunction instance's. Its ``fn`` is the JITFunction too, as Triton's
+    Autotuner expects when it follows ``.fn`` from its own down to the
+    JITFunction it tunes.
+    """
+
+    def __init__(self, jit_fn: Any) -> None:
+        self.jit_fn = jit_fn
+
+    @property
+    def fn(self) -> Any:
+        return self.jit_fn
+
+    def warmup(self, *args, **kwargs):
+        return type(self.jit_fn).warmup(self.jit_fn, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "jit_fn":  # not set yet (e.g. mid-copy): no recursion
+            raise AttributeError(name)
+        return getattr(self.jit_fn, name)
 
 
 def _untraced_call_args(
@@ -521,23 +718,29 @@ class NKITrace(LaunchInterface, TraceInterface):
             if you want full python flexibility inside kernels (e.g. importing modules inside a kernel).
             Does nothing if self.frontend_name == 'nki'.
         """
-        if self.frontend_name == "nki_beta2" and pre_trace:
-            import nki
+        with self._launch_scope(_launch_call(None, args, kwargs, capture=False)):
+            if not self.client_manager.interpreting_clients():
+                # Only IR clients: there is no compiled kernel here, and the
+                # real kernel never runs for them, so nothing runs.
+                self.finalize()
+                return None
+            if self.frontend_name == "nki_beta2" and pre_trace:
+                import nki
 
-            kwargs.pop("warmup", None)
-            grid = kwargs.pop("grid", None)
-            nki.trace(self.func, grid=grid, platform_target=platform_target).specialize(
-                *args, **kwargs
-            )
-            kwargs["grid"] = grid
-        with self.client_manager.patch_run(
-            self.func,
-            frontend_name=self.frontend_name,
-        ):
-            kwargs.update({"client_manager": self.client_manager})
-            ret = self.interpreter_fn.run(*args, **kwargs)
-            self.finalize()
-            return ret
+                kwargs.pop("warmup", None)
+                grid = kwargs.pop("grid", None)
+                nki.trace(
+                    self.func, grid=grid, platform_target=platform_target
+                ).specialize(*args, **kwargs)
+                kwargs["grid"] = grid
+            with self.client_manager.patch_run(
+                self.func,
+                frontend_name=self.frontend_name,
+            ):
+                kwargs.update({"client_manager": self.client_manager})
+                ret = self.interpreter_fn.run(*args, **kwargs)
+                self.finalize()
+                return ret
 
 
 class GluonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
@@ -579,17 +782,23 @@ class GluonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
                 "GluonTrace.run() missing required keyword argument: 'grid'"
             )
 
-        with self.client_manager.patch_run(self.base_fn, frontend_name="gluon"):
-            try:
-                ret = self.runner.run(
-                    *args,
-                    **kwargs,
-                    client_manager=self.client_manager,
-                )
-            finally:
-                self.client_manager.post_run_callback(self.base_fn)
-            self.finalize()
-            return ret
+        with self._launch_scope(_launch_call(None, args, kwargs, capture=False)):
+            if not self.client_manager.interpreting_clients():
+                # Only IR clients: there is no compiled kernel here, and the
+                # real kernel never runs for them, so nothing runs.
+                self.finalize()
+                return None
+            with self.client_manager.patch_run(self.base_fn, frontend_name="gluon"):
+                try:
+                    ret = self.runner.run(
+                        *args,
+                        **kwargs,
+                        client_manager=self.client_manager,
+                    )
+                finally:
+                    self.client_manager.post_run_callback(self.base_fn)
+                self.finalize()
+                return ret
 
     def __call__(self, *args, **kwargs):
         return self.fn(*args, **kwargs)
