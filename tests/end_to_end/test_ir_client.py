@@ -272,3 +272,20 @@ def test_another_triton_release_compiles_nothing_and_goes_on(monkeypatch):
     ((), (failure,)) = ir.logs[0]
     unavailable = host_compile_unavailable(failure.error)
     assert "supports Triton 3.8.x only" in str(unavailable)
+
+
+def test_the_real_reader_through_the_parse_cache():
+    ir = _ToyIR()  # ParseCache's default reader: tilelens.ir.ttir_reader.parse_ttir
+    traced = tilelens.trace(ir)(_make_add_one())
+    x, out = _inputs()
+
+    traced[(4,)](x, out, 64, BLOCK=16)
+    traced[(4,)](x, out, 64, BLOCK=16)
+
+    first, second = ir.outcomes
+    assert (first.error, first.refusal) == (None, None)
+    assert first.graph.kernel_name == "add_one"
+    # The second launch is a cache hit.
+    assert second is first
+    (config,) = ir.last_verdict.per_config
+    assert config.status == "parsed"

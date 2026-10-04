@@ -1,0 +1,4 @@
+[codespell]
+# Fixed vocabulary, not typos: `aranges` is the plural of tl.arange, `lits`
+# names the walk's string-literal spans (tilelens/ir/_mlir_walk.py).
+ignore-words-list = aranges,lits

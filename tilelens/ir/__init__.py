@@ -1,4 +1,4 @@
-"""Compiled-IR layer: what IR-mode clients get of the kernels Triton compiles (TTIR).
+"""Compiled-IR layer: read Triton-compiled kernels (TTIR) for the IR-mode clients.
 
 Exports resolve on first access, so importing ``tilelens.ir`` imports neither
 Triton nor its MLIR bindings.
