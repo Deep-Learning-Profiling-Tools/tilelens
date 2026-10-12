@@ -32,7 +32,7 @@ dependencies = [
   "flask_cloudflared",
   "tqdm",
   "ml_dtypes",
-  "cuda-tile>=1.0.0",
+  "cuda-tile>=1.0.0,<2",
 ]
 
 [tool.setuptools.packages.find]
