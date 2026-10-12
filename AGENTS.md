@@ -26,6 +26,13 @@ Prefer focused tests near the behavior being changed: unit tests in `tests/unit/
 
 Recent commits use concise imperative summaries, often with prefixes such as `[FIX]`, `[FEAT]`, or `[REFACTOR]`, and PR numbers added by GitHub, for example `[FIX] Handle stride-0 expanded tensors in sanitizer (#327)`. Keep commits scoped to one logical change. Pull requests should explain the user-visible change, list test commands run, link related issues, and include screenshots or trace examples when web UI or visualizer output changes.
 
+PRs are squash-merged, so keep a stack of PRs up to date with merges, not rebase + force-push:
+
+- Push new work as new commits on the branch it belongs to.
+- Then update every PR above it, bottom-up, one at a time. Use the PR page's **Update branch** button (Update with merge commit) or `gh pr update-branch <number>` without `--rebase`.
+- After the bottom PR is squash-merged and the next PR is retargeted to `main`, record the squash commit with `git merge -s ours <squash-sha>`, then run `git merge origin/main`. Only do this once `git diff <squash-sha> <lower-branch-tip>` is empty and that tip is already merged into the branch.
+- Do not use `gh stack sync` or `gh stack push`: they rebase and force-push.
+
 ## Security & Configuration Tips
 
 Do not commit local traces, credentials, or generated debug artifacts. Runtime behavior is controlled by environment variables such as `TILELENS_VERBOSE`, `TILELENS_PORT`, `ENABLE_SANITIZER`, `ENABLE_PROFILER`, and `SANITIZER_ENABLE_FAKE_TENSOR`; document any new variables in `README.md`.
