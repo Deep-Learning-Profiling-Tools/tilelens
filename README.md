@@ -190,6 +190,7 @@ Analyze kernels across visualization, profiling, and sanitization with a single 
 - Visualizer: currently supports load, store, and matmul operations for 1/2/3D tensors (more operations and dimensions coming soon).
 - Profiler: flags non-unrolled loops, inefficient mask usage, and missing buffer_load optimizations while tracking load/store byte counts with low-overhead sampling.
 - Sanitizer: symbolically checks tensor memory accesses for out-of-bounds errors and emits reports with tensor metadata, call stack, and expression trees; optional fake-memory storage avoids real reads.
+  Findings are printed (once per access site per sanitizer) and kept in the sanitizer's `records`; the program keeps running, and `tile-sanitizer` exits with status 1 if it found any, unless the program exits with its own non-zero status.
 
 ### Save and load traces
 

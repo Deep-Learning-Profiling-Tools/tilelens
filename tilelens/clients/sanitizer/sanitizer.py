@@ -76,10 +76,6 @@ class Sanitizer(Client):
             return cast(SanitizerT, obj)
         return cast(SanitizerT, object.__new__(cls))
 
-    def __init__(self, abort_on_error: bool = True, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.abort_on_error: bool = abort_on_error
-
     def pre_run_callback(self, fn: Callable) -> bool:
         return True
 
@@ -154,9 +150,11 @@ _fn_symbolic_cache_set: set[_FnSymbolicCache] = set()
 
 
 class SymbolicSanitizer(Sanitizer, SymbolicClient):
-    def __init__(self, abort_on_error: bool = True):
-        super().__init__(abort_on_error=abort_on_error)
+    def __init__(self) -> None:
+        super().__init__()
         self.records: list[OutOfBoundsRecordZ3] = []
+        # (file, line, op, tensor) sites already printed; repeats are only recorded.
+        self._printed_sites: set[tuple[str, int, str, str | None]] = set()
         self.cache_args: list[Any] = []
         self.cache_grid: tuple[int, ...] | None = None
 
@@ -245,6 +243,17 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
         self.cache_grid = tuple(int(g) for g in grid)
         SymbolicClient.grid_callback(self, grid)
 
+    def _registered_lanes(self, addrs: np.ndarray) -> np.ndarray:
+        """Lanes whose address lies inside a registered tensor."""
+        addrs = np.asarray(addrs).astype(np.int64)
+        ranges = sorted((start, end) for start, end, _ in self.tensor_addrs)
+        if not ranges:
+            return np.zeros(addrs.shape, dtype=bool)
+        starts = np.array([start for start, _ in ranges], dtype=np.int64)
+        ends = np.maximum.accumulate(np.array([end for _, end in ranges], np.int64))
+        idx = np.searchsorted(starts, addrs, side="right") - 1
+        return (idx >= 0) & (addrs <= ends[np.maximum(idx, 0)])
+
     def _op_load_overrider(self, ptr, mask, other, *_args):
         ptr = self._materialize_memory_operand(ptr)
         mask = self._materialize_memory_operand(mask)
@@ -252,6 +261,9 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
         mask_sym = SymbolicExpr.from_value(mask) if mask is not None else None
         other_sym = SymbolicExpr.from_value(other) if other is not None else None
         ret = SymbolicExpr.create("load", ptr_sym, mask_sym, other_sym)
+        # Out-of-bounds lanes are reported; if this load is concretized later,
+        # they read ``other``/0, not raw memory that could crash or hang the run.
+        ret.lane_filter = self._registered_lanes
 
         self._route_pointer_access(ret, ptr_sym, mask_sym, Load, "read")
         return ret
@@ -636,15 +648,19 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
             symbolic_expr=symbolic_expr,
             tensor_name=tensor_name,
         )
-        if self.abort_on_error:
-            # Use the new PDB-style print function if available
-            if symbolic_expr is not None or cfg.verbose:
-                print_oob_record_pdb_style(oob_record, symbolic_expr)
-            else:
-                print_oob_record(oob_record)
-            sys.exit(1)
+        self.records.append(oob_record)
+        if traceback_info:
+            frame = traceback_info[-1]
+            site = (frame.filename, frame.lineno, op_type.__name__, tensor_name)
+            if site in self._printed_sites:
+                return
+            self._printed_sites.add(site)
+        if symbolic_expr is not None or cfg.verbose:
+            print_oob_record_pdb_style(oob_record, symbolic_expr)
         else:
-            self.records.append(oob_record)
+            print_oob_record(oob_record)
+        # Keep the report if the program later crashes or is killed.
+        sys.stdout.flush()
 
 
 class NullSanitizer(NullSymbolicClient, Sanitizer):
@@ -652,6 +668,3 @@ class NullSanitizer(NullSymbolicClient, Sanitizer):
     A do-nothing object returned when the sanitizer is off.
     Every callback raises via ``NullSymbolicClient`` so misuse is obvious.
     """
-
-    def __init__(self, abort_on_error: bool = True, *args: Any, **kwargs: Any):
-        super().__init__(abort_on_error=abort_on_error)

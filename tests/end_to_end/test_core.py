@@ -26,9 +26,7 @@ def test_trace_decorator_add_clients():
     @tilelens.trace("sanitizer")
     @tilelens.trace("profiler")
     @tilelens.trace("tracer")
-    @tilelens.trace(
-        Sanitizer(abort_on_error=True)
-    )  # Duplicate Sanitizer (should be ignored)
+    @tilelens.trace(Sanitizer())  # Duplicate Sanitizer (should be ignored)
     @triton.jit
     def my_kernel(x_ptr, y_ptr, out_ptr, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -108,7 +106,7 @@ def test_gluon_sanitizer_run_preserves_instrumentation_mode(monkeypatch):
     from triton.experimental import gluon
     from triton.experimental.gluon import language as ttgl
 
-    @tilelens.trace(client=Sanitizer(abort_on_error=False), frontend="gluon")
+    @tilelens.trace(client=Sanitizer(), frontend="gluon")
     @gluon.jit
     def my_gluon_kernel(out):
         pid = ttgl.program_id(0)
@@ -236,7 +234,9 @@ def test_trace_patches_extra_cuda_builtins():
 
 
 def test_trace_supports_symbolic_sort():
-    @tilelens.trace("sanitizer")
+    sanitizer = Sanitizer()
+
+    @tilelens.trace(client=sanitizer)
     @triton.jit
     def sort_kernel(inp, out, BLOCK: tl.constexpr):
         offs = tl.arange(0, BLOCK)
@@ -247,10 +247,11 @@ def test_trace_supports_symbolic_sort():
     inp = torch.tensor([3, 1, 7, 0, 2, 5, 4, 6], dtype=torch.int32)
     out = torch.empty_like(inp)
     sort_kernel[(1,)](inp, out, BLOCK=inp.numel())
+    assert not sanitizer.records
 
 
 # ======== Nested JIT Call Tests =========
-@tilelens.trace(client=Sanitizer(abort_on_error=True))
+@tilelens.trace(client=Sanitizer())
 @triton.jit
 def trace_nested_inner_kernel(x):
     return x * 2
@@ -270,8 +271,9 @@ def test_trace_nested_jit_calls():
     the Trace wrapper needs to properly delegate to the underlying function.
     This test ensures compatibility with the command line tile-sanitizer wrapper.
     """
+    sanitizer = Sanitizer()
 
-    @tilelens.trace(client=Sanitizer(abort_on_error=True))
+    @tilelens.trace(client=sanitizer)
     @triton.jit
     def trace_nested_call_kernel(ptr, n: tl.constexpr):
         x = tl.load(ptr + tl.arange(0, n))
@@ -283,10 +285,13 @@ def test_trace_nested_jit_calls():
     # Test execution
     data = torch.ones(8)
     trace_nested_call_kernel[(1,)](data, 8)
+    assert not sanitizer.records
 
 
 def test_trace_nested_jit_calls_mismatched_clients():
-    @tilelens.trace(client=Sanitizer(abort_on_error=True))
+    sanitizer = Sanitizer()
+
+    @tilelens.trace(client=sanitizer)
     @triton.jit
     def trace_nested_call_kernel(ptr, n: tl.constexpr):
         x = tl.load(ptr + tl.arange(0, n))
@@ -298,10 +303,12 @@ def test_trace_nested_jit_calls_mismatched_clients():
         RuntimeError, match="nested traced calls require matching clients"
     ):
         trace_nested_call_kernel[(1,)](data, 8)
+    assert not sanitizer.records
 
 
 # ======== Autotuner Compatibility =========
 if torch.cuda.is_available():  # Only test if CUDA is available
+    autotune_sanitizer = Sanitizer()
 
     @triton.autotune(
         configs=[
@@ -310,7 +317,7 @@ if torch.cuda.is_available():  # Only test if CUDA is available
         ],
         key=["n_elements"],
     )
-    @tilelens.trace(client=Sanitizer(abort_on_error=True))
+    @tilelens.trace(client=autotune_sanitizer)
     @triton.jit
     def add_kernel_no_mask(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
         """
@@ -350,8 +357,8 @@ if torch.cuda.is_available():  # Only test if CUDA is available
 
         # The kernel launch uses n_elements=256, exceeding the valid tensor size.
         grid = lambda META: (triton.cdiv(256, META["BLOCK_SIZE"]),)
-        with pytest.raises(SystemExit):
-            add_kernel_no_mask[grid](x_ptr=x, y_ptr=y, out_ptr=out, n_elements=256)
+        add_kernel_no_mask[grid](x_ptr=x, y_ptr=y, out_ptr=out, n_elements=256)
+        assert autotune_sanitizer.records
 
 
 # ======== Autotuner + Interpreter Mode =========
