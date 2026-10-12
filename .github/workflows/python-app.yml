@@ -93,7 +93,7 @@ jobs:
         python-version: '3.12'
 
     - name: Install with pip
-      run: pip install .
+      run: pip install ".[test]"
 
     - name: Verify installation
       working-directory: ${{ runner.temp }}

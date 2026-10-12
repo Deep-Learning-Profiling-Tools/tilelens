@@ -190,7 +190,8 @@ simulation runtimes live under `tilelens/core/simulation/`.
 cuTile kernels run on the CPU with NumPy arrays and support tracing and visualization:
 
 ```sh
-uv run python -m examples.cutile.matmul --visualize
+uv sync --extra test
+uv run --extra test python -m examples.cutile.matmul --visualize
 ```
 
 ```py

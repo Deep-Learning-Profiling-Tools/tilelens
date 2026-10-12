@@ -32,8 +32,7 @@ dependencies = [
   "flask_cloudflared",
   "tqdm",
   "ml_dtypes",
-  "cuda-tile>=1.5,<2",
-  "torch",
+  "cuda-tile>=1.0.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -65,6 +64,7 @@ test = [
   "pytest",
   "pytest-xdist",
   "numpy",
+  "torch",
 ]
 nki = [
   "neuronx-cc==2.22.12471.0+b4a00d10; python_version < '3.13'",
