@@ -1,3 +1,6 @@
+import inspect
+import warnings
+
 import pytest
 import torch
 
@@ -5,9 +8,11 @@ import triton
 import triton.language as tl
 
 import tilelens
-from tilelens.clients import Profiler, Sanitizer
+from tilelens.clients import Profiler, Sanitizer, Tracer
 from tilelens.core.callbacks import ForLoopCallbacks, OpCallbacks
 from tilelens.core.client import Client
+from tilelens.core.data import Barrier, InterpreterDivergence
+import tilelens.core.trace as trace_module
 
 
 # ======== Trace Decorator Tests =========
@@ -368,3 +373,78 @@ def test_autotune_interpreter_mode():
 
     traced = tilelens.trace(client=Sanitizer())(noop_kernel)
     traced[(1,)](n=32)
+
+
+# ======== Barrier and Interpreter-Divergence Ops =========
+class _OpRecorder(Tracer):
+    def __init__(self):
+        super().__init__()
+        self.ops: list = []
+
+    def register_op_callback(self, op_type):
+        if op_type in (Barrier, InterpreterDivergence):
+            return OpCallbacks(before_callback=lambda *a: self.ops.append((op_type, a)))
+        return super().register_op_callback(op_type)
+
+
+@triton.jit
+def _block_truthiness_kernel(out):
+    offs = tl.arange(0, 8)
+    m = (offs < 2) and (offs < 4)  # diverges
+    m = m or (offs < 1)  # diverges
+    v = 1.0 if offs < 4 else 2.0  # diverges
+    if not (offs < 4):  # diverges
+        v = 3.0
+    if tl.arange(0, 1) < 1:  # a one-element block does not diverge
+        tl.store(out + offs, v, mask=m)
+
+
+@triton.jit
+def _scalar_if_and_mask_kernel(x, out, n):
+    offs = tl.arange(0, 8)
+    if n > 0:
+        tl.store(out + offs, tl.load(x + offs, mask=offs < 4, other=0.0), mask=offs < 4)
+    tl.debug_barrier()
+
+
+def test_block_truthiness_and_barrier_reach_clients_as_ops():
+    recorder = _OpRecorder()
+    tilelens.trace(client=recorder)(_block_truthiness_kernel)[(1,)](torch.zeros(8))
+    src, first = inspect.getsourcelines(_block_truthiness_kernel.fn)
+    lines = [first + i for i, ln in enumerate(src) if "# diverges" in ln]
+    assert [(op, a[0], a[1][1]) for op, a in recorder.ops] == [
+        (InterpreterDivergence, "block-truthiness", line) for line in lines
+    ]
+    # scalar `if n > 0` and Triton's own `if mask and ...` are no divergence
+    recorder = _OpRecorder()
+    args = (torch.zeros(8), torch.zeros(8), 3)
+    tilelens.trace(client=recorder)(_scalar_if_and_mask_kernel)[(2,)](*args)
+    assert recorder.ops == [(Barrier, ()), (Barrier, ())]
+
+
+def _profiler():
+    profiler = Profiler()
+    profiler.disable_buffer_load_check = True  # its warmup needs a GPU
+    return profiler
+
+
+@pytest.mark.parametrize("make_client", [Sanitizer, Tracer, _profiler])
+def test_block_truthiness_noticed_once_per_launch(make_client, tmp_path, monkeypatch):
+    client = make_client()  # the sanitizer with abort_on_error=True
+    traced = tilelens.trace(client=client)(_block_truthiness_kernel)
+    grids = [(2,), (1,), (1,)]  # the sanitizer must not skip the repeat
+    with warnings.catch_warnings(record=True) as warned:
+        warnings.simplefilter("default")  # Python's own, not pytest.warns' always
+        for grid in grids:
+            traced[grid](torch.zeros(8))
+    notices = [w for w in warned if "triton-lang/triton/pull/12150" in str(w.message)]
+    assert len(notices) == len(grids)
+    if make_client is Sanitizer:
+        verdict = client.unsupported
+        assert verdict.status == "unsupported"
+        assert verdict.refusal.kind == "block-truthiness"
+        ours = trace_module.launches[-len(grids) :]
+        assert [launch.records for launch in ours] == [[verdict]] * len(grids)
+        monkeypatch.setattr(trace_module, "launches", ours[-1:])  # save only ours
+        tilelens.load(tilelens.save(tmp_path / "trace.zip"))
+        assert trace_module.launches[-1].records == [verdict]

@@ -40,6 +40,7 @@ from ..data import (
     Ashr,
     AtomicCas,
     AtomicRMW,
+    Barrier,
     BinaryOp,
     Bitcast,
     Broadcast,
@@ -52,6 +53,7 @@ from ..data import (
     FpToFp,
     Idiv,
     IntToPtr,
+    InterpreterDivergence,
     Join,
     Load,
     MakeBlockPointer,
@@ -109,6 +111,7 @@ from ..symbolic_metadata import (
     pointer_type as symbolic_pointer_type,
 )
 from ..patch import LoopSite, loop_file_token
+from ...utils.traceback_utils import truthiness_initiator
 from .base import (
     AdapterResult,
     Frontend,
@@ -118,9 +121,22 @@ from .base import (
 )
 
 
+class _InterpreterDivergences:
+    """TileLens's own op namespace: the frontend's divergence checks call
+    ``report`` so an InterpreterDivergence reaches the clients through their
+    op callbacks like any other op."""
+
+    def report(self, kind: str, source_location: tuple[str, int, str]) -> None:
+        return None
+
+
+interpreter_divergences = _InterpreterDivergences()
+
+
 TRITON_NAMESPACES: dict[Any, dict[str, type[Op]]] = {
     interpreter_builder: {
         "create_get_program_id": ProgramId,
+        "create_barrier": Barrier,
         "create_store": RawStore,
         "create_masked_store": Store,
         "create_load": RawLoad,
@@ -175,6 +191,9 @@ TRITON_NAMESPACES: dict[Any, dict[str, type[Op]]] = {
     },
     tl.math: {
         "umulhi": Umulhi,
+    },
+    interpreter_divergences: {
+        "report": InterpreterDivergence,
     },
 }
 
@@ -508,6 +527,30 @@ class TritonFrontend(Frontend):
             return original_to_tensor(x, check_type)
 
         scope.set_attr(interpreter_semantic, "to_tensor", _to_tensor_symbolic_aware)
+
+    @staticmethod
+    def _patch_triton_block_truthiness(scope: _LangPatchScope) -> None:
+        # Triton's interpreter answers bool() of a multi-element block tensor
+        # with True, so kernel code's `a and b` / `a or b` / `not a` / `if a:`
+        # on one computes what compiled Triton does not (an upstream
+        # interpreter bug, triton-lang/triton#12150). Observe it without
+        # changing the value, and report it as an op; what it means is each
+        # client's call. Triton's own frontend plumbing (`if mask and ...`)
+        # tests a tensor's presence, not its value, and is not reported.
+        # This wraps the __bool__ that triton_patch_lang just installed (the
+        # 3.8 interpreter's private _patch_lang_tensor), so it must run after
+        # triton_patch_lang: before it, tl.core.tensor has no __bool__.
+        interpreted_bool = tl.core.tensor.__bool__
+
+        def __bool__(tensor):
+            ty = tensor.type
+            if ty.is_block() and ty.numel > 1:
+                site = truthiness_initiator()
+                if site is not None:
+                    interpreter_divergences.report("block-truthiness", site)
+            return interpreted_bool(tensor)
+
+        scope.set_attr(tl.core.tensor, "__bool__", __bool__)
 
     def _init_args_hst(self, args_dev, kwargs):
         def _to_cpu(arg):
@@ -910,6 +953,7 @@ class TritonFrontend(Frontend):
             _patch_builtin(module, interpreter_builder, scope)
         self._patch_triton_inline_asm(scope)
         self._patch_triton_semantic_to_tensor(scope)
+        self._patch_triton_block_truthiness(scope)
         scope.set_attr(knobs.runtime, "interpret", True)
         return scope
 

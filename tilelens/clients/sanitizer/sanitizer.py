@@ -8,6 +8,7 @@ from typing import (
     cast,
 )
 import sys
+import warnings
 
 import numpy as np
 from torch import Tensor
@@ -20,9 +21,11 @@ from ...core.callbacks import OpCallbacks, ForLoopCallbacks
 from ...core.data import (
     Op,
     Allocate,
+    InterpreterDivergence,
     Load,
     Store,
 )
+from ...ir.verdict import IRVerdict, Refusal, SourceLocation
 from ..symbolic_engine import (
     SymbolicExpr,
     SymbolicClient,
@@ -176,8 +179,13 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
             )
         super().__init__(abort_on_error=abort_on_error)
         self.records: list[OutOfBoundsRecordZ3] = []
+        # The last launch's "unsupported" verdict (the compiled sanitizer's
+        # record), None while it is supported; also in Launch.records.
+        self.unsupported: IRVerdict | None = None
         self.cache_args: list[Any] = []
         self.cache_grid: tuple[int, ...] | None = None
+        # This launch's _fn_symbolic_cache_set key, set by pre_run_callback.
+        self.fn_cache: _FnSymbolicCache | None = None
 
     # Explicit forwarders to SymbolicClient: the Sanitizer factory
     # carries concrete stubs (NotImplementedError or ``return True``) to
@@ -187,7 +195,10 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
         SymbolicClient.grid_idx_callback(self, grid_idx)
 
     def finalize(self) -> list:
-        return SymbolicClient.finalize(self)
+        records = SymbolicClient.finalize(self)
+        if self.unsupported is not None:
+            records = [*records, self.unsupported]
+        return records
 
     def register_for_loop_callback(self) -> ForLoopCallbacks:
         return SymbolicClient.register_for_loop_callback(self)
@@ -201,6 +212,14 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
             if cached is None:
                 cached = OpCallbacks(
                     after_callback=self.lock_fn(self._op_allocate_after_callback)
+                )
+                self.op_callback_cache[op_type] = cached
+            return cached
+        if op_type is InterpreterDivergence:
+            cached = self.op_callback_cache.get(op_type)
+            if cached is None:
+                cached = OpCallbacks(
+                    before_callback=self.lock_fn(self._on_interpreter_divergence)
                 )
                 self.op_callback_cache[op_type] = cached
             return cached
@@ -225,6 +244,36 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
             shape=shape,
             strides=strides,
             block_shape=block_shape,
+        )
+
+    def _on_interpreter_divergence(
+        self, kind: str, source_location: tuple[str, int, str]
+    ) -> None:
+        # The interpreted run is not what the compiled kernel does, so this
+        # launch's checks say nothing reliable: the launch is unsupported.
+        # Reported once per launch and never aborted on, since the kernel is
+        # not shown to be wrong. Accesses found out of bounds in the launch
+        # are still reported (and aborted on) as usual.
+        if self.unsupported is not None:
+            return
+        # Uncache the launch, so an identical later launch runs (and is
+        # reported unsupported) again instead of being skipped as checked.
+        if self.fn_cache is not None:
+            _fn_symbolic_cache_set.discard(self.fn_cache)
+        filename, lineno, _ = source_location
+        message = (
+            InterpreterDivergence.describe(kind, source_location)
+            + ". This launch is unsupported: its sanitizer results are unreliable."
+        )
+        self.unsupported = IRVerdict(
+            client=self.NAME,
+            status="unsupported",
+            refusal=Refusal(kind, message, loc=SourceLocation(filename, lineno)),
+        )
+        # warn_explicit at the kernel line, with no warning registry, so
+        # Python's default filter does not collapse later launches' notices.
+        warnings.warn_explicit(
+            f"[{self.LOG_TAG}] {message}", RuntimeWarning, filename, lineno
         )
 
     def _addr_ok_premise(self) -> BoolRef:
@@ -262,6 +311,7 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
         # ``pre_run_callback`` can consult it before deciding whether to skip
         # the launch.
         self.cache_grid = tuple(int(g) for g in grid)
+        self.unsupported = None
         SymbolicClient.grid_callback(self, grid)
 
     def _op_load_overrider(self, ptr, mask, other, *_args):
@@ -373,6 +423,7 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
     def pre_run_callback(self, fn: Callable) -> bool:
         if self.cache_grid:
             fn_cache = _FnSymbolicCache(fn, self.cache_grid, tuple(self.cache_args))
+            self.fn_cache = fn_cache
             self._clear_cache()
             if fn_cache not in _fn_symbolic_cache_set:
                 _fn_symbolic_cache_set.add(fn_cache)
