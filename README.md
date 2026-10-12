@@ -120,19 +120,10 @@ uv sync --extra nki # NKI support but no testing
 uv sync --extra test # tests but no NKI support
 ```
 
-### Optional: Enable cuTile Support
-
-For source installs:
-
-```sh
-uv sync --extra cutile
-# Use "uv sync --extra cutile --extra test" to also run cuTile tests.
-```
-
 ### Testing
 * To run core TileLens tests, run `pytest tests/`.
 * (if NKI installed) To run NKI-specific tests, run `pytest tests/ -m nki`.
-* (if cuTile installed) To run cuTile-specific tests, run `pytest tests/cutile/`.
+* To run cuTile-specific tests, run `pytest tests/cutile/`.
 * To run all tests (Triton + NKI), run `pytest tests/ -m ""`.
 * To run visualizer web UI tests, run `npm run test:frontend`.
 
@@ -199,7 +190,7 @@ simulation runtimes live under `tilelens/core/simulation/`.
 cuTile kernels run on the CPU with NumPy arrays and support tracing and visualization:
 
 ```sh
-uv run --extra cutile python -m examples.cutile.matmul --visualize
+uv run python -m examples.cutile.matmul --visualize
 ```
 
 ```py

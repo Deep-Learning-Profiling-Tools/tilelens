@@ -17,7 +17,7 @@ try:
     import cuda.tile as ct
 except ModuleNotFoundError as exc:
     raise ModuleNotFoundError(
-        "Install tilelens[cutile] to use the cuTile interpreter."
+        "Install cuda-tile to use the cuTile interpreter."
     ) from exc
 
 from ..frontend.base import get_frontend
@@ -799,8 +799,6 @@ class Builder:
 
 
 cutile_builder = Builder()
-# Keep the old builder alias for existing callers.
-builder = cutile_builder
 
 
 def cutile_patch_lang(scope=None):

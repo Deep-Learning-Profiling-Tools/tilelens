@@ -32,6 +32,8 @@ dependencies = [
   "flask_cloudflared",
   "tqdm",
   "ml_dtypes",
+  "cuda-tile>=1.5,<2",
+  "torch",
 ]
 
 [tool.setuptools.packages.find]
@@ -59,12 +61,10 @@ triton-race-detector = "tilelens.wrapper:apply_race_detector"
 triton-visualizer = "tilelens.visualizer_cli:main"
 
 [project.optional-dependencies]
-cutile = ["cuda-tile==1.5.0", "numpy"]
 test = [
   "pytest",
   "pytest-xdist",
   "numpy",
-  "torch",
 ]
 nki = [
   "neuronx-cc==2.22.12471.0+b4a00d10; python_version < '3.13'",

@@ -1,7 +1,9 @@
 """Tests for cuTile tracing and visualization."""
 # ruff: noqa: E402
 
+import importlib.util
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -13,7 +15,15 @@ from tilelens.clients import Tracer
 from tilelens.core.data import Dot, Grid, Load, Store
 from tilelens.core.simulation.cutile import cutile_builder
 from tilelens.core.trace import launches
-from examples.cutile.matmul import matmul_kernel, TILE_M, TILE_N
+
+example_path = Path(__file__).resolve().parents[2] / "examples" / "cutile" / "matmul.py"
+spec = importlib.util.spec_from_file_location("cutile_matmul_example", example_path)
+assert spec is not None
+assert spec.loader is not None
+matmul_example = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(matmul_example)
+matmul_kernel = matmul_example.matmul_kernel
+TILE_M, TILE_N = matmul_example.TILE_M, matmul_example.TILE_N
 
 
 @pytest.fixture(autouse=True)
