@@ -96,14 +96,14 @@ def test_indexed_views_and_mma_use_shared_records():
     @ct.kernel
     def indexed_kernel(src, dst):
         view = src.slice(0, 1, 4)
-        indices = ct.arange(4) - 1
+        indices = ct.arange(4, dtype=ct.int32) - 1
         values = ct.gather(view, indices, padding_value=0)
         product = ct.mma(
             ct.reshape(values, (2, 2)),
             ct.ones((2, 2), ct.float32),
             ct.zeros((2, 2), ct.float32),
         )
-        ct.scatter(dst, ct.arange(4), ct.reshape(product, (4,)))
+        ct.scatter(dst, ct.arange(4, dtype=ct.int32), ct.reshape(product, (4,)))
 
     src = np.array([10, 20, 30, 40], np.float32)
     dst = np.zeros(4, np.float32)

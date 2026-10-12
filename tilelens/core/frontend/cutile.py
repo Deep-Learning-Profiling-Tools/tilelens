@@ -113,7 +113,8 @@ def _cutile_indexed_adapter(
 def _cutile_dot_adapter(x: Any, y: Any, *_args: Any, **_kwargs: Any) -> AdapterResult:
     assert HAS_CUTILE
     # Copy read-only tiles before the visualizer converts them to Torch tensors.
-    return AdapterResult(Array(x.data.copy()), Array(y.data.copy()))
+    lhs, rhs = Array(x.data), Array(y.data)
+    return AdapterResult(Array(lhs.numpy().copy()), Array(rhs.numpy().copy()))
 
 
 def _cutile_reduce_sum_adapter(

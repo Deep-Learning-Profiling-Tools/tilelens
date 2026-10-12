@@ -48,6 +48,14 @@ def _is_float(dtype):
     )
 
 
+def _is_low_precision(dtype):
+    return dtype in (
+        DTYPES[ct.bfloat16],
+        DTYPES[ct.float8_e4m3fn],
+        DTYPES[ct.float8_e5m2],
+    )
+
+
 def _binary_values(x, y, force_float=False):
     """Choose operand dtypes without NumPy's integer/float widening.
 
@@ -75,6 +83,11 @@ def _binary_values(x, y, force_float=False):
         dtype = np.result_type(x_value.dtype, y_value.dtype)
     if force_float and not _is_float(dtype):
         dtype = np.dtype(np.float32)
+    elif dtype == np.dtype(np.bool_) and (
+        (isinstance(x, int) and not isinstance(x, bool))
+        or (isinstance(y, int) and not isinstance(y, bool))
+    ):
+        dtype = np.dtype(np.int32)
     # Use float32 arithmetic for NumPy void storage dtypes.
     compute_dtype = dtype if dtype.kind != "V" else np.dtype(np.float32)
     return x_value.astype(compute_dtype), y_value.astype(compute_dtype), dtype
@@ -141,6 +154,8 @@ def _tile_value(value):
     """Return the NumPy value stored in a tile or Python scalar."""
     if isinstance(value, Tile):
         return value.data
+    if isinstance(value, np.generic):
+        return np.asarray(value)
     if isinstance(value, bool):
         return np.asarray(value, dtype=np.bool_)
     if isinstance(value, int):
@@ -179,6 +194,8 @@ class Tile:
             value = value.data
         if dtype is not None:
             value = np.asarray(value, dtype=_numpy_dtype(dtype))
+        elif isinstance(value, np.generic):
+            value = np.asarray(value)
         elif isinstance(value, int):
             value = np.asarray(value, dtype=np.int32)
         elif isinstance(value, float):
@@ -285,7 +302,12 @@ class Tile:
         return bool(self.data)
 
     def __neg__(self):
-        return Tile(np.negative(self.data))
+        value = (
+            self.data.astype(np.int32)
+            if self.data.dtype == np.dtype(np.bool_)
+            else self.data
+        )
+        return Tile(np.negative(value))
 
     def __eq__(self, other):
         return cutile_builder.equal(self, other)
@@ -389,6 +411,8 @@ class Array:
         return self
 
     def numpy(self):
+        if _is_low_precision(self.data.dtype):
+            return self.data.astype(np.float32)
         return self.data
 
     def get_offsets(self):
@@ -396,6 +420,20 @@ class Array:
         for size, stride in zip(self.shape, self.data.strides):
             offsets = np.expand_dims(offsets, -1) + np.arange(size) * stride
         return Array(offsets)
+
+
+class _TraceArray:
+    """Numeric trace data with the original array's memory metadata."""
+
+    def __init__(self, array):
+        self.array = array
+
+    @property
+    def data(self):
+        return self.array.numpy()
+
+    def __getattr__(self, name):
+        return getattr(self.array, name)
 
 
 class TiledView:
@@ -556,13 +594,21 @@ class Builder:
     def ones(self, shape, dtype):
         return self.full(shape, 1, dtype)
 
-    def arange(self, size, *, dtype=ct.int32, start=0, step=1):
+    def arange(self, size, /, *, dtype, start=0, step=1):
         (size,) = _validate_tile_shape(size)
         return Tile((start + np.arange(size) * step).astype(_numpy_dtype(dtype)))
 
     @staticmethod
     def _binary(x, y, operation, force_float=False):
         x, y, dtype = _binary_values(x, y, force_float)
+        if dtype == np.dtype(np.bool_) and operation in (
+            np.add,
+            np.subtract,
+            np.multiply,
+            np.floor_divide,
+            np.remainder,
+        ):
+            raise TypeError("Boolean arithmetic requires an integer cast")
         return Tile(operation(x, y).astype(dtype))
 
     @staticmethod
@@ -650,10 +696,24 @@ class Builder:
 
     def sum(self, x, /, axis=None, *, keepdims=False, **kwargs):
         value = _tile_value(x)
-        return Tile(np.sum(value, axis=axis, keepdims=keepdims, dtype=value.dtype))
+        dtype = np.dtype(np.int32) if value.dtype == np.dtype(np.bool_) else value.dtype
+        compute_dtype = np.float32 if _is_low_precision(dtype) else dtype
+        return Tile(
+            np.asarray(
+                np.sum(value, axis=axis, keepdims=keepdims, dtype=compute_dtype),
+                dtype=dtype,
+            )
+        )
 
     def matmul(self, x, y, /):
-        return Tile(np.matmul(_tile_value(x), _tile_value(y)))
+        lhs, rhs = _tile_value(x), _tile_value(y)
+        if _is_low_precision(lhs.dtype):
+            return Tile(
+                np.matmul(lhs.astype(np.float32), rhs.astype(np.float32)).astype(
+                    lhs.dtype
+                )
+            )
+        return Tile(np.matmul(lhs, rhs))
 
     def floordiv(self, x, y, /):
         return self._binary(x, y, np.floor_divide)
@@ -710,7 +770,10 @@ class Builder:
         return self._unary(x, lambda value: 1 / np.sqrt(value))
 
     def max(self, x, /, axis=None, *, keepdims=False, **kwargs):
-        return Tile(np.max(_tile_value(x), axis=axis, keepdims=keepdims))
+        value = _tile_value(x)
+        if value.dtype == np.dtype(np.bool_):
+            value = value.astype(np.int32)
+        return Tile(np.max(value, axis=axis, keepdims=keepdims))
 
     def argmax(self, x, /, axis=None, *, keepdims=False):
         return Tile(
@@ -723,7 +786,9 @@ class Builder:
         value = _tile_value(x)
         if reverse:
             value = np.flip(value, axis)
-        result = np.cumsum(value, axis=axis, dtype=value.dtype)
+        dtype = np.dtype(np.int32) if value.dtype == np.dtype(np.bool_) else value.dtype
+        compute_dtype = np.float32 if _is_low_precision(dtype) else dtype
+        result = np.cumsum(value, axis=axis, dtype=compute_dtype).astype(dtype)
         return Tile(np.flip(result, axis) if reverse else result)
 
     def cat(self, tiles, /, axis):
@@ -927,7 +992,12 @@ class CuTileInterpretedFunction:
             bound = inspect.signature(self.fn).bind(*args, **kwargs)
             bound.apply_defaults()
             for name, arg in bound.arguments.items():
-                client_manager.arg_callback(name, arg, arg)
+                trace_arg = (
+                    _TraceArray(arg)
+                    if isinstance(arg, Array) and _is_low_precision(arg.data.dtype)
+                    else arg
+                )
+                client_manager.arg_callback(name, trace_arg, arg)
             client_manager.grid_callback(grid_dims)
 
         # Traced execution is already patched by ClientManager.patch_run().

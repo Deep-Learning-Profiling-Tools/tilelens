@@ -30,7 +30,7 @@ def matmul_kernel(lhs, rhs, result):
     result_tile = ct.full((TILE_M, TILE_N), 0, ct.float32)
 
     # Accumulate partial sums.
-    for k in range(math.ceil(K / TILE_K)):
+    for k in range(ct.cdiv(K, TILE_K)):
         lhs_tile = ct.load(
             lhs,
             (m, k),

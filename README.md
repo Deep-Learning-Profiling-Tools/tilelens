@@ -123,7 +123,7 @@ uv sync --extra test # tests but no NKI support
 ### Testing
 * To run core TileLens tests, run `pytest tests/`.
 * (if NKI installed) To run NKI-specific tests, run `pytest tests/ -m nki`.
-* To run cuTile-specific tests, run `pytest tests/cutile/`.
+* To run cuTile-specific tests, run `pytest tests/unit/test_cutile.py tests/end_to_end/test_cutile.py tests/cutile/test_cutile_tracer.py`.
 * To run all tests (Triton + NKI), run `pytest tests/ -m ""`.
 * To run visualizer web UI tests, run `npm run test:frontend`.
 

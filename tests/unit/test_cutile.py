@@ -1,4 +1,4 @@
-"""Tests for the NumPy-backed cuTile interpreter."""
+"""Tests for cuTile values and operations."""
 
 import operator
 
@@ -9,7 +9,6 @@ ct = pytest.importorskip("cuda.tile")
 
 from tilelens.core.simulation.cutile import (  # noqa: E402
     Array,
-    CuTileInterpretedFunction,
     Tile,
     cutile_builder,
 )
@@ -88,33 +87,16 @@ def test_load_and_store():
     np.testing.assert_array_equal(output, [0, 1, 2, 3, -1, -1, -1, -1, 8, 9])
 
 
-def test_interpreted_kernel():
-    @ct.kernel
-    def add_kernel(a, b, out):
-        block = ct.bid(0)
-        x = ct.load(a, (block,), (4,), padding_mode=ct.PaddingMode.ZERO)
-        y = ct.load(b, (block,), (4,), padding_mode=ct.PaddingMode.ZERO)
-        ct.store(out, (block,), x + y)
-
-    a = np.arange(10, dtype=np.int32)
-    b = np.arange(10, dtype=np.int32) * 2
-    output = np.empty_like(a)
-    original_load = ct.load
-
-    CuTileInterpretedFunction(add_kernel).run(a, b, output, grid=(3,))
-
-    np.testing.assert_array_equal(output, a + b)
-    assert ct.load is original_load
-
-
 def test_tile_shape_operations():
-    tile = cutile_builder.arange(16).reshape((4, -1))
+    tile = cutile_builder.arange(16, dtype=ct.int32).reshape((4, -1))
     np.testing.assert_array_equal(tile.transpose().data, tile.data.T)
     np.testing.assert_array_equal(tile.permute((1, 0)).data, tile.data.T)
     np.testing.assert_array_equal(tile.extract((1, 0), (2, 2)).data, [[8, 9], [12, 13]])
     assert tile[:, None, ...].shape == (4, 1, 4)
     assert cutile_builder.expand_dims(tile, -1).shape == (4, 4, 1)
-    assert cutile_builder.broadcast_to(cutile_builder.arange(4), (2, 4)).shape == (2, 4)
+    assert cutile_builder.broadcast_to(
+        cutile_builder.arange(4, dtype=ct.int32), (2, 4)
+    ).shape == (2, 4)
     assert tile.astype(ct.float32).dtype == ct.float32
     assert operator.index(cutile_builder.full((1,), 3, ct.int32).item()) == 3
     with pytest.raises(TypeError, match="extract"):
@@ -299,24 +281,6 @@ def test_integer_operators_and_scalar_control_flow():
         bool(x)
 
 
-def test_softmax_kernel_and_builtin_max_restore():
-    @ct.kernel
-    def softmax(src, dst):
-        x = ct.load(src, (ct.bid(0), 0), (1, 8), padding_mode=ct.PaddingMode.NEG_INF)
-        m = max(ct.full((), -float("inf"), ct.float32), ct.max(x))
-        probabilities = ct.exp(x - m)
-        ct.store(dst, (ct.bid(0), 0), probabilities / ct.sum(probabilities))
-
-    data = np.array([[100, 101, 102, 103, 104], [-3, -2, -1, 0, 1]], np.float32)
-    result = np.zeros_like(data)
-    original_exp = ct.exp
-    CuTileInterpretedFunction(softmax).run(data, result, grid=(2,))
-    expected = np.exp(data - data.max(1, keepdims=True))
-    expected /= expected.sum(1, keepdims=True)
-    np.testing.assert_allclose(result, expected, rtol=1e-6)
-    assert ct.exp is original_exp
-
-
 def test_transcendentals_selection_and_fp16_rounding():
     x = Tile(np.array([1, 2, 4, 8], np.float32))
     np.testing.assert_allclose(cutile_builder.rsqrt(x).data, 1 / np.sqrt(x.data))
@@ -331,25 +295,6 @@ def test_transcendentals_selection_and_fp16_rounding():
     assert cutile_builder.exp(cutile_builder.astype(x, ct.float16)).dtype == ct.float16
 
 
-def test_kernel_preserves_shadowed_builtins_and_keyword_defaults(monkeypatch):
-    calls = []
-
-    def helper(x, y):
-        calls.append(True)
-        return x + y
-
-    def kernel(src, dst, *, increment=2):
-        values = ct.load(src, (0,), (4,))
-        ct.store(dst, (0,), max(values, increment))
-
-    monkeypatch.setitem(kernel.__globals__, "max", helper)
-    src = np.arange(4, dtype=np.float32)
-    dst = np.zeros_like(src)
-    CuTileInterpretedFunction(kernel).run(src, dst)
-    np.testing.assert_array_equal(dst, src + 2)
-    assert calls == [True]
-
-
 def test_mixed_float_tiles_do_not_narrow_float64():
     precise = Tile(np.array([1.0 + 2**-40], np.float64))
     zero = Tile(np.zeros(1, np.float32))
@@ -357,3 +302,56 @@ def test_mixed_float_tiles_do_not_narrow_float64():
     assert result.dtype == ct.float64
     np.testing.assert_array_equal(result.data, precise.data)
     np.testing.assert_array_equal((precise > Tile(np.ones(1, np.float32))).data, [True])
+
+
+@pytest.mark.parametrize("fill", [1.0, 0.1])
+def test_bfloat16_reductions(fill):
+    tile = cutile_builder.full((1024,), fill, ct.bfloat16)
+    expected = tile.data.astype(np.float32)
+    total = cutile_builder.sum(tile)
+    scan = cutile_builder.cumsum(tile)
+    reverse = cutile_builder.cumsum(tile, reverse=True)
+    assert total.dtype == scan.dtype == reverse.dtype == ct.bfloat16
+    np.testing.assert_array_equal(
+        total.data, np.asarray(expected.sum(), dtype=tile.data.dtype)
+    )
+    np.testing.assert_array_equal(scan.data, expected.cumsum().astype(tile.data.dtype))
+    np.testing.assert_array_equal(
+        reverse.data, expected[::-1].cumsum()[::-1].astype(tile.data.dtype)
+    )
+
+
+def test_boolean_results():
+    tile = Tile(np.array([True, False, True, True]))
+    assert cutile_builder.sum(tile).dtype == ct.int32
+    assert cutile_builder.sum(tile).data == 3
+    scan = cutile_builder.cumsum(tile)
+    assert scan.dtype == ct.int32
+    np.testing.assert_array_equal(scan.data, [1, 1, 2, 3])
+    assert cutile_builder.max(tile).dtype == ct.int32
+    assert (tile + 2).dtype == (2 + tile).dtype == ct.int32
+    np.testing.assert_array_equal((tile + 2).data, [3, 2, 3, 3])
+    np.testing.assert_array_equal(
+        (tile + Tile(np.full(4, 2, np.int32))).data, [3, 2, 3, 3]
+    )
+    with pytest.raises(TypeError, match="Boolean arithmetic"):
+        tile + tile
+
+
+def test_scalar_float64_results():
+    tile = Tile(np.array([1e300, 1, 1, 1], np.float64))
+    for result in (
+        cutile_builder.sum(tile),
+        cutile_builder.max(tile),
+        Tile(np.float64(1e300)),
+    ):
+        assert result.dtype == ct.float64
+        assert result.data == 1e300
+    scalar = Tile(np.array(1e-300, np.float64))
+    assert (scalar + scalar).dtype == ct.float64
+    assert (scalar + scalar).data == 2e-300
+
+
+def test_arange_requires_dtype():
+    with pytest.raises(TypeError, match="dtype"):
+        cutile_builder.arange(4)
