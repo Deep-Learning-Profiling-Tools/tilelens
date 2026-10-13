@@ -260,15 +260,6 @@ def _untraced(value: Any) -> Any:
     return value
 
 
-def _code_names(code: types.CodeType) -> set[str]:
-    # Comprehensions are nested code objects before Python 3.12.
-    names = set(code.co_names)
-    for const in code.co_consts:
-        if isinstance(const, types.CodeType):
-            names |= _code_names(const)
-    return names
-
-
 def _traced_references(
     base_fn: Callable | None,
 ) -> list[tuple[dict, str, TritonTrace]]:
@@ -283,7 +274,8 @@ def _traced_references(
         if id(fn) in visited_fns:
             continue
         visited_fns.add(id(fn))
-        names = _code_names(fn.__code__)
+        # Python 3.12+ inlines comprehensions, so their names are here too.
+        names = fn.__code__.co_names
         namespaces = [fn.__globals__]
         visited_namespaces = {id(fn.__globals__)}
         while namespaces:
