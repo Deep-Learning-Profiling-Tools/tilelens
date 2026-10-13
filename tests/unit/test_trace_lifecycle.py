@@ -92,11 +92,19 @@ def test_patch_run_loop_hook_conflict_leaves_nothing_patched():
     assert getattr(namespace, attr) == original
 
 
-def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain():
+@pytest.mark.parametrize("user_post_hook", [False, True])
+def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain(user_post_hook):
+    posts = []
+
     @triton.autotune(
         configs=[triton.Config({"BLOCK": 4}), triton.Config({"BLOCK": 8})],
         key=["n"],
         restore_value=["out_ptr"],
+        # Triton's own restore_value post_hook, or a user's that closes over
+        # just `posts` and must stay bound to it.
+        post_hook=(lambda nargs, exception: posts.append(exception))
+        if user_post_hook
+        else None,
         cache_results=True,
     )
     @triton.heuristics({"EVEN": lambda args: args["n"] % args["BLOCK"] == 0})
@@ -115,6 +123,7 @@ def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain():
 
     torch.testing.assert_close(out, x + 1)
     assert vars(user) == before and user.cache == {}
+    assert posts == ([None, None] if user_post_hook else [])
 
 
 def test_a_heuristics_kernel_launches_through_its_voted_warmup(monkeypatch):
@@ -216,12 +225,13 @@ def test_a_voted_compile_sees_traced_helpers_as_jit_functions(monkeypatch):
     traced = tilelens.trace(_EagerClient(warmup_vote=True))(kernel)
     seen = []
 
-    def run(*args, grid, warmup, FN, FNS, **kwargs):
+    def run(x, FN, *, grid, warmup, FNS):
         # What the compile resolves: the constexpr arguments and the global.
         seen.append((FN, FNS, globals()["_codegen_helper"]))
 
     monkeypatch.setattr(traced.jit_fn, "run", run)
 
-    traced.warmup(torch.zeros(1), FN=helper, FNS=(helper,), grid=(1,))
+    # FN by position, FNS by keyword inside a tuple.
+    traced.warmup(torch.zeros(1), helper, FNS=(helper,), grid=(1,))
 
     assert seen == [(helper.jit_fn, (helper.jit_fn,), helper.jit_fn)]
