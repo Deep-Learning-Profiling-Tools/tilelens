@@ -252,7 +252,7 @@ def _untraced(value: Any) -> Any:
     """``value`` with each TritonTrace in it (also inside a tuple) replaced
     by its JITFunction: Triton's code generator calls any other callee as
     plain Python."""
-    if isinstance(value, TritonTrace) and value.jit_fn is not None:
+    if isinstance(value, TritonTrace):
         return value.jit_fn
     if isinstance(value, tuple):
         items = [_untraced(item) for item in value]
@@ -272,11 +272,9 @@ def _code_names(code: types.CodeType) -> set[str]:
 def _traced_references(
     base_fn: Callable | None,
 ) -> list[tuple[dict, str, TritonTrace]]:
-    """Every (namespace, name, trace) a real compile of ``base_fn`` resolves:
-    each name a reached function's code mentions, looked up in its globals
-    and, as Triton does for ``mod.fn``, in the modules those reach."""
-    from triton import JITFunction
-
+    """(namespace, name, trace) for each name ``base_fn`` or a trace it
+    reaches mentions, looked up in its globals and, as Triton does for
+    ``mod.fn``, in the modules those reach."""
     found: list[tuple[dict, str, TritonTrace]] = []
     visited_fns: set[int] = set()
     pending: list[Any] = [base_fn]
@@ -293,11 +291,8 @@ def _traced_references(
             for name in names:
                 value = namespace.get(name)
                 if isinstance(value, TritonTrace):
-                    if value.jit_fn is not None:
-                        found.append((namespace, name, value))
+                    found.append((namespace, name, value))
                     pending.append(value.base_fn)
-                elif isinstance(value, JITFunction):
-                    pending.append(value.fn)
                 elif (
                     isinstance(value, types.ModuleType)
                     and id(vars(value)) not in visited_namespaces
@@ -312,7 +307,8 @@ def _unwrapped_trace_globals(base_fn: Callable | None):
     """Bind each TritonTrace a real compile of ``base_fn`` reaches back to its
     JITFunction for the scope: under the CLI wrappers device functions are
     traces too, and Triton's dependency walker rejects them ("Unsupported
-    function referenced"). Traces captured in closures are not swapped."""
+    function referenced"). Traces captured in closures, or reached only
+    through an untraced JITFunction, are not swapped."""
     swapped = _traced_references(base_fn)
     try:
         for namespace, name, trace in swapped:
