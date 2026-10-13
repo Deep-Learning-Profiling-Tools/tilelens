@@ -90,7 +90,8 @@ class AccessEventRecord:
     # join/split, splat in between). At the same position such a pair is
     # ordered by causality (the value must exist before it is written), so
     # the intra-instance query ranges over DISTINCT positions only for
-    # these pairs.
+    # these pairs. A block anchor is listed only when it has a
+    # lane_position.
     dep_loads: tuple[int, ...] = ()
     # The block position of a lane, one coordinate per dimension of the
     # access's block (the arange feeding that dimension, minus its start).

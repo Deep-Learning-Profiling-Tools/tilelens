@@ -506,6 +506,39 @@ def _published_transposed_old_value_kernel(z, flag, B: tl.constexpr):
     tl.store(z + offs, 5, mask=(pid == 1) & (f >= 100))
 
 
+@triton.jit
+def _published_one_address_old_value_kernel(z, flag, B: tl.constexpr):
+    # B lanes without an arange, all on z[0] and flag[0]: program 1
+    # acquires one lane's publication, which orders only that lane's
+    # atomic on z[0] before its store.
+    pid = tl.program_id(0)
+    zero = tl.zeros([B], dtype=tl.int32)
+    old = tl.atomic_add(z + zero, 1, mask=pid == 0, sem="relaxed")
+    tl.atomic_xchg(flag + zero, old + 100, mask=pid == 0, sem="release")
+    f = tl.atomic_add(flag, 0, mask=pid == 1, sem="acquire")
+    tl.store(z, 5, mask=(pid == 1) & (f >= 100))
+
+
+@triton.jit
+def _published_scalar_old_value_kernel(z, flag):
+    pid = tl.program_id(0)
+    old = tl.atomic_add(z, 1, mask=pid == 0, sem="relaxed")
+    tl.atomic_xchg(flag, old + 100, mask=pid == 0, sem="release")
+    f = tl.atomic_add(flag, 0, mask=pid == 1, sem="acquire")
+    tl.store(z, 5, mask=(pid == 1) & (f >= 100))
+
+
+def test_dependency_on_a_block_without_positions_gives_no_order():
+    # A block anchor with no lane position (lanes on one address) orders no
+    # dependent lane after it; a scalar anchor, one lane, still does.
+    kernel = _published_one_address_old_value_kernel
+    detector = _run(kernel, (2,), _ints(1), _ints(1), 4)
+    race = _race(detector, RaceType.WAW, kernel, "tl.atomic_add(z", "tl.store")
+    assert race.programs == ((0, 0, 0), (1, 0, 0))
+    detector = _run(_published_scalar_old_value_kernel, (2,), _ints(1), _ints(1))
+    assert detector.last_status == "ok" and not detector.last_reports
+
+
 def test_dependency_orders_a_lane_after_its_own_position_only():
     # A dependency orders the anchor's lane at the dependent lane's own
     # position, not every lane of it: with a release publication the

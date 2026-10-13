@@ -1562,8 +1562,15 @@ class SymbolicRaceDetector(RaceDetector, SymbolicClient):
     def _append_record(self, record: AccessEventRecord) -> None:
         self.records.append(record)
         expr = record.symbolic_expr
-        if expr is not None and getattr(expr, "op", None) in self._DEP_ANCHOR_OPS:
-            self._dep_anchor_ids[id(expr)] = record.event_id
+        if expr is None or getattr(expr, "op", None) not in self._DEP_ANCHOR_OPS:
+            return
+        # A block anchor without a lane_position (e.g. B lanes on one
+        # address, z + tl.zeros([B])) has no position to pair a dependent
+        # lane with: it anchors no dependency, rather than one that orders
+        # every lane of it before the dependent.
+        if tuple(getattr(expr, "shape", None) or ()) and record.lane_position is None:
+            return
+        self._dep_anchor_ids[id(expr)] = record.event_id
 
     def _dep_loads_of(self, expr: Any) -> tuple[int, ...]:
         """event_ids of the anchors this record's value / mask / compare

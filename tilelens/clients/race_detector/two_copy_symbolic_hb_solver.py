@@ -1453,8 +1453,12 @@ class TwoCopySymbolicHBSolver:
         variables are independent within a copy, and a shared arange
         variable is no position either once an op moves elements (a
         transposed pointer keeps the variables of the untransposed one).
-        Without positions, only events using no arange variable (a scalar
-        access, one position) are at the same position."""
+        Without positions, two events on the same lane that use no arange
+        variable are taken to be at the same position. That holds for a
+        rank-0 anchor (one position) but not for a block on one address
+        (``z + tl.zeros([B])``: B positions, no arange), so the caller must
+        not list such a block anchor in ``dep_pairs``; SymbolicRaceDetector
+        anchors no dependency on a block record without a position."""
         pos1, pos2 = e1.record.lane_position, e2.record.lane_position
         if pos1 and pos2 and len(pos1) == len(pos2):
             sub = (self.ctx_a if e1.copy == "a" else self.ctx_b).arange_substitutions
