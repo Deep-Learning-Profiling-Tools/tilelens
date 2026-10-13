@@ -1,5 +1,4 @@
 import copy
-import inspect
 from contextlib import contextmanager
 from collections.abc import Callable
 from typing import Any
@@ -14,32 +13,6 @@ import types
 
 
 launches: list[Launch] = []
-
-
-def _without_warmup(kwargs: dict[str, Any]) -> dict[str, Any]:
-    # Launch kwargs carry warmup=False; the warmup entry points set their own.
-    return {k: v for k, v in kwargs.items() if k != "warmup"}
-
-
-def _rebind_closure(fn: Any, old: Any, new: Any) -> Any:
-    """Return ``fn`` with the closure cells that hold ``old`` pointing at ``new``."""
-    closure = getattr(fn, "__closure__", None)
-    if not closure:
-        return fn
-    cells = []
-    for cell in closure:
-        try:
-            value = cell.cell_contents
-        except ValueError:  # empty cell
-            value = None
-        cells.append(types.CellType(new) if value is old else cell)
-    if all(a is b for a, b in zip(cells, closure)):
-        return fn
-    rebound = types.FunctionType(
-        fn.__code__, fn.__globals__, fn.__name__, fn.__defaults__, tuple(cells)
-    )
-    rebound.__kwdefaults__ = fn.__kwdefaults__
-    return rebound
 
 
 class TraceInterface:
@@ -111,62 +84,44 @@ class KernelTraceSupport:
         fn()
         return (1.0, 1.0, 1.0)
 
-    def _interpreter_runner(self, runner: Any, interpreted_fn: Any) -> Any:
-        return self._rebuild_runner(runner, interpreted_fn, interpreted=True)
-
-    def _warmup_runner(self, runner: Any, jit_fn: Any | None) -> Any | None:
-        if jit_fn is None:
-            return None
-        return self._rebuild_runner(runner, jit_fn, interpreted=False)
-
-    def _rebuild_runner(self, runner: Any, leaf: Any, *, interpreted: bool) -> Any:
-        """Rebuild the Autotuner/Heuristics chain of ``runner`` on top of ``leaf``.
-
-        Every layer is shallow-copied down to the kernel, which ``leaf``
-        replaces, so the user's runner is never mutated. No deepcopy: a real
-        JITFunction holds an RLock. A nested trace is looked through so the
-        layers it wraps are kept.
-        """
-        if isinstance(runner, (TritonTrace, GluonTrace)):
-            runner = runner.fn
+    def _rebuild_runner(self, runner: Any, leaf: Any) -> Any:
+        """Rebuild ``runner``'s Autotuner/Heuristics chain from shallow copies
+        (a JITFunction holds an RLock, so no deepcopy), with ``leaf`` in place
+        of its kernel, so the user's chain is never mutated."""
         if not (self._is_autotuner(runner) or self._is_heuristics(runner)):
             return leaf
         layer = copy.copy(runner)
-        layer.fn = self._rebuild_runner(runner.fn, leaf, interpreted=interpreted)
+        layer.fn = self._rebuild_runner(runner.fn, leaf)
         if self._is_autotuner(layer):
-            self._isolate_autotuner(runner, layer, interpreted=interpreted)
-        elif not interpreted:
+            # Read by Autotuner.run (the interpreted chain), not by .warmup.
+            layer.cache = {}  # copy.copy shares the user's
+            # check_disk_cache walks .fn down to a JITFunction, which the
+            # interpreted chain lacks.
+            layer.cache_results = False
+            layer.do_bench = self.dummy_benchmarker
+            # Triton's reset_to_zero/restore_value hooks close over just the
+            # Autotuner they were built for; point them at the copy, which
+            # keeps restore_copies.
+            for name in ("pre_hook", "post_hook"):
+                hook = getattr(layer, name)
+                closure = getattr(hook, "__closure__", None)
+                if closure and len(closure) == 1 and closure[0].cell_contents is runner:
+                    rebound = types.FunctionType(
+                        hook.__code__,
+                        hook.__globals__,
+                        hook.__name__,
+                        hook.__defaults__,
+                        (types.CellType(layer),),
+                    )
+                    setattr(layer, name, rebound)
+        else:
             layer.warmup = self._heuristics_warmup(layer)
         return layer
 
-    def _isolate_autotuner(
-        self, original: Any, layer: Any, *, interpreted: bool
-    ) -> None:
-        # copy.copy shares the cache dict Autotuner.run fills in; give the copy
-        # its own, so a trace never changes what the user's autotuner picks.
-        layer.cache = {}
-        # Interpreter timings must never reach Triton's on-disk autotune cache.
-        layer.cache_results = False
-        # Triton's own reset_to_zero/restore_value hooks close over the
-        # Autotuner they were built for (restore_copies lives on it); point
-        # them at the copy.
-        for name in ("pre_hook", "post_hook"):
-            if not getattr(layer, f"user_defined_{name}", False):
-                hook = _rebind_closure(getattr(layer, name), original, layer)
-                setattr(layer, name, hook)
-        if interpreted:
-            # Kernel Cache: replace the benchmark with a dummy to skip performance testing.
-            layer._do_bench = self.dummy_benchmarker
-            # do_bench is a cached_property; drop a value the original cached.
-            layer.__dict__.pop("do_bench", None)
-
     @staticmethod
     def _heuristics_warmup(layer: Any) -> Callable:
-        # Heuristics inherits KernelInterface.warmup, which calls
-        # run(warmup=True) and so bypasses fn.warmup, where patch_warmup
-        # collects the warmup votes. Warm up like Autotuner.warmup does
-        # instead: fill in the heuristic kwargs as Heuristics.run does, then
-        # call fn.warmup.
+        # KernelInterface.warmup calls run(warmup=True), bypassing fn.warmup,
+        # where patch_warmup votes: fill in the heuristics, then call fn.warmup.
         def warmup(*args, **kwargs):
             for name, heur in layer.values.items():
                 kwargs[name] = heur({**dict(zip(layer.arg_names, args)), **kwargs})
@@ -231,8 +186,10 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
             self.jit_fn, self.base_fn, self.interpreted_fn = unpack_kernel(runner.fn)
         else:
             self.jit_fn, self.base_fn, self.interpreted_fn = unpack_kernel(runner)
-        self.runner = self._interpreter_runner(runner, self.interpreted_fn)
-        self.warmup_runner = self._warmup_runner(runner, self.jit_fn)
+        self.runner = self._rebuild_runner(runner, self.interpreted_fn)
+        self.warmup_runner = (
+            None if self.jit_fn is None else self._rebuild_runner(runner, self.jit_fn)
+        )
 
         self.arg_names = runner.arg_names
 
@@ -243,7 +200,9 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
         self._copy_callable_attrs(runner, self.base_fn, src_fallback=self.jit_fn)
 
     def run(self, *args, **kwargs):
-        self._voted_warmup(*args, **kwargs)
+        with self.client_manager.patch_warmup(self.jit_fn, self._real_compile):
+            if self.warmup_runner:
+                self.warmup_runner.warmup(*args, **kwargs)
 
         with self.client_manager.patch_run(self.base_fn, frontend_name="triton"):
             kwargs.update({"client_manager": self.client_manager})
@@ -252,95 +211,57 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
             self.finalize()
             return ret
 
-    def _real_compile_window(self):
-        return _unwrapped_trace_globals(self.base_fn)
-
     def __call__(self, *args, **kwargs):
-        # A traced JIT function called from inside a traced kernel's
-        # interpreted run executes its interpreted function directly.
-        from triton import knobs
+        # When a traced JIT function is called from within another JIT function,
+        # we need to execute the underlying function directly
 
+        # check that client sets match for calling and called functions
         from .frontend import triton as triton_frontend
 
         outer_client_manager = triton_frontend.frontend.current_client_manager()
-        if outer_client_manager is None:
-            if knobs.runtime.interpret:
-                # Triton's own interpreter (TRITON_INTERPRET=1), e.g. running
-                # an untraced kernel: the helper runs untraced, as Triton's
-                # InterpretedFunction would.
-                return self.interpreted_fn(*args, **kwargs)
-            # Outside any interpreter, the caller is a real compile that
-            # reached the trace as a plain Python callable, through a path
-            # _unwrapped_trace_globals and _untraced_call_args do not cover.
-            # Running the interpreter here would patch triton.language for
-            # every later compile.
-            raise TypeError(
-                f"{self.__name__} is a tilelens-traced Triton function called "
-                "outside a traced launch's interpreter, with TRITON_INTERPRET "
-                "off: e.g. by a real compile that reached it through a path "
-                "tilelens does not unwrap; use its JITFunction "
-                f"({self.__name__}.jit_fn) there instead."
-            )
-        # check that client sets match for calling and called functions
-        outer_clients = set(outer_client_manager.clients)
-        inner_clients = set(self.client_manager.clients)
-        if outer_clients != inner_clients:
-            raise RuntimeError(
-                "nested traced calls require matching clients; "
-                f"outer={outer_clients}, inner={inner_clients}"
-            )
+        if outer_client_manager is not None:
+            outer_clients = set(outer_client_manager.clients)
+            inner_clients = set(self.client_manager.clients)
+            if outer_clients != inner_clients:
+                raise RuntimeError(
+                    "nested traced calls require matching clients; "
+                    f"outer={outer_clients}, inner={inner_clients}"
+                )
+            return self.interpreted_fn(*args, **kwargs)
 
-        return self.interpreted_fn(*args, **kwargs)
+        # Outside a traced launch, behave as the untraced function: Triton's
+        # interpreter, or JITFunction's refusal outside a kernel (also when a
+        # real compile calls the trace as plain Python).
+        return self.fn(*args, **kwargs)
 
     def warmup(self, *args, **kwargs):
-        return self._voted_warmup(*args, **kwargs)
+        with self.client_manager.patch_warmup(self.jit_fn, self._real_compile):
+            if self.warmup_runner:
+                self.warmup_runner.warmup(*args, **kwargs)
 
-    def _voted_warmup(self, *args, **kwargs):
-        # The pre/post_warmup vote: a real compile only if some client asks.
-        if not self.warmup_runner:
-            return None
-        with self.client_manager.patch_warmup(
-            self.jit_fn,
-            compile_context=self._real_compile_window,
-            real_args=_untraced_call_args,
-        ):
-            return self.warmup_runner.warmup(*args, **_without_warmup(kwargs))
+    def _real_compile(self, warmup: Callable, args: tuple, kwargs: dict) -> Any:
+        # Triton accepts only JITFunction callees, so the compile must see each
+        # traced helper it reaches, by argument or by name, as its JITFunction.
+        args = tuple(_untraced(arg) for arg in args)
+        kwargs = {name: _untraced(value) for name, value in kwargs.items()}
+        with _unwrapped_trace_globals(self.base_fn):
+            return warmup(*args, **kwargs)
 
 
-def _untraced_call_args(
-    jit_fn: Any, args: tuple, kwargs: dict[str, Any]
-) -> tuple[tuple, dict[str, Any]]:
-    """One JITFunction warmup call's arguments as a real compile must see
-    them: each TritonTrace passed as an argument (also inside a tuple), or
-    bound as a parameter default, replaced by its JITFunction (the default
-    passed explicitly). Triton's code generator treats any other callee as
-    plain Python and would call TritonTrace.__call__.
-    """
-
-    def real(value: Any) -> Any:
-        if isinstance(value, TritonTrace) and value.jit_fn is not None:
-            return value.jit_fn
-        if isinstance(value, tuple):
-            items = [real(item) for item in value]
-            if all(new is old for new, old in zip(items, value)):
-                return value
-            # A namedtuple is rebuilt from fields, a plain tuple from items.
-            return type(value)(*items) if hasattr(value, "_fields") else tuple(items)
-        return value
-
-    real_args = tuple(real(arg) for arg in args)
-    real_kwargs = {name: real(value) for name, value in kwargs.items()}
-    signature = getattr(jit_fn, "signature", None)
-    if isinstance(signature, inspect.Signature):
-        for index, (name, param) in enumerate(signature.parameters.items()):
-            if index < len(real_args) or name in real_kwargs:
-                continue
-            if real(param.default) is not param.default:
-                real_kwargs[name] = real(param.default)
-    return real_args, real_kwargs
+def _untraced(value: Any) -> Any:
+    """``value`` with each TritonTrace in it (also inside a tuple) replaced
+    by its JITFunction: Triton's code generator calls any other callee as
+    plain Python."""
+    if isinstance(value, TritonTrace) and value.jit_fn is not None:
+        return value.jit_fn
+    if isinstance(value, tuple):
+        items = [_untraced(item) for item in value]
+        return type(value)(*items) if hasattr(value, "_fields") else type(value)(items)
+    return value
 
 
 def _code_names(code: types.CodeType) -> set[str]:
+    # Comprehensions are nested code objects before Python 3.12.
     names = set(code.co_names)
     for const in code.co_consts:
         if isinstance(const, types.CodeType):
@@ -348,112 +269,58 @@ def _code_names(code: types.CodeType) -> set[str]:
     return names
 
 
-def _is_triton_internal(value: Any) -> bool:
-    # Triton's own modules and stdlib functions hold no user traces.
-    module: Any = getattr(value, "__module__", None)
-    if isinstance(value, types.ModuleType):
-        module = value.__name__
-    return isinstance(module, str) and module.split(".")[0] == "triton"
-
-
 def _traced_references(
     base_fn: Callable | None,
-) -> list[tuple[dict, str, "TritonTrace"]]:
-    """Every (namespace, name, trace) binding a real compile of ``base_fn``
-    resolves to a TritonTrace.
-
-    Triton resolves a callee from the caller's globals and then through
-    module attributes (``helpers.fn``, ``pkg.api.fn``). The walk follows the
-    same paths, filtered by the names each function's code mentions
-    (co_names), and continues into every referenced JIT function's own code,
-    so helpers of helpers are found and unrelated bindings are left alone.
-    Triton also resolves parameter default expressions in the globals; their
-    names are not in co_names, so a global bound to a traced default counts
-    too.
-    """
+) -> list[tuple[dict, str, TritonTrace]]:
+    """Every (namespace, name, trace) a real compile of ``base_fn`` resolves:
+    each name a reached function's code mentions, looked up in its globals
+    and, as Triton does for ``mod.fn``, in the modules those reach."""
     from triton import JITFunction
 
     found: list[tuple[dict, str, TritonTrace]] = []
-    bindings: set[tuple[int, str]] = set()
     visited_fns: set[int] = set()
     pending: list[Any] = [base_fn]
     while pending:
         fn = pending.pop()
-        code = getattr(fn, "__code__", None)
-        fn_globals = getattr(fn, "__globals__", None)
-        if not isinstance(code, types.CodeType) or not isinstance(fn_globals, dict):
-            continue
         if id(fn) in visited_fns:
             continue
         visited_fns.add(id(fn))
-        names = _code_names(code)
-        traced_defaults = [
-            d
-            for d in getattr(fn, "__defaults__", None) or ()
-            if isinstance(d, TritonTrace)
-        ]
-        if traced_defaults:
-            names |= {
-                name
-                for name, value in fn_globals.items()
-                if any(value is default for default in traced_defaults)
-            }
-        namespaces = [fn_globals]
-        visited_namespaces = {id(fn_globals)}
+        names = _code_names(fn.__code__)
+        namespaces = [fn.__globals__]
+        visited_namespaces = {id(fn.__globals__)}
         while namespaces:
             namespace = namespaces.pop()
             for name in names:
                 value = namespace.get(name)
                 if isinstance(value, TritonTrace):
-                    if (
-                        value.jit_fn is not None
-                        and (id(namespace), name) not in bindings
-                    ):
-                        bindings.add((id(namespace), name))
+                    if value.jit_fn is not None:
                         found.append((namespace, name, value))
                     pending.append(value.base_fn)
-                elif isinstance(value, JITFunction) and not _is_triton_internal(value):
+                elif isinstance(value, JITFunction):
                     pending.append(value.fn)
-                elif isinstance(value, types.ModuleType) and not _is_triton_internal(
-                    value
+                elif (
+                    isinstance(value, types.ModuleType)
+                    and id(vars(value)) not in visited_namespaces
                 ):
-                    module_dict = getattr(value, "__dict__", None)
-                    if (
-                        isinstance(module_dict, dict)
-                        and id(module_dict) not in visited_namespaces
-                    ):
-                        visited_namespaces.add(id(module_dict))
-                        namespaces.append(module_dict)
+                    visited_namespaces.add(id(vars(value)))
+                    namespaces.append(vars(value))
     return found
 
 
 @contextmanager
-def _unwrapped_trace_globals(base_fn: Callable | None = None):
-    """Temporarily bind each TritonTrace a real compile of ``base_fn`` would
-    reach back to its JITFunction.
-
-    Under the CLI wrappers every ``@triton.jit`` function, device functions
-    included, becomes a TritonTrace. Triton's dependency walker and code
-    generator only accept JITCallables as callees ("Unsupported function
-    referenced"); the interpreter tolerates the wrapper through
-    ``TritonTrace.__call__``, a real compile does not. Only the bindings the
-    kernel's code can reach are swapped (see _traced_references), and each is
-    restored on exit unless it was rebound in the meantime. Callees reached
-    through closure variables are not covered (Triton's dependency walker
-    rejects them); callees passed as arguments are mapped per call instead
-    (_untraced_call_args).
-    """
-    swapped: list[tuple[dict, str, TritonTrace]] = []
+def _unwrapped_trace_globals(base_fn: Callable | None):
+    """Bind each TritonTrace a real compile of ``base_fn`` reaches back to its
+    JITFunction for the scope: under the CLI wrappers device functions are
+    traces too, and Triton's dependency walker rejects them ("Unsupported
+    function referenced"). Traces captured in closures are not swapped."""
+    swapped = _traced_references(base_fn)
     try:
-        for namespace, name, trace in _traced_references(base_fn):
-            if namespace.get(name) is trace:
-                namespace[name] = trace.jit_fn
-                swapped.append((namespace, name, trace))
+        for namespace, name, trace in swapped:
+            namespace[name] = trace.jit_fn
         yield
     finally:
-        for namespace, name, trace in reversed(swapped):
-            if namespace.get(name) is trace.jit_fn:
-                namespace[name] = trace
+        for namespace, name, trace in swapped:
+            namespace[name] = trace
 
 
 class NKITrace(LaunchInterface, TraceInterface):
@@ -567,7 +434,7 @@ class GluonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
         )
         self.fn = runner
         self.arg_names = runner.arg_names
-        self.runner = self._interpreter_runner(runner, self.interpreted_fn)
+        self.runner = self._rebuild_runner(runner, self.interpreted_fn)
 
         TraceInterface.__init__(self, client)
         self._copy_callable_attrs(runner, self.base_fn)
