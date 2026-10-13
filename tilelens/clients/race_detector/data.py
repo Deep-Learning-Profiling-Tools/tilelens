@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from typing import Any, Literal
 
 import torch
@@ -13,10 +13,11 @@ MemorySem = Literal["plain", "relaxed", "acquire", "release", "acq_rel"]
 AtomicKind = Literal["none", "cas", "rmw"]
 
 
-class RaceType(Enum):
-    RAW = auto()  # Read-After-Write
-    WAR = auto()  # Write-After-Read
-    WAW = auto()  # Write-After-Write
+class RaceType(str, Enum):
+    # str-valued, so a RaceRecord holds (and a saved trace keeps) the name.
+    RAW = "RAW"  # Read-After-Write
+    WAR = "WAR"  # Write-After-Read
+    WAW = "WAW"  # Write-After-Write
 
 
 @dataclass
@@ -91,6 +92,12 @@ class AccessEventRecord:
     # the intra-instance query ranges over DISTINCT positions only for
     # these pairs.
     dep_loads: tuple[int, ...] = ()
+    # The block position of a lane, one coordinate per dimension of the
+    # access's block (the arange feeding that dimension, minus its start).
+    # When both records of a dependency-ordered pair carry one, the
+    # dependency edge and the DISTINCT-position query compare positions
+    # through it. None: not derived.
+    lane_position: tuple[Any, ...] | None = None
 
     # Operational control conditions used for value-causality dependencies,
     # before execution-domain premises are conjoined into event activity.
@@ -124,6 +131,9 @@ class RaceReport:
     reason: str = ""
     race_type_value: RaceType | None = None
     witness_addr: int | None = None
+    # Each access's own address in the witness (they differ when the two
+    # element sizes do).
+    witness_addrs: tuple[int, int] | None = None
     witness_grid_a: tuple[int, int, int] | None = None
     witness_grid_b: tuple[int, int, int] | None = None
 
@@ -142,10 +152,46 @@ class RaceReport:
         return self.race_type_value
 
 
+@dataclass(frozen=True)
+class RaceAccess:
+    """One access of a race witness."""
+
+    op: str  # the Op's name: "load", "store", "atomic_cas" or "atomic_rmw"
+    writes: bool  # whether it writes in the witness
+    tensor_name: str | None
+    source_location: tuple[str, int, str] | None  # (filename, lineno, func)
+    # The element it touches in the witness, counted in elements from the
+    # tensor's data pointer (the flat index for a contiguous tensor); None
+    # when the tensor is unknown.
+    element: int | None
+
+
+@dataclass(frozen=True)
+class RaceRecord:
+    """A race the race detector found, as ``Launch.records`` holds it.
+
+    Plain data, so ``tilelens.save()`` keeps it: no Z3 terms, no tensors.
+    ``programs`` are the program ids of the two accesses in the witness
+    (equal for a race inside one program instance).
+    """
+
+    race_type: str  # a RaceType value
+    first: RaceAccess
+    second: RaceAccess
+    programs: tuple[tuple[int, int, int], tuple[int, int, int]]
+    reason: str
+
+    def __post_init__(self) -> None:
+        # A RaceType member is held as its plain string, as a load returns it.
+        object.__setattr__(self, "race_type", RaceType(self.race_type).value)
+
+
 __all__ = [
     "AccessEventRecord",
     "AtomicKind",
     "MemorySem",
+    "RaceAccess",
+    "RaceRecord",
     "RaceReport",
     "RaceType",
 ]

@@ -342,6 +342,16 @@ class InterpreterDivergence(Op):
 
 
 @dataclass
+class InlineAsm(Op):
+    """``tl.inline_asm_elementwise``, which the interpreted run cannot execute:
+    the Triton frontend approximates its result by its first argument
+    converted to the result dtype. Delivered with no arguments, before the
+    approximation runs."""
+
+    name: ClassVar[str] = "inline_asm"
+
+
+@dataclass
 class Tensor:
     ptr: int
     dtype: str

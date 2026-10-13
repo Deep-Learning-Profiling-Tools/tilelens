@@ -14,7 +14,14 @@ class UnsupportedSymbolicRaceQuery(Exception):
     Either capture-side normalisation or solver-side lowering may raise this,
     and so may any solver query that Z3 cannot decide. The caller must report
     the launch as unsupported, never as race-free.
+
+    ``reason_unknown`` is Z3's ``reason_unknown()`` (e.g. ``"timeout"``) when
+    an undecided query raised it, None otherwise.
     """
+
+    def __init__(self, *args: object, reason_unknown: str | None = None) -> None:
+        super().__init__(*args)
+        self.reason_unknown = reason_unknown
 
 
 class CountingScopeUnsupported(UnsupportedSymbolicRaceQuery):

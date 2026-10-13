@@ -9,6 +9,9 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "LoadStoreBytes": ("tilelens.clients.profiler.data", "LoadStoreBytes"),
     "OpTypeCounts": ("tilelens.clients.profiler.data", "OpTypeCounts"),
     "RaceDetector": ("tilelens.clients.race_detector.race_detector", "RaceDetector"),
+    "RaceType": ("tilelens.clients.race_detector.data", "RaceType"),
+    "RaceRecord": ("tilelens.clients.race_detector.data", "RaceRecord"),
+    "RaceAccess": ("tilelens.clients.race_detector.data", "RaceAccess"),
     "Sanitizer": ("tilelens.clients.sanitizer.sanitizer", "Sanitizer"),
     "CompiledSanitizer": (
         "tilelens.clients.sanitizer.compiled.client",

@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from ..clients.profiler import data as profiler_data
+from ..clients.race_detector import data as race_detector_data
 from ..clients.sanitizer import data as sanitizer_data
 from ..ir import launch as ir_launch
 from ..ir import verdict as ir_verdict
@@ -27,6 +28,7 @@ _TRACE_CLASSES = {
     for module in (
         trace_data,
         profiler_data,
+        race_detector_data,
         sanitizer_data,
         traceback_utils,
         # Pure data: neither imports Triton.
