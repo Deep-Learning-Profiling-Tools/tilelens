@@ -19,17 +19,20 @@ from tilelens.ir import ttir_reader as R
 from tilelens.ir.ttir_reader import (
     AccessGraph,
     Arange,
+    AtomicInfo,
     Bin,
     Cmp,
     Const,
     IntCast,
     IterArgOffset,
+    Observed,
     Param,
     Pid,
     Select,
     TTIRKind,
     UnsupportedTTIR,
     mentions_observed,
+    observed_indices,
     parse_ttir,
     width_obligations,
 )
@@ -190,6 +193,7 @@ REFUSED = {
     "reader_ttir/int_iterarg_offset.ttir": "loop-variant-advance",
     "reader_ttir/pure_asm_int_addr.ttir": "inline-asm",
     "reader_ttir/observed_lanes.ttir": "indirect-address",
+    "reader_ttir/poll_while.ttir": "control-flow",
 }
 
 
@@ -441,7 +445,7 @@ def test_llvm_and_gpu_ops_outside_the_inert_ones_refuse():
         }) : (tensor<4xi32>) -> i32"""
     e = _refusal(_module(body, args="%p: !tt.ptr<i32>, %n: i32"))
     assert e.kind is TTIRKind.OUT_OF_VOCABULARY and "llvm.inttoptr" in e.message
-    # the inert ones stay inert: ttg.barrier is the one ttg op accepted;
+    # ttg.barrier is the one ttg op accepted (a Fence, see below);
     # gpu.barrier still parses, but the frontend never emits it: refused
     g = parse_ttir(_module("ttg.barrier all\n%v = tt.load %p : !tt.ptr<f32>"))
     assert [a.kind for a in g.accesses] == ["load"]
@@ -887,3 +891,176 @@ def test_obligation_sites_do_not_affect_term_equality():
     b = Bin("+", Pid(0), Const(1), 32, line_no=9, loc=None)
     assert a == b and hash(a) == hash(b) and repr(a) == repr(b)
     assert Bin("+", Pid(0), Const(1), 64) != a  # the width is part of the value
+
+
+# ─────────────────────────── facts for the race detector ───────────────────────────
+
+
+def test_atomics_carry_their_attributes_and_operands():
+    g = _graph("reader_ttir/atomic_attrs.ttir")
+    atomics = [a for a in g.accesses if a.atomic is not None]
+    assert [(a.kind, a.atomic) for a in atomics] == [
+        ("atomic_rmw", AtomicInfo(op, sem, scope))
+        for op, sem, scope in [
+            ("and", "relaxed", "gpu"),
+            ("or", "acquire", "cta"),
+            ("xor", "release", "sys"),
+            ("add", "acq_rel", "gpu"),
+            ("fadd", "acq_rel", "gpu"),
+            ("max", "acq_rel", "gpu"),
+            ("min", "acq_rel", "gpu"),
+            ("umax", "acq_rel", "gpu"),
+            ("umin", "acq_rel", "gpu"),
+            ("exch", "acq_rel", "gpu"),
+        ]
+    ] + [("atomic_cas", AtomicInfo(None, "release", "sys"))]
+    # the value operand as a Term, None for loaded data (and floats)
+    vals = [a.atomic_val for a in atomics]
+    assert vals[3] == Pid(0) and vals[0] == Const(1)
+    assert vals[4] is None and vals[9] is None  # 1.0, a loaded value
+    cas = atomics[-1]
+    assert (cas.atomic_cmp, cas.atomic_val) == (Pid(0), Const(1))
+    assert all(a.atomic_cmp is None for a in atomics[:-1])
+    (load,) = [a for a in g.accesses if a.kind == "load"]
+    assert load.atomic is None and load.atomic_val is None
+    # elem_float is the accessed pointer's pointee: the fmax atomics of
+    # golden_atomic_fmax go through i32 views of the f32 out_ptr
+    assert [a.elem_float for a in atomics] == [i == 4 for i in range(11)]
+    g = _graph("ttir/golden_atomic_fmax_sm80.ttir")
+    assert [(a.kind, a.elem_float) for a in g.accesses] == [
+        ("load", True),
+        ("atomic_rmw", False),
+        ("atomic_rmw", False),
+    ]
+
+
+def test_observed_indices_reach_through_loop_carried_pointers():
+    for name in ("p4_observed_direct", "p4_observed_loop", "p4_observed_delta"):
+        g = _graph(f"reader_ttir/{name}.ttir")
+        load = next(a for a in g.accesses if a.kind == "load")
+        assert observed_indices(load.offset, g) == {0}, name
+        assert observed_indices(load.mask, g) == frozenset()
+    # the iter_arg's offset0 / delta hold the observation, not the offset
+    assert not any(isinstance(n, Observed) for n in R._nodes((load.offset,), None))
+
+
+def test_pid_axes_are_every_axis_read():
+    # axes 1 and 2 reach only a stored value, never an address
+    assert _graph("reader_ttir/fences.ttir").pid_axes == {0, 1, 2}
+    assert _graph("ttir/spike_atomics.ttir").pid_axes == frozenset()
+    # a combine region's program id counts; its barrier is no Fence
+    g = _graph("reader_ttir/pid_in_combine.ttir")
+    assert (g.pid_axes, g.fences) == ({0, 1}, ())
+
+
+def test_barriers_are_fences_among_the_accesses():
+    text = _text("reader_ttir/fences.ttir")
+    g = parse_ttir(text)
+    store0, load, store1, store_loop, store2 = g.accesses
+    top, then, data, loop = g.fences
+    assert [f.position for f in g.fences] == [0.5, 1.5, 2.5, 2.5]
+    assert all(f.op == "ttg.barrier" and f.addr_space == 31 for f in g.fences)
+    for f in g.fences:
+        assert "ttg.barrier all" in text.splitlines()[f.line_no - 1]
+        assert "tl.debug_barrier()" in _source_line(f.loc)
+    # path, guarded and in_loop read as an access's
+    assert then.path == Cmp("slt", Pid(0), Param("n"), 32) == store1.path
+    assert (data.guarded, data.path) == (True, None)
+    assert (loop.in_loop, store_loop.in_loop) == (True, True)
+    assert not any(f.in_loop or f.guarded for f in (top, then))
+
+    # block paths: a fence's is a prefix of exactly the accesses in its block
+    def under(f):
+        return [a.block_path[: len(f.block_path)] == f.block_path for a in g.accesses]
+
+    assert under(top) == [True] * 5
+    assert under(then) == [False, False, True, False, False]
+    assert under(data) == [False] * 5
+    assert under(loop) == [False, False, False, True, False]
+    # addrSpace is a bit set
+    for kw, bits in (("local", 1), ("global_read|global_write", 6)):
+        g = parse_ttir(_module(f"ttg.barrier {kw}\n%v = tt.load %p : !tt.ptr<f32>"))
+        assert [(f.addr_space, f.position) for f in g.fences] == [(bits, -0.5)]
+
+
+def _deps(name: str) -> list[tuple[str, tuple[int, ...]]]:
+    return [(a.kind, a.deps) for a in _graph(f"reader_ttir/{name}.ttir").accesses]
+
+
+def test_deps_are_the_loads_a_value_reads_lane_for_lane():
+    g = _graph("reader_ttir/deps_rules.ttir")
+    assert all(a.elem_float for a in g.accesses if a.kind == "store")  # f32 out
+    assert _deps("deps_rules") == [
+        ("load", ()),
+        ("load", ()),
+        ("load", ()),
+        ("store", (0, 2)),  # x * 2 + 1 under mask m > 0
+        ("store", (2,)),  # where(m > 0, x, y): the condition's
+        ("store", (0,)),  # where(offs < n, x, x + 1): both arms'
+        ("store", ()),  # where(offs < n, x, y)
+        ("store", (1,)),  # sum(x) + y: a splat of a scalar sum drops x
+        ("store", ()),  # an scf.if result
+        ("store", (0,)),  # exp, bitcast
+        ("load", ()),
+        ("store", ()),  # tt.reduce
+        ("load", ()),  # masked by m
+        ("store", (12,)),
+        ("store", (0,)),  # x under a mask of sum(x): the operands unite
+        ("store", ()),  # the loop-carried acc
+    ]
+    # tt.dot: the accumulator, not the operands
+    assert _deps("deps_dot")[-1] == ("store", (2,))
+    # an atomic_rmw's val and mask, an atomic_cas's cmp and val, and an
+    # atomic's result
+    assert _deps("deps_atomics") == [
+        ("load", ()),
+        ("load", ()),
+        ("atomic_rmw", (0, 1)),
+        ("load", ()),
+        ("load", ()),
+        ("atomic_cas", (3, 4)),
+        ("store", (2,)),
+    ]
+    # a shape change keeps no lane: a splat of a loaded scalar
+    body = """
+        %x = tt.load %p : !tt.ptr<f32>
+        %s = tt.splat %x : f32 -> tensor<4xf32>
+        %ps = tt.splat %p : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+        tt.store %ps, %s : tensor<4x!tt.ptr<f32>>
+        tt.store %p, %x : !tt.ptr<f32>"""
+    assert [a.deps for a in parse_ttir(_module(body)).accesses] == [(), (), (0,)]
+
+
+def test_while_regions_are_read_only_on_request():
+    text = _text("reader_ttir/poll_while.ttir")
+    e = _refusal(text)
+    assert e.kind is TTIRKind.CONTROL_FLOW and "scf.while" in e.message
+    g = parse_ttir(text, while_regions=True)
+    first, guarded, outer, inner = g.whiles
+    assert [w.before for w in g.whiles] == [(0,), (1,), (2,), (3,)]
+    assert [w.after for w in g.whiles] == [(), (), (3,), ()]
+    assert [w.parent for w in g.whiles] == [None, None, None, 2]
+    assert outer.after_ops == ("scf.while", "scf.yield")
+    assert first.after_ops == inner.after_ops == ("scf.yield",)
+    assert not any(w.carries for w in g.whiles)
+    # a poll's result is an observation, like an atomic's
+    assert first.cond == Cmp("eq", Observed(0), Const(0), 32)
+    assert guarded.cond == Cmp("ne", Observed(1), Param("n"), 32)
+    assert g.accesses[1].path == Cmp("slt", Pid(0), Param("n"), 32)
+    assert guarded.block_path == g.accesses[1].block_path[:-1]
+    assert guarded.blocks[0] == g.accesses[1].block_path[-1]
+    for w in g.whiles:
+        assert "scf.while" in text.splitlines()[w.line_no - 1]
+        assert "while tl." in _source_line(w.loc)
+    # a carried loop value and an atomic poll (the walk-layer corpus)
+    g = parse_ttir(_text("ttir/spike_spin_while.ttir"), while_regions=True)
+    cas, carried = g.whiles
+    assert cas.cond == Cmp("eq", Observed(0), Const(1), 32) and not cas.carries
+    assert (carried.carries, carried.cond, carried.after) == (True, None, (2,))
+    assert carried.after_ops == ("tt.load", "scf.yield")
+    assert g.accesses[3].deps == ()  # the store of the loop's result
+    # without an scf.while the option changes nothing
+    for name in ("ttir/golden_matmul_s3_sm80.ttir", "reader_ttir/fences.ttir"):
+        assert parse_ttir(_text(name), while_regions=True) == _graph(name)
+    outcome = ParseCache().get(text, while_regions=True)
+    assert len(outcome.graph.whiles) == 4

@@ -46,6 +46,8 @@ def test_generic_form_reads_like_the_custom_form():
     m = W._walk(_text("crafted_generic_form.ttir"))
     assert _ops(m, "arith.cmpi")[0].attrs["predicate"] == "slt"
     assert _ops(m, "tt.get_program_id")[0].attrs["axis"] == 1
+    (rmw,) = _ops(m, "tt.atomic_rmw")
+    assert dict(rmw.attrs) == {"rmw_op": "fadd", "sem": "acq_rel", "scope": "gpu"}
 
 
 def test_structure_records_are_consistent():

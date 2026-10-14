@@ -342,7 +342,7 @@ def test_artifact_log_keeps_declared_stages_meta_and_bindings():
     log.record(
         _event((x, out, 64, False, 0.5), {"BLOCK": 8, "EVEN": True}, kernel=kernel_b)
     )
-    log.record(
+    again = log.record(
         _event(
             (x, out, 64, False, 0.5),
             {"BLOCK": 4, "EVEN": True},
@@ -355,6 +355,7 @@ def test_artifact_log_keeps_declared_stages_meta_and_bindings():
     spec_a, spec_b = log.specializations
     assert (spec_a.specialization, spec_b.specialization) == ("hash-a", "hash-b")
     assert len(spec_a.bindings) == 2 and len(spec_b.bindings) == 1
+    assert spec_a.bindings[1] is again  # record returns the binding it keeps
     # Only the declared stages the kernel has: no ttgir, no ptx.
     assert dict(spec_a.artifacts.stages) == {"ttir": "// ttir a"}
     assert dict(spec_a.artifacts.meta) == {
