@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import builtins
+from contextlib import ExitStack, contextmanager
+from functools import wraps
 import inspect
 import itertools
 import operator
+import threading
 import types
+import warnings
 from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 import numpy as np
@@ -21,6 +25,9 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from ..frontend.base import get_frontend
+
+
+cutile_execution_lock = threading.RLock()
 
 
 DTYPES = {
@@ -41,6 +48,25 @@ DTYPES = {
     ct.float8_e5m2: STORAGE_DTYPES["float8_e5m2"],
 }
 NUMPY_DTYPES = {dtype: token for token, dtype in DTYPES.items()}
+
+
+# Save signatures before patching the language module.
+_LANG_FUNCTIONS = {
+    name: getattr(ct, name)
+    for name in ct.__all__
+    if inspect.isfunction(getattr(ct, name))
+}
+if hasattr(ct, "Slice"):
+    _LANG_FUNCTIONS["Slice"] = ct.Slice
+_LANG_SIGNATURES = {name: inspect.signature(fn) for name, fn in _LANG_FUNCTIONS.items()}
+_TILE_FUNCTION_CODE = ct.function(lambda: None).__code__
+
+
+def _is_tile_function(fn):
+    # cuTile 1.0 did not mark its tile-only wrappers with an attribute.
+    return getattr(fn, "_cutile_function_wrapper", False) or (
+        isinstance(fn, types.FunctionType) and fn.__code__ is _TILE_FUNCTION_CODE
+    )
 
 
 def _is_float(dtype):
@@ -169,7 +195,15 @@ def _tile_access(array, index, shape, order="C", traversal_steps=None):
         raise ValueError("Tile shape, index, and traversal steps must match array rank")
     if any(operator.index(s) <= 0 for s in steps):
         raise ValueError("Traversal steps must be positive integers")
-    starts = tuple(i * s for i, s in zip(index, steps))
+    valid = all(
+        0 <= i < (array.shape[axis] + s - 1) // s
+        for i, s, axis in zip(index, steps, axes)
+    )
+    starts = (
+        tuple(i * s for i, s in zip(index, steps))
+        if valid
+        else tuple(array.shape[axis] for axis in axes)
+    )
     return shape, axes, access_shape, starts
 
 
@@ -385,6 +419,8 @@ class Array:
     """Mutable global storage or a slice sharing its parent's NumPy memory."""
 
     def __init__(self, value, parent=None, origin=None):
+        if any(stride % value.itemsize for stride in value.strides):
+            raise ValueError("Array byte strides must be multiples of element size")
         self.data = value
         self._parent = parent
         self._origin = (0,) * value.ndim if origin is None else origin
@@ -510,6 +546,7 @@ class TiledView:
         )
 
     def store(self, index, tile, **kwargs):
+        tile = Tile(_implicit_value(tile, self.array.dtype))
         tile = cutile_builder.broadcast_to(tile, self.tile_shape)
         return cutile_builder.store(
             self.array, index, tile, traversal_steps=self.traversal_steps, **kwargs
@@ -572,7 +609,7 @@ class Builder:
             keys, valid = _indexed_access(
                 array, index, kwargs.get("mask"), kwargs.get("check_bounds", True)
             )
-            padding = _tile_value(kwargs.get("padding_value", 0))
+            padding = _implicit_value(kwargs.get("padding_value", 0), array.dtype)
             value = np.broadcast_to(padding, valid.shape)
             value = value.astype(array.data.dtype).copy()
             value[valid] = array.data[tuple(key[valid] for key in keys)]
@@ -610,10 +647,10 @@ class Builder:
             keys, valid = _indexed_access(
                 array, index, kwargs.get("mask"), kwargs.get("check_bounds", True)
             )
-            value = np.broadcast_to(_tile_value(tile), valid.shape)
+            value = np.broadcast_to(_implicit_value(tile, array.dtype), valid.shape)
             array.data[tuple(key[valid] for key in keys)] = value[valid]
             return
-        value = _tile_value(tile)
+        value = _implicit_value(tile, array.dtype)
         _, axes, shape, starts = _tile_access(
             array, index, value.shape, order, traversal_steps
         )
@@ -942,100 +979,255 @@ class Builder:
         )
 
     def atomic_add(self, array, indices, update, /, *, check_bounds=True, **kwargs):
-        """Sequential element updates, returning old values for repeated indices."""
+        return self._atomic(array, indices, update, np.add, check_bounds=check_bounds)
+
+    def _atomic(
+        self, array, indices, update, operation, *, check_bounds=True, expected=None
+    ):
         keys, valid = _indexed_access(array, indices, check_bounds=check_bounds)
-        values = np.broadcast_to(_tile_value(update), valid.shape)
+        updates = np.broadcast_to(_implicit_value(update, array.dtype), valid.shape)
+        previous = self.gather(array, indices, check_bounds=check_bounds)
+        old = previous.data.copy()
+        final = previous.data.copy()
         positions = tuple(key[valid] for key in keys)
-        offsets = np.ravel_multi_index(positions, array.shape)
-        if np.unique(offsets).size == offsets.size:
-            previous = self.gather(array, indices, check_bounds=check_bounds)
-            self.scatter(
-                array, indices, previous.data + values, check_bounds=check_bounds
-            )
-            return previous
-        old = np.zeros(valid.shape, dtype=array.data.dtype)
-        for position in np.ndindex(valid.shape):
-            if valid[position]:
-                key = tuple(int(index[position]) for index in keys)
-                previous = self.gather(array, key, check_bounds=False)
-                old[position] = previous.data
-                self.scatter(
-                    array, key, previous.data + values[position], check_bounds=False
+        offsets = sum(
+            (key * stride for key, stride in zip(positions, array.data.strides)),
+            np.zeros(np.count_nonzero(valid), dtype=np.int64),
+        )
+        order = np.argsort(offsets, kind="stable")
+        sorted_offsets = offsets[order]
+        starts = np.r_[0, np.flatnonzero(np.diff(sorted_offsets)) + 1, len(order)]
+        old_values, new_values = old[valid], final[valid]
+        valid_updates = updates[valid]
+        comparisons = (
+            None
+            if expected is None
+            else np.broadcast_to(_implicit_value(expected, array.dtype), valid.shape)
+        )
+        if comparisons is not None:
+            old[~valid] = comparisons[~valid]
+            comparisons = comparisons[valid]
+        for start, stop in zip(starts[:-1], starts[1:]):
+            group = order[start:stop]
+            if not group.size:
+                continue
+            initial = old_values[group[0]]
+            if operation in ("exchange", "cas"):
+                current = initial
+                for lane in group:
+                    old_values[lane] = current
+                    if operation == "exchange" or current == comparisons[lane]:
+                        current = valid_updates[lane]
+            else:
+                sequence = np.concatenate(
+                    (np.asarray(initial).reshape(1), valid_updates[group])
                 )
+                accumulated = operation.accumulate(sequence, dtype=array.data.dtype)
+                old_values[group] = accumulated[:-1]
+                current = accumulated[-1]
+            new_values[group] = current
+        old[valid], final[valid] = old_values, new_values
+        # One vector access per operation, even when addresses repeat.
+        self.scatter(
+            array, indices, Tile(final), mask=Tile(valid), check_bounds=check_bounds
+        )
         return Tile(old)
+
+    def atomic_max(self, array, indices, update, /, *, check_bounds=True, **kwargs):
+        return self._atomic(array, indices, update, np.fmax, check_bounds=check_bounds)
+
+    def atomic_min(self, array, indices, update, /, *, check_bounds=True, **kwargs):
+        return self._atomic(array, indices, update, np.fmin, check_bounds=check_bounds)
+
+    def atomic_and(self, array, indices, update, /, *, check_bounds=True, **kwargs):
+        return self._atomic(
+            array, indices, update, np.bitwise_and, check_bounds=check_bounds
+        )
+
+    def atomic_or(self, array, indices, update, /, *, check_bounds=True, **kwargs):
+        return self._atomic(
+            array, indices, update, np.bitwise_or, check_bounds=check_bounds
+        )
+
+    def atomic_xor(self, array, indices, update, /, *, check_bounds=True, **kwargs):
+        return self._atomic(
+            array, indices, update, np.bitwise_xor, check_bounds=check_bounds
+        )
+
+    def atomic_xchg(self, array, indices, update, /, *, check_bounds=True, **kwargs):
+        return self._atomic(
+            array, indices, update, "exchange", check_bounds=check_bounds
+        )
+
+    def atomic_cas(
+        self, array, indices, expected, desired, /, *, check_bounds=True, **kwargs
+    ):
+        return self._atomic(
+            array, indices, desired, "cas", expected=expected, check_bounds=check_bounds
+        )
+
+    @staticmethod
+    def _check_cpu_math_options(
+        rounding_mode=None, flush_to_zero=False, *, rounding_modes=(ct.RoundingMode.RN,)
+    ):
+        if not isinstance(flush_to_zero, bool):
+            raise TypeError("flush_to_zero must be a constant bool")
+        if rounding_mode is not None and not isinstance(rounding_mode, ct.RoundingMode):
+            raise TypeError("rounding_mode must be a RoundingMode or None")
+        if flush_to_zero:
+            raise NotImplementedError("flush_to_zero is unsupported")
+        if rounding_mode is not None and rounding_mode not in rounding_modes:
+            raise NotImplementedError(
+                "CPU simulation does not implement this rounding mode"
+            )
+
+    def static_iter(self, iterable, /):
+        # Snapshot the iterable before unrolling, as the compiler does.
+        if isinstance(iterable, (Tile, Array)):
+            raise TypeError("static_iter requires a Python iterable")
+        return iter(tuple(iterable))
+
+    def cdiv(self, x, y, /):
+        lhs, rhs, dtype = _binary_values(x, y)
+        if dtype.kind not in "iu":
+            raise TypeError("cdiv requires integer operands")
+        if np.any(rhs == 0):
+            raise ZeroDivisionError("cdiv by zero")
+        # Exact ceil-division without fixed-width intermediate overflow.
+        result = -np.floor_divide(-lhs.astype(object), rhs.astype(object))
+        limits = np.iinfo(dtype)
+        if np.any(result < limits.min) or np.any(result > limits.max):
+            raise NotImplementedError(
+                "Integer division overflow has no defined CPU result"
+            )
+        return Tile(np.asarray(result, dtype=dtype))
 
 
 cutile_builder = Builder()
 
 
+def _language_operation(name):
+    original = _LANG_FUNCTIONS[name]
+
+    @wraps(original)
+    def execute(*args, **kwargs):
+        bound = _LANG_SIGNATURES[name].bind(*args, **kwargs)
+        bound.apply_defaults()
+        for key, enum in (
+            ("memory_order", ct.MemoryOrder),
+            ("memory_scope", ct.MemoryScope),
+        ):
+            if key in bound.arguments and not isinstance(bound.arguments[key], enum):
+                raise TypeError(f"Invalid {key}: {bound.arguments[key]}")
+        cutile_builder._check_cpu_math_options(
+            bound.arguments.get("rounding_mode"),
+            bound.arguments.get("flush_to_zero", False),
+            rounding_modes=(ct.RoundingMode.RN, ct.RoundingMode.FULL),
+        )
+        method = getattr(cutile_builder, name, None)
+        if method is None:
+            raise NotImplementedError(f"ct.{name} is unsupported")
+        return method(*args, **kwargs)
+
+    return execute
+
+
 def cutile_patch_lang(scope=None):
-    """Bind cuda.tile operations to the current interpreter builder methods."""
-
-    def _set_attr(obj, name, value):
+    """Bind cuTile operations to the interpreter while preserving signatures."""
+    for name in _LANG_FUNCTIONS:
+        if name in ("function", "compiler_timeout"):
+            continue
+        value = _language_operation(name)
         if scope is None:
-            setattr(obj, name, value)
+            setattr(ct, name, value)
         else:
-            scope.set_attr(obj, name, value)
-
-    for name in (
-        "bid",
-        "load",
-        "store",
-        "full",
-        "add",
-        "sub",
-        "mul",
-        "truediv",
-        "less",
-        "greater",
-        "less_equal",
-        "greater_equal",
-        "bitwise_and",
-        "bitwise_or",
-        "reshape",
-        "astype",
-        "sum",
-        "matmul",
-        "zeros",
-        "ones",
-        "arange",
-        "num_tiles",
-        "broadcast_to",
-        "permute",
-        "transpose",
-        "expand_dims",
-        "extract",
-        "floordiv",
-        "mod",
-        "equal",
-        "not_equal",
-        "bitwise_xor",
-        "bitwise_lshift",
-        "bitwise_rshift",
-        "where",
-        "maximum",
-        "minimum",
-        "exp",
-        "exp2",
-        "log",
-        "rsqrt",
-        "max",
-        "argmax",
-        "cumsum",
-        "cat",
-        "mma",
-        "gather",
-        "scatter",
-        "atomic_add",
-    ):
-        _set_attr(ct, name, getattr(cutile_builder, name))
-    _set_attr(ct, "static_iter", iter)
+            scope.set_attr(ct, name, value)
 
 
 def cutile_unpatch_lang(scope=None):
     """Restore the language functions saved by a patch scope."""
     if scope is not None:
         scope.restore()
+
+
+@contextmanager
+def _execution_scope(fn):
+    """Patch referenced aliases and helper globals, then restore them."""
+    scope, visited = ExitStack(), set()
+    originals = {
+        id(value): name
+        for name, value in _LANG_FUNCTIONS.items()
+        if name not in ("function", "compiler_timeout")
+    }
+    missing = object()
+
+    def set_global(namespace, name, value):
+        previous = namespace.get(name, missing)
+        if previous is missing:
+            scope.callback(namespace.pop, name, None)
+        else:
+            scope.callback(operator.setitem, namespace, name, previous)
+        namespace[name] = value
+
+    def patched_value(value):
+        operation = originals.get(id(value))
+        if operation is not None:
+            wrapper = _language_operation(operation)
+            visited.add(id(wrapper))
+            return wrapper
+        return inspect.unwrap(value) if _is_tile_function(value) else value
+
+    def tile_minmax(original, operation):
+        def execute(*args, **kwargs):
+            if len(args) == 2 and any(isinstance(arg, Tile) for arg in args):
+                return operation(*args, **kwargs)
+            return original(*args, **kwargs)
+
+        return execute
+
+    def patch_function(function):
+        if not isinstance(function, types.FunctionType) or id(function) in visited:
+            return
+        visited.add(id(function))
+        namespace = function.__globals__
+        for name, operation in (
+            ("max", cutile_builder.maximum),
+            ("min", cutile_builder.minimum),
+        ):
+            original = getattr(builtins, name)
+            if namespace.get(name, original) is original:
+                set_global(namespace, name, tile_minmax(original, operation))
+        for name in function.__code__.co_names:
+            value = namespace.get(name)
+            replacement = patched_value(value)
+            if replacement is not value:
+                set_global(namespace, name, replacement)
+                value = replacement
+            if isinstance(value, types.FunctionType):
+                patch_function(value)
+            elif isinstance(value, types.ModuleType) and not value.__name__.startswith(
+                ("cuda", "numpy", "tilelens")
+            ):
+                for attribute in function.__code__.co_names:
+                    helper = getattr(value, attribute, None)
+                    replacement = patched_value(helper)
+                    if replacement is not helper:
+                        set_global(value.__dict__, attribute, replacement)
+                    patch_function(replacement)
+        for cell in function.__closure__ or ():
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                continue
+            replacement = patched_value(value)
+            if replacement is not value:
+                scope.callback(setattr, cell, "cell_contents", value)
+                cell.cell_contents = replacement
+            patch_function(replacement)
+
+    with scope:
+        patch_function(fn)
+        yield fn
 
 
 def _parameter_annotations(fn):
@@ -1070,11 +1262,30 @@ def _wrap_argument(arg, scalar_dtype=None):
     if scalar_dtype is not None:
         _check_integer_scalar(arg, scalar_dtype)
         return Tile(arg, scalar_dtype)
+    if isinstance(arg, (Array, Tile)):
+        return arg
     if isinstance(arg, np.ndarray):
         return Array(arg)
     if isinstance(arg, (bool, int, float, np.generic)):
         return Tile(arg)
-    return arg
+    if arg is None or isinstance(arg, (str, tuple)):
+        return arg
+    import torch
+
+    if isinstance(arg, torch.Tensor):
+        if arg.device.type != "cpu":
+            raise TypeError("cuTile interpretation requires CPU tensors")
+        arg = arg.detach()
+        storage = {
+            torch.bfloat16: torch.int16,
+            torch.float8_e4m3fn: torch.uint8,
+            torch.float8_e5m2: torch.uint8,
+        }
+        if arg.dtype in storage:
+            dtype = _numpy_dtype(arg.dtype)
+            return Array(arg.view(storage[arg.dtype]).numpy().view(dtype))
+        return Array(arg.numpy())
+    raise TypeError(f"Unsupported cuTile argument: {type(arg).__name__}")
 
 
 class CuTileInterpretedFunction:
@@ -1084,41 +1295,17 @@ class CuTileInterpretedFunction:
         # @ct.kernel stores the original Python function in _pyfunc.
         self.fn = fn._pyfunc if isinstance(fn, ct.kernel) else fn
 
-    def _execution_function(self):
-        """Handle elementwise min/max in the kernel's globals."""
-        namespace = self.fn.__globals__.copy()
-
-        def tile_minmax(name, operation):
-            original = namespace.get(name, getattr(builtins, name))
-            # A kernel may intentionally shadow a builtin with a helper.
-            if original is not getattr(builtins, name):
-                return original
-
-            def wrapped(*args, **kwargs):
-                if len(args) == 2 and any(isinstance(arg, Tile) for arg in args):
-                    return operation(*args, **kwargs)
-                return original(*args, **kwargs)
-
-            return wrapped
-
-        namespace["max"] = tile_minmax("max", cutile_builder.maximum)
-        namespace["min"] = tile_minmax("min", cutile_builder.minimum)
-        return types.FunctionType(
-            self.fn.__code__,
-            namespace,
-            self.fn.__name__,
-            self.fn.__defaults__,
-            self.fn.__closure__,
-        )
-
     def run(self, *args, grid=(1,), client_manager=None, **kwargs) -> None:
+        with cutile_execution_lock:
+            return self._run(*args, grid=grid, client_manager=client_manager, **kwargs)
+
+    def _run(self, *args, grid=(1,), client_manager=None, **kwargs) -> None:
         grid_dims = (grid,) if isinstance(grid, int) else tuple(grid)
         if not 1 <= len(grid_dims) <= 3 or any(
-            not isinstance(dim, int) or dim < 0 for dim in grid_dims
+            not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0
+            for dim in grid_dims
         ):
-            raise ValueError(
-                "cuTile grid must contain one to three nonnegative integers"
-            )
+            raise ValueError("cuTile grid must contain one to three positive integers")
         grid_dims += (1,) * (3 - len(grid_dims))
         cutile_builder.set_grid_dim(*grid_dims)
 
@@ -1133,6 +1320,13 @@ class CuTileInterpretedFunction:
 
         if client_manager is not None:
             for name, arg in bound.arguments.items():
+                if isinstance(arg, Array) and not arg.is_contiguous():
+                    warnings.warn(
+                        f"cuTile argument {name!r} is noncontiguous; visualization "
+                        "and trace saving require contiguous arrays",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
                 trace_arg = (
                     _TraceArray(arg)
                     if isinstance(arg, Array) and _is_low_precision(arg.data.dtype)
@@ -1149,17 +1343,16 @@ class CuTileInterpretedFunction:
             else None
         )
         try:
-            execution_fn = self._execution_function()
-            execution_fn.__kwdefaults__ = self.fn.__kwdefaults__
-            for grid_idx in itertools.product(*(range(dim) for dim in grid_dims)):
-                cutile_builder.set_grid_idx(*grid_idx)
-                if client_manager is not None:
-                    client_manager.grid_idx_callback(grid_idx)
-                    if not client_manager.pre_run_callback(self.fn):
-                        return
-                execution_fn(*args, **kwargs)
-                if client_manager is not None:
-                    if not client_manager.post_run_callback(self.fn):
-                        return
+            with _execution_scope(self.fn) as execution_fn:
+                for grid_idx in itertools.product(*(range(dim) for dim in grid_dims)):
+                    cutile_builder.set_grid_idx(*grid_idx)
+                    if client_manager is not None:
+                        client_manager.grid_idx_callback(grid_idx)
+                        if not client_manager.pre_run_callback(self.fn):
+                            return
+                    execution_fn(*args, **kwargs)
+                    if client_manager is not None:
+                        if not client_manager.post_run_callback(self.fn):
+                            return
         finally:
             cutile_unpatch_lang(scope)

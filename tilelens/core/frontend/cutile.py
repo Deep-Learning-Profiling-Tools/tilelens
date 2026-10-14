@@ -1,6 +1,8 @@
 """Adapt cuTile interpreter operations to the shared tracing callbacks."""
 
 from collections.abc import Callable
+from contextlib import contextmanager
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -177,3 +179,51 @@ class CuTileFrontend(Frontend):
 
 
 frontend = register_frontend(CuTileFrontend())
+
+
+_launch_scope_lock = Lock()
+_launch_scope = None
+_launch_options = None
+_launch_users = 0
+
+
+@contextmanager
+def interpreted_launches(client="tracer"):
+    """Run ct.launch on CPU; overlapping scopes must use identical settings."""
+    global _launch_scope, _launch_options, _launch_users
+
+    import cuda.tile as ct
+    import tilelens
+    from tilelens.core.trace import CuTileTrace
+
+    def launch(stream, grid, kernel, args):
+        runner = (
+            kernel
+            if isinstance(kernel, CuTileTrace)
+            else tilelens.trace(client, frontend="cutile")(kernel)
+        )
+        return runner.run(*args, grid=grid)
+
+    # The global entry point can be shared by worker threads. Hold this guard
+    # only while changing ownership; each runner serializes its own execution.
+    with _launch_scope_lock:
+        options = client
+        if _launch_users and options != _launch_options:
+            raise RuntimeError(
+                "Overlapping interpreted_launches contexts must use the same "
+                "client settings"
+            )
+        if not _launch_users:
+            _launch_scope = _LangPatchScope()
+            _launch_scope.set_attr(ct, "launch", launch)
+            _launch_options = options
+        _launch_users += 1
+    try:
+        yield
+    finally:
+        with _launch_scope_lock:
+            _launch_users -= 1
+            if not _launch_users:
+                _launch_scope.restore()
+                _launch_scope = None
+                _launch_options = None

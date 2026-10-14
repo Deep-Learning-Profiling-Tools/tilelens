@@ -233,13 +233,18 @@ class CuTileTrace(LaunchInterface, TraceInterface):
         super().add_client(selected)
 
     def run(self, *args, grid=(1,), **kwargs):
+        from .simulation.cutile import cutile_execution_lock
+
         kwargs.pop("warmup", None)
-        with self.client_manager.patch_run(self.func, frontend_name=self.frontend_name):
-            ret = self.interpreter_fn.run(
-                *args, grid=grid, client_manager=self.client_manager, **kwargs
-            )
-            self.finalize()
-            return ret
+        with cutile_execution_lock:
+            with self.client_manager.patch_run(
+                self.func, frontend_name=self.frontend_name
+            ):
+                ret = self.interpreter_fn.run(
+                    *args, grid=grid, client_manager=self.client_manager, **kwargs
+                )
+                self.finalize()
+                return ret
 
     def __call__(self, *args, **kwargs):
         return self.run(*args, **kwargs)
