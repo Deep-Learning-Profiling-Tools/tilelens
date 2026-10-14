@@ -8,7 +8,7 @@ git clone https://github.com/Deep-Learning-Profiling-Tools/tilelens.git
 cd tilelens
 
 # Setup dev environment and install dependencies
-uv sync --extra test  # append "--extra nki" if developing NKI functionality
+uv sync --extra test  # for NKI work: uv sync --python 3.12 --extra nki --extra test
 pre-commit install
 
 # (code up the PR)
@@ -27,8 +27,8 @@ examples/             # Entry points for new users to try out tilelens functiona
 docs/                 # tilelens website
 tilelens/
   core/frontend/      # DSL operation adapters and runtime patching
-  core/simulation/    # NKI simulation runtimes
-  clients/            # Visualizer, profiler, and sanitizer clients
+  core/simulation/    # CPU simulation runtimes for Gluon and NKI
+  clients/            # Tracer (visualizer), profiler, sanitizer, and race detector clients
   visualizer/         # Python interface for the visualizer
   utils/              # Miscellaneous utility functions
 tests/
