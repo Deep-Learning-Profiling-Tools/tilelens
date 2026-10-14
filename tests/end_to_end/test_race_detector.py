@@ -558,6 +558,295 @@ def test_dependency_orders_a_lane_after_its_own_position_only():
 
 
 @triton.jit
+def _published_2d_kernel(
+    z, flag, B: tl.constexpr, COLS: tl.constexpr, SHARED: tl.constexpr
+):
+    # As _published_reversed_old_value_kernel in 2-D, with the rows or the
+    # columns reversed: a comparison of one dimension only would order
+    # another position's atomic before the store. (Two aranges on one
+    # line would share a variable.) SHARED: the publication uses the
+    # atomic's aranges, so only another lane's publication is acquired.
+    pid = tl.program_id(0)
+    r1 = tl.arange(0, B)
+    c1 = tl.arange(0, B)
+    rz = r1 if COLS else B - 1 - r1
+    cz = B - 1 - c1 if COLS else c1
+    old = tl.atomic_add(
+        z + rz[:, None] * B + cz[None, :], 1, mask=pid == 0, sem="relaxed"
+    )
+    if SHARED:
+        r2, c2 = r1, c1
+    else:
+        r2 = tl.arange(0, B)
+        c2 = tl.arange(0, B)
+    tl.atomic_xchg(
+        flag + r2[:, None] * B + c2[None, :], old + 100, mask=pid == 0, sem="release"
+    )
+    r3 = tl.arange(0, B)
+    c3 = tl.arange(0, B)
+    offs = r3[:, None] * B + c3[None, :]
+    f = tl.atomic_add(flag + offs, 0, mask=pid == 1, sem="acquire")
+    tl.store(z + offs, 5, mask=(pid == 1) & (f >= 100))
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("cols", [False, True])
+def test_dependency_compares_every_dimension(cols, shared):
+    detector = _run(_published_2d_kernel, (2,), _ints(16), _ints(16), 4, cols, shared)
+    race = _race(
+        detector, RaceType.WAW, _published_2d_kernel, "old = tl.atomic_add", "tl.store"
+    )
+    assert race.programs == ((0, 0, 0), (1, 0, 0))
+    assert race.first.element == race.second.element
+
+
+@triton.jit
+def _flag_source_kernel(
+    z, flag, B: tl.constexpr, SETTER: tl.constexpr, LANE: tl.constexpr
+):
+    # Program 1 lane q stores z[q] once it reads flag[q] >= 100, and
+    # program 0 adds to z, unsynchronized. Who sets flag[q]:
+    #   LANE 0: program 0's lane q, while its lane B - 1 - q adds to z[q];
+    #   LANE 1: program SETTER, at lane B - 1 - q;
+    #   LANE 2: program 1's lane q, after the read: never seen by it;
+    #   LANE 3: program 1's lane B - 1 - q, after the read in program order.
+    pid = tl.program_id(0)
+    o = tl.arange(0, B)
+    tl.atomic_add(z + (B - 1 - o if LANE == 0 else o), 1, mask=pid == 0, sem="relaxed")
+    if LANE < 2:
+        tl.atomic_xchg(
+            flag + (o if LANE == 0 else B - 1 - o),
+            100,
+            mask=pid == SETTER,
+            sem="relaxed",
+        )
+    f = tl.atomic_add(flag + o, 0, mask=pid == 1, sem="relaxed")
+    if LANE >= 2:
+        tl.atomic_xchg(
+            flag + (o if LANE == 2 else B - 1 - o), 100, mask=pid == 1, sem="relaxed"
+        )
+    tl.store(z + o, 5, mask=(pid == 1) & (f >= 100))
+
+
+@triton.jit
+def _winner_publish_kernel(data, flag, B: tl.constexpr):
+    # The CAS winner on flag[0] stores data[0], then (barrier) publishes
+    # flag[1]; a loser acquires flag[1] and reads data[0]. Only the
+    # winner's own instance writes flag[1]: race-free.
+    pid = tl.program_id(0)
+    won = tl.atomic_cas(flag, 0, 1, sem="relaxed") == 0
+    tl.store(data, 7, mask=won)
+    tl.debug_barrier()
+    tl.atomic_xchg(flag + 1, 1, mask=won, sem="release")
+    f = tl.atomic_add(flag + 1, 0, sem="acquire")
+    tl.store(data + 1 + pid, tl.load(data, mask=(f == 1) & ~won, other=0))
+
+
+@triton.jit
+def _fenced_flag_kernel(
+    data, flag, out, B: tl.constexpr, SEM: tl.constexpr, SETTER: tl.constexpr
+):
+    # Program 0 lane p stores data[p]; after a barrier, program SETTER's
+    # lane p publishes flag[B - 1 - p]. Program 1 lane q acquires flag[q]
+    # and reads data[q]: ordered by another lane's release and the barrier
+    # only when program 0 is the setter.
+    pid = tl.program_id(0)
+    o = tl.arange(0, B)
+    tl.store(data + o, 7, mask=pid == 0)
+    tl.debug_barrier()
+    tl.atomic_xchg(flag + (B - 1 - o), 1, mask=pid == SETTER, sem=SEM)
+    f = tl.atomic_add(flag + o, 0, mask=pid == 1, sem="acquire")
+    tl.store(out + pid * B + o, tl.load(data + o, mask=(pid == 1) & (f == 1), other=0))
+
+
+_WAW_Z = ("WAW", "tl.atomic_add(z", "tl.store")
+
+
+@pytest.mark.parametrize(
+    "kernel, grid, args, race",
+    [
+        (_flag_source_kernel, (2,), (0, 0), _WAW_Z),  # another lane
+        (_flag_source_kernel, (3,), (2, 1), _WAW_Z),  # a third program
+        (_flag_source_kernel, (2,), (1, 1), _WAW_Z),  # the reader's program
+        (_flag_source_kernel, (2,), (1, 2), None),  # ... its own lane, later
+        (_flag_source_kernel, (2,), (1, 3), _WAW_Z),  # ... another lane, later
+        (_winner_publish_kernel, (2,), (), None),
+        (
+            _fenced_flag_kernel,
+            (2,),
+            ("relaxed", 0),
+            ("RAW", "tl.store(data", "tl.load"),
+        ),
+        (_fenced_flag_kernel, (2,), ("release", 0), None),
+        # Program 2's barrier orders nothing of program 0.
+        (
+            _fenced_flag_kernel,
+            (3,),
+            ("release", 2),
+            ("RAW", "tl.store(data", "tl.load"),
+        ),
+    ],
+)
+def test_a_flag_may_come_from_any_lane_or_program(kernel, grid, args, race):
+    out = (_ints(4 * grid[0]),) if kernel is _fenced_flag_kernel else ()
+    detector = _run(kernel, grid, _ints(4), _ints(4), *out, 4, *args)
+    if race is None:
+        assert detector.last_status == "ok" and not detector.last_reports
+        return
+    record = _race(detector, RaceType(race[0]), kernel, race[1], race[2])
+    assert record.programs == ((0, 0, 0), (1, 0, 0))
+
+
+@triton.jit
+def _unnamed_lanes_kernel(flag, z, B: tl.constexpr, MODE: tl.constexpr):
+    # Pointers whose arange variables do not name their lanes.
+    #   0: B columns of program 0 publish flag[row]; program 1's plain load
+    #      of flag[row] races with the columns it did not acquire from.
+    #   1: lane (i, j) of the add and lane (j, i) of the transposed xchg
+    #      update flag[i, j] on two threads, unordered: when the add runs
+    #      first, both see 0, in both programs.
+    #   2: the B columns of a row store different values to z[row].
+    pid = tl.program_id(0)
+    r1 = tl.arange(0, B)
+    c1 = tl.arange(0, B)
+    r2 = tl.arange(0, B)
+    if MODE == 0:
+        row = tl.broadcast_to((flag + r1)[:, None], (B, B))
+        tl.atomic_xchg(row, 100, mask=pid == 0, sem="release")
+        f = tl.atomic_add(flag + r2, 0, mask=pid == 1, sem="acquire")
+        tl.load(flag + r2, mask=(pid == 1) & (f == 100))
+    elif MODE == 1:
+        ptr = flag + pid * B * B + r1[:, None] * B + c1[None, :]
+        g = tl.atomic_xchg(tl.trans(ptr), 1, sem="relaxed")
+        f = tl.atomic_add(ptr, 0, sem="relaxed")
+        both_zero = (f == 0) & (tl.trans(g) == 0)
+        tl.store(z + r1[:, None] * B + c1[None, :], pid, mask=both_zero)
+    else:
+        row = tl.broadcast_to((z + r1)[:, None], (B, B))
+        tl.store(row, tl.broadcast_to(c1[None, :], (B, B)))
+
+
+@triton.jit
+def _broadcast_old_values_kernel(flag, z, B: tl.constexpr):
+    # Per row, the column that reads 0 stores 1 to z[row]; column 0 stores
+    # 2 if it reads 100, which it does unless it was first.
+    r1 = tl.arange(0, B)
+    c1 = tl.arange(0, B)
+    f = tl.atomic_xchg(tl.broadcast_to((flag + r1)[:, None], (B, B)), 100)
+    zp = z + r1[:, None] + 0 * c1[None, :]
+    tl.store(zp, 1, mask=f == 0)
+    tl.store(zp, 2, mask=(f == 100) & (c1[None, :] == 0))
+
+
+@pytest.mark.parametrize(
+    "mode, grid, race",
+    [
+        (0, (2,), ("RAW", "tl.atomic_xchg(row", "tl.load")),
+        (1, (2,), ("WAW", "mask=both_zero", "mask=both_zero")),
+        (2, (1,), ("WAW", "tl.store(row", "tl.store(row")),
+    ],
+)
+def test_lanes_a_pointer_does_not_name_are_distinct(mode, grid, race):
+    detector = _run(_unnamed_lanes_kernel, grid, _ints(32), _ints(16), 4, mode)
+    record = _race(detector, RaceType(race[0]), _unnamed_lanes_kernel, *race[1:])
+    programs = {record.programs[0][0], record.programs[1][0]}
+    assert programs == ({0, 1} if grid == (2,) else {0})
+
+
+def test_broadcast_lanes_get_their_own_old_values():
+    kernel = _broadcast_old_values_kernel
+    detector = _run(kernel, (1,), _ints(4), _ints(4), 4)
+    found = {
+        (r.race_type, r.first.source_location[1], r.second.source_location[1])
+        for r in detector.last_reports
+    }
+    pair = (_line(kernel, "mask=f == 0"), _line(kernel, "mask=(f == 100)"))
+    assert (RaceType.WAW, *pair) in found
+
+
+@triton.jit
+def _row_pipeline_kernel(t, out, B: tl.constexpr, FENCE: tl.constexpr):
+    # Iteration i stores row i, then reads row i - 1 at the neighbouring
+    # lane: the previous iteration's store, unless a barrier separates them.
+    d = tl.arange(0, B)
+    acc = tl.zeros([B], dtype=tl.float32)
+    for i in range(1, 4):
+        tl.store(t + i * B + d, acc + i)
+        if FENCE:
+            tl.debug_barrier()
+        acc += tl.load(t + (i - 1) * B + (d ^ 1))
+    tl.store(out + d, acc)
+
+
+@triton.jit
+def _slide_kernel(x, B: tl.constexpr):
+    d = tl.arange(0, B)
+    for i in range(3):  # lane 1 of iteration i and lane 0 of i + 1: x[i + 1]
+        tl.store(x + i + d, i)
+
+
+@triton.jit
+def _lane_old_values_kernel(cnt, x, y, B: tl.constexpr):
+    # Each lane gets its own old value: the lane that gets 0 stores x[p],
+    # the one that gets 1 may be lane p ^ 1, which loads x[p].
+    o = tl.arange(0, B)
+    old = tl.atomic_add(cnt + o * 0, 1, sem="relaxed")
+    tl.store(x + o, 1, mask=old == 0)
+    tl.store(y + o, tl.load(x + (o ^ 1), mask=old == 1, other=0))
+
+
+@pytest.mark.parametrize(
+    "kernel, args, race",
+    [
+        (
+            _row_pipeline_kernel,
+            (torch.zeros(64), torch.zeros(16), 16, False),
+            ("RAW", "tl.store(t", "acc +="),
+        ),
+        (_row_pipeline_kernel, (torch.zeros(64), torch.zeros(16), 16, True), None),
+        (_slide_kernel, (_ints(16), 8), ("WAW", "tl.store", "tl.store")),
+        (
+            _lane_old_values_kernel,
+            (_ints(1), _ints(4), _ints(4), 4),
+            ("RAW", "tl.store(x", "tl.store(y"),
+        ),
+        # One element's read-modify-write in each iteration, with no barrier:
+        # the next iteration's load against this one's store.
+        (
+            _load_store_loop_kernel,
+            (torch.zeros(16), 16),
+            ("WAR", "tl.load", "tl.store"),
+        ),
+    ],
+)
+def test_one_program_races_across_iterations_and_lanes(kernel, args, race):
+    detector = _run(kernel, (1,), *args)
+    if race is None:
+        assert detector.last_status == "ok" and not detector.last_reports
+        return
+    record = _race(detector, RaceType(race[0]), kernel, race[1], race[2])
+    assert record.programs == ((0, 0, 0), (0, 0, 0))
+
+
+@triton.jit
+def _counter_kernel(cnt, out, B: tl.constexpr, BLOCK: tl.constexpr):
+    # Two programs add 1 to cnt[0] once each, or once per lane: only with B
+    # lanes per program are the old values 5 and 6 reached.
+    o = tl.arange(0, B) if BLOCK == 1 else tl.zeros([B], dtype=tl.int32)
+    old = tl.atomic_add(cnt + o * 0 if BLOCK else cnt, 1, sem="relaxed")
+    tl.store(out + o * 0 if BLOCK else out, 1, mask=(old == 5) | (old == 6))
+
+
+@pytest.mark.parametrize("block", [0, 1, 2])
+def test_counting_needs_one_increment_per_program(block):
+    detector = _run(_counter_kernel, (2,), _ints(1), _ints(1), 4, block)
+    if not block:
+        assert detector.last_status == "ok" and not detector.last_reports
+        return
+    _race(detector, RaceType.WAW, _counter_kernel, "tl.store", "tl.store")
+
+
+@triton.jit
 def _pid_branch_kernel(out):
     if tl.program_id(0) == 0:
         tl.store(out, 1)
