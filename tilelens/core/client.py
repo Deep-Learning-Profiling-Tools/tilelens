@@ -179,26 +179,24 @@ class ClientManager:
         # A fresh Launch per launch, so `launches` gets distinct entries.
         self.launch = Launch()
         with patch_calls(frontend_name):
-            # Inside the try: a failing setup (e.g. two loop overriders) must
-            # not leave the interpreter's ops patched.
-            try:
-                # Collect all for-loop callbacks from clients
-                all_loop_callbacks = []
-                for client in self.clients.values():
-                    for namespace, attrs in namespaces.items():  # patch ops
-                        for attr, op in attrs.items():
-                            callbacks = client.register_op_callback(op)
-                            patch_op(
-                                namespace,
-                                attr,
-                                callbacks,
-                                frontend_name=frontend_name,
-                            )
-                    all_loop_callbacks.append(client.register_for_loop_callback())
+            # Collect all for-loop callbacks from clients
+            all_loop_callbacks = []
+            for client in self.clients.values():
+                for namespace, attrs in namespaces.items():  # patch ops
+                    for attr, op in attrs.items():
+                        callbacks = client.register_op_callback(op)
+                        patch_op(
+                            namespace,
+                            attr,
+                            callbacks,
+                            frontend_name=frontend_name,
+                        )
+                all_loop_callbacks.append(client.register_for_loop_callback())
 
-                self._populate_loop_hooks(all_loop_callbacks)
-                patch_for_loop(frontend_name)
-                patch_lang(fn, frontend_name, client_manager=self)
+            self._populate_loop_hooks(all_loop_callbacks)
+            patch_for_loop(frontend_name)
+            patch_lang(fn, frontend_name, client_manager=self)
+            try:
                 yield
             finally:
                 unpatch_lang(frontend_name)

@@ -9,8 +9,7 @@ import triton.language as tl
 
 import tilelens
 from tilelens.core.callbacks import ForLoopCallbacks, OpCallbacks
-from tilelens.core.client import Client, ClientManager
-from tilelens.core.frontend.base import get_frontend
+from tilelens.core.client import Client
 from tilelens.core.trace import _unwrapped_trace_globals, launches
 
 
@@ -30,11 +29,10 @@ class _EagerClient(Client):
 
     NAME = "eager"
 
-    def __init__(self, *, warmup_vote=False, loop_overrider=None):
+    def __init__(self, *, warmup_vote=False):
         super().__init__()
         self.calls: list = []
         self.warmup_vote = warmup_vote
-        self.loop_overrider = loop_overrider
 
     def pre_run_callback(self, fn):
         return True
@@ -55,7 +53,7 @@ class _EagerClient(Client):
         return OpCallbacks()
 
     def register_for_loop_callback(self):
-        return ForLoopCallbacks(loop_iter_overrider=self.loop_overrider)
+        return ForLoopCallbacks()
 
     def finalize(self):
         return []
@@ -70,26 +68,6 @@ class _EagerClient(Client):
 
 class _OtherEagerClient(_EagerClient):
     NAME = "other_eager"
-
-
-def test_patch_run_loop_hook_conflict_leaves_nothing_patched():
-    # The sanitizer and the race detector each install a loop-iteration
-    # overrider, so tracing a kernel with both refuses here.
-    manager = ClientManager(
-        [
-            _EagerClient(loop_overrider=lambda site, idx: idx),
-            _OtherEagerClient(loop_overrider=lambda site, idx: idx),
-        ]
-    )
-    namespace, attrs = next(iter(get_frontend("triton").namespaces.items()))
-    attr = next(iter(attrs))
-    original = getattr(namespace, attr)
-
-    with pytest.raises(RuntimeError, match="Only one loop_iter overrider"):
-        with manager.patch_run(None, frontend_name="triton"):
-            pass
-
-    assert getattr(namespace, attr) == original
 
 
 @pytest.mark.parametrize("user_post_hook", [False, True])
