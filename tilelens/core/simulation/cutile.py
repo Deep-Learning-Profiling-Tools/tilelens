@@ -7,7 +7,7 @@ import inspect
 import itertools
 import operator
 import types
-from typing import Any
+from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 import numpy as np
 
@@ -27,6 +27,9 @@ DTYPES = {
     ct.bool_: np.dtype(np.bool_),
     ct.int8: STORAGE_DTYPES["int8"],
     ct.uint8: STORAGE_DTYPES["uint8"],
+    ct.uint16: STORAGE_DTYPES["uint16"],
+    ct.uint32: STORAGE_DTYPES["uint32"],
+    ct.uint64: STORAGE_DTYPES["uint64"],
     ct.int16: STORAGE_DTYPES["int16"],
     ct.int32: STORAGE_DTYPES["int32"],
     ct.int64: STORAGE_DTYPES["int64"],
@@ -57,40 +60,47 @@ def _is_low_precision(dtype):
 
 
 def _binary_values(x, y, force_float=False):
-    """Choose operand dtypes without NumPy's integer/float widening.
+    """Use cuTile's promotion rules, including weak literals and range checks."""
+    from cuda.tile._ir.ops_utils import promote_dtypes
 
-    This implements only part of cuTile's dtype promotion rules.
-    """
-    x_value, y_value = _tile_value(x), _tile_value(y)
-    if isinstance(x, Tile) and isinstance(y, (bool, int, float)):
-        dtype = x_value.dtype
-        if isinstance(y, float) and not _is_float(dtype):
-            dtype = np.dtype(np.float32)
-    elif isinstance(y, Tile) and isinstance(x, (bool, int, float)):
-        dtype = y_value.dtype
-        if isinstance(x, float) and not _is_float(dtype):
-            dtype = np.dtype(np.float32)
-    elif x_value.dtype == y_value.dtype:
-        dtype = x_value.dtype
-    elif _is_float(x_value.dtype) or _is_float(y_value.dtype):
-        floats = [v.dtype for v in (x_value, y_value) if _is_float(v.dtype)]
-        dtype = max(floats, key=lambda d: d.itemsize)
-        if len(floats) == 2 and floats[0] != floats[1]:
-            dtype = np.dtype(
-                np.float64 if np.dtype(np.float64) in floats else np.float32
-            )
-    else:
-        dtype = np.result_type(x_value.dtype, y_value.dtype)
-    if force_float and not _is_float(dtype):
-        dtype = np.dtype(np.float32)
-    elif dtype == np.dtype(np.bool_) and (
-        (isinstance(x, int) and not isinstance(x, bool))
-        or (isinstance(y, int) and not isinstance(y, bool))
-    ):
-        dtype = np.dtype(np.int32)
-    # Use float32 arithmetic for NumPy void storage dtypes.
-    compute_dtype = dtype if dtype.kind != "V" else np.dtype(np.float32)
-    return x_value.astype(compute_dtype), y_value.astype(compute_dtype), dtype
+    token = promote_dtypes(_promotion_type(x), _promotion_type(y), force_float)
+    dtype = _numpy_dtype(token)
+    compute_dtype = np.dtype(np.float32) if _is_low_precision(dtype) else dtype
+    return (
+        _tile_value(x).astype(compute_dtype),
+        _tile_value(y).astype(compute_dtype),
+        dtype,
+    )
+
+
+def _promotion_type(value):
+    from cuda.tile._ir.type import LooselyTypedScalar
+
+    if isinstance(value, (bool, int, float)) and not isinstance(value, np.generic):
+        return LooselyTypedScalar(value)
+    return (
+        value.dtype
+        if isinstance(value, Tile)
+        else NUMPY_DTYPES[_tile_value(value).dtype]
+    )
+
+
+def _implicit_value(value, dtype):
+    from cuda.tile._ir.ops_utils import promote_dtypes
+    from cuda.tile._ir.type import LooselyTypedScalar
+
+    dtype = _numpy_dtype(dtype)
+    target = NUMPY_DTYPES[dtype]
+    source = _promotion_type(value)
+    if isinstance(source, LooselyTypedScalar):
+        try:
+            from cuda.tile._ir.cast_ops import check_implicit_cast
+        except ImportError:
+            from cuda.tile._ir.ops_utils import check_implicit_cast
+        check_implicit_cast(source, target)
+    elif promote_dtypes(source, target) != target:
+        raise TypeError(f"Cannot implicitly cast to {target}")
+    return _tile_value(value).astype(dtype)
 
 
 def _normalize_shape(shape: Any) -> tuple:
@@ -102,7 +112,20 @@ def _numpy_dtype(dtype):
     # TF32 is a compute format. CPU interpretation uses float32 precision.
     if dtype == ct.tfloat32:
         return np.dtype(np.float32)
-    return DTYPES[dtype]
+    if dtype in DTYPES:
+        return DTYPES[dtype]
+    from cuda.tile._ir.typing_support import to_dtype
+
+    try:
+        return DTYPES[to_dtype(dtype)]
+    except (KeyError, TypeError):
+        try:
+            normalized = np.dtype(dtype)
+            if normalized in NUMPY_DTYPES:
+                return normalized
+        except TypeError:
+            pass
+        raise TypeError(f"Unsupported dtype: {dtype}") from None
 
 
 def _validate_tile_shape(shape: Any) -> tuple[int, ...]:
@@ -152,17 +175,7 @@ def _tile_access(array, index, shape, order="C", traversal_steps=None):
 
 def _tile_value(value):
     """Return the NumPy value stored in a tile or Python scalar."""
-    if isinstance(value, Tile):
-        return value.data
-    if isinstance(value, np.generic):
-        return np.asarray(value)
-    if isinstance(value, bool):
-        return np.asarray(value, dtype=np.bool_)
-    if isinstance(value, int):
-        return np.asarray(value, dtype=np.int32)
-    if isinstance(value, float):
-        return np.asarray(value, dtype=np.float32)
-    return np.asarray(value)
+    return value.data if isinstance(value, Tile) else np.asarray(value)
 
 
 def _indexed_access(array, indices, mask=None, check_bounds=True):
@@ -186,24 +199,46 @@ def _indexed_access(array, indices, mask=None, check_bounds=True):
     return tuple(keys), valid
 
 
+def _unary_value(value):
+    if isinstance(value, (bool, int, float)) and not isinstance(value, np.generic):
+        return Tile(value).data
+    return _tile_value(value)
+
+
 class Tile:
     """Immutable local tile value backed by an owned NumPy array."""
 
     def __init__(self, value, dtype=None):
         if isinstance(value, Tile):
+            if dtype is None:
+                dtype = value.dtype
             value = value.data
         if dtype is not None:
             value = np.asarray(value, dtype=_numpy_dtype(dtype))
         elif isinstance(value, np.generic):
             value = np.asarray(value)
+        elif isinstance(value, bool):
+            value = np.asarray(value, dtype=np.bool_)
         elif isinstance(value, int):
-            value = np.asarray(value, dtype=np.int32)
+            try:
+                from cuda.tile._ir.typing_support import dtype_of_constant_scalar
+            except ImportError:
+                from cuda.tile._ir.typing_support import (
+                    typeof_pyval as dtype_of_constant_scalar,
+                )
+
+            value = np.asarray(
+                value, dtype=_numpy_dtype(dtype_of_constant_scalar(value))
+            )
         elif isinstance(value, float):
             value = np.asarray(value, dtype=np.float32)
 
         # Keep tiles immutable and independent of the source array.
         self.data = np.array(value, copy=True)
         self.data.setflags(write=False)
+        self._dtype = (
+            ct.tfloat32 if dtype == ct.tfloat32 else NUMPY_DTYPES[self.data.dtype]
+        )
 
     @property
     def shape(self):
@@ -215,7 +250,7 @@ class Tile:
 
     @property
     def dtype(self):
-        return NUMPY_DTYPES[self.data.dtype]
+        return self._dtype
 
     def __index__(self):
         if self.shape != () or self.data.dtype.kind not in "iu":
@@ -225,7 +260,7 @@ class Tile:
     def item(self):
         if self.data.size != 1:
             raise ValueError("item requires a single-element tile")
-        return Tile(self.data.reshape(()))
+        return Tile(self.data.reshape(()), self.dtype)
 
     def __getitem__(self, index):
         keys = index if isinstance(index, tuple) else (index,)
@@ -233,7 +268,7 @@ class Tile:
             raise TypeError(
                 "Tile indexing supports only None, ellipsis, and full slices; use extract"
             )
-        return Tile(self.data[keys])
+        return Tile(self.data[keys], self.dtype)
 
     def reshape(self, shape):
         return cutile_builder.reshape(self, shape)
@@ -458,9 +493,11 @@ class TiledView:
 
     def num_tiles(self, axis):
         axis = _normalize_axis(axis, self.array.ndim)
-        return (
-            self.array.shape[axis] + self.traversal_steps[axis] - 1
-        ) // self.traversal_steps[axis]
+        return Tile(
+            (self.array.shape[axis] + self.traversal_steps[axis] - 1)
+            // self.traversal_steps[axis],
+            ct.int32,
+        )
 
     def load(self, index, **kwargs):
         return cutile_builder.load(
@@ -493,12 +530,17 @@ class Builder:
         self.grid_idx = grid_idx
 
     def bid(self, axis):
-        return self.grid_idx[axis]
+        axis = operator.index(axis)
+        if axis not in (0, 1, 2):
+            raise ValueError(f"Invalid axis {axis} for 3D grid")
+        return Tile(self.grid_idx[axis], ct.int32)
 
     def num_tiles(self, array, /, axis, shape, order="C"):
         _, axes, shape, _ = _tile_access(array, (0,) * array.ndim, shape, order)
         axis = _normalize_axis(axis, array.ndim)
-        return (array.shape[axes[axis]] + shape[axis] - 1) // shape[axis]
+        return Tile(
+            (array.shape[axes[axis]] + shape[axis] - 1) // shape[axis], ct.int32
+        )
 
     @staticmethod
     def _region(array_shape, starts, shape):
@@ -583,9 +625,10 @@ class Builder:
         return Tile(
             np.full(
                 _validate_tile_shape(shape),
-                _tile_value(fill_value),
+                _implicit_value(fill_value, dtype),
                 dtype=_numpy_dtype(dtype),
-            )
+            ),
+            dtype=dtype,
         )
 
     def zeros(self, shape, dtype):
@@ -641,22 +684,28 @@ class Builder:
         return self._compare(x, y, np.greater_equal)
 
     def bitwise_and(self, x, y, /):
-        return Tile(np.bitwise_and(_tile_value(x), _tile_value(y)))
+        return self._binary(x, y, np.bitwise_and)
 
     def bitwise_or(self, x, y, /):
-        return Tile(np.bitwise_or(_tile_value(x), _tile_value(y)))
+        return self._binary(x, y, np.bitwise_or)
 
     def reshape(self, x, /, shape):
         value = np.reshape(_tile_value(x), _normalize_shape(shape))
         _validate_tile_shape(value.shape)
-        return Tile(value)
+        return Tile(value, x.dtype if isinstance(x, Tile) else None)
 
     def broadcast_to(self, x, /, shape):
-        return Tile(np.broadcast_to(_tile_value(x), _validate_tile_shape(shape)))
+        return Tile(
+            np.broadcast_to(_tile_value(x), _validate_tile_shape(shape)),
+            x.dtype if isinstance(x, Tile) else None,
+        )
 
     def permute(self, x, /, axes):
         value = _tile_value(x)
-        return Tile(value.transpose(_normalize_order(axes, value.ndim)))
+        return Tile(
+            value.transpose(_normalize_order(axes, value.ndim)),
+            x.dtype if isinstance(x, Tile) else None,
+        )
 
     def transpose(self, x, /, axis0=None, axis1=None):
         value = _tile_value(x)
@@ -669,11 +718,15 @@ class Builder:
                 value,
                 _normalize_axis(axis0, value.ndim),
                 _normalize_axis(axis1, value.ndim),
-            )
+            ),
+            x.dtype if isinstance(x, Tile) else None,
         )
 
     def expand_dims(self, x, /, axis):
-        return Tile(np.expand_dims(_tile_value(x), operator.index(axis)))
+        return Tile(
+            np.expand_dims(_tile_value(x), operator.index(axis)),
+            x.dtype if isinstance(x, Tile) else None,
+        )
 
     def extract(self, x, /, index, shape):
         value = _tile_value(x)
@@ -688,11 +741,23 @@ class Builder:
                 "extract requires divisible shapes and in-bounds tile indices"
             )
         return Tile(
-            value[tuple(slice(i * s, (i + 1) * s) for i, s in zip(index, shape))]
+            value[tuple(slice(i * s, (i + 1) * s) for i, s in zip(index, shape))],
+            x.dtype if isinstance(x, Tile) else None,
         )
 
     def astype(self, x, dtype, /):
-        return Tile(_tile_value(x).astype(_numpy_dtype(dtype)))
+        value, target = _tile_value(x), _numpy_dtype(dtype)
+        if _is_float(value.dtype) and target.kind in "iu":
+            bounds = np.iinfo(target)
+            result = np.zeros(value.shape, dtype=target)
+            finite = np.isfinite(value) & (value > bounds.min) & (value < bounds.max)
+            result[finite] = value[finite].astype(target)
+            result[value <= bounds.min] = bounds.min
+            result[value >= bounds.max] = bounds.max
+            return Tile(result)
+        return Tile(
+            value.astype(target), dtype=ct.tfloat32 if dtype == ct.tfloat32 else None
+        )
 
     def sum(self, x, /, axis=None, *, keepdims=False, **kwargs):
         value = _tile_value(x)
@@ -706,17 +771,27 @@ class Builder:
         )
 
     def matmul(self, x, y, /):
+        from cuda.tile._datatype import _resolve_mma_supported_dtype
+        from cuda.tile._ir.ops_utils import promote_dtypes
+
         lhs, rhs = _tile_value(x), _tile_value(y)
-        if _is_low_precision(lhs.dtype):
-            return Tile(
-                np.matmul(lhs.astype(np.float32), rhs.astype(np.float32)).astype(
-                    lhs.dtype
-                )
-            )
-        return Tile(np.matmul(lhs, rhs))
+        common = promote_dtypes(_promotion_type(x), _promotion_type(y))
+        accumulator = _resolve_mma_supported_dtype(common, common)
+        dtype = _numpy_dtype(common)
+        compute = _numpy_dtype(accumulator)
+        if compute == np.float16:
+            compute = np.dtype(np.float32)
+        return Tile(
+            np.asarray(
+                np.matmul(lhs.astype(compute), rhs.astype(compute)), dtype=dtype
+            ),
+            common,
+        )
 
     def floordiv(self, x, y, /):
-        return self._binary(x, y, np.floor_divide)
+        lhs, rhs, dtype = _binary_values(x, y)
+        result = np.floor(lhs / rhs) if _is_float(dtype) else np.floor_divide(lhs, rhs)
+        return Tile(np.asarray(result, dtype=dtype))
 
     def mod(self, x, y, /):
         return self._binary(x, y, np.remainder)
@@ -741,16 +816,16 @@ class Builder:
         return Tile(np.where(_tile_value(condition), x, y).astype(dtype))
 
     def maximum(self, x, y, /, **kwargs):
-        return self._binary(x, y, np.maximum)
+        return self._binary(x, y, np.fmax)
 
     def minimum(self, x, y, /, **kwargs):
-        return self._binary(x, y, np.minimum)
+        return self._binary(x, y, np.fmin)
 
     @staticmethod
     def _unary(x, operation):
-        value = _tile_value(x)
+        value = _unary_value(x)
         if not _is_float(value.dtype):
-            raise TypeError("Transcendental operations require floating-point tiles")
+            value = value.astype(np.float32)
         return Tile(
             operation(
                 value.astype(np.float64 if value.dtype == np.float64 else np.float32)
@@ -773,14 +848,26 @@ class Builder:
         value = _tile_value(x)
         if value.dtype == np.dtype(np.bool_):
             value = value.astype(np.int32)
-        return Tile(np.max(value, axis=axis, keepdims=keepdims))
+        return Tile(np.fmax.reduce(value, axis=axis, keepdims=keepdims))
 
     def argmax(self, x, /, axis=None, *, keepdims=False):
-        return Tile(
-            np.asarray(
-                np.argmax(_tile_value(x), axis=axis, keepdims=keepdims), dtype=np.int32
-            )
-        )
+        return self._arg_reduce(x, axis, keepdims, maximum=True)
+
+    @staticmethod
+    def _arg_reduce(x, axis, keepdims, *, maximum):
+        value = _tile_value(x)
+        if _is_low_precision(value.dtype):
+            value = value.astype(np.float32)
+        operation = np.fmax if maximum else np.fmin
+        extremum = operation.reduce(value, axis=axis, keepdims=True)
+        matches = value == extremum
+        if axis is None:
+            result = np.argmax(matches.reshape(-1))
+            if keepdims:
+                result = np.asarray(result).reshape((1,) * value.ndim)
+        else:
+            result = np.argmax(matches, axis=axis, keepdims=keepdims)
+        return Tile(np.asarray(result, dtype=np.int32))
 
     def cumsum(self, x, /, axis=0, *, reverse=False, **kwargs):
         value = _tile_value(x)
@@ -796,11 +883,26 @@ class Builder:
             raise ValueError("cat requires two tiles of the same shape")
         return Tile(np.concatenate([_tile_value(tile) for tile in tiles], axis=axis))
 
-    def mma(self, x, y, /, acc, **kwargs):
+    def mma(self, x, y, /, acc, *, use_fast_acc=False):
+        from cuda.tile._datatype import _resolve_mma_supported_dtype
+
+        _resolve_mma_supported_dtype(
+            _promotion_type(x), _promotion_type(y), _promotion_type(acc)
+        )
+        if use_fast_acc:
+            raise NotImplementedError("fast accumulation is unsupported")
         accumulator = _tile_value(acc)
-        # Accumulate narrow integer/float inputs in the accumulator's format.
-        lhs = _tile_value(x).astype(accumulator.dtype)
-        rhs = _tile_value(y).astype(accumulator.dtype)
+        compute = np.float32 if accumulator.dtype == np.float16 else accumulator.dtype
+        lhs = _tile_value(x).astype(compute)
+        rhs = _tile_value(y).astype(compute)
+        if lhs.ndim < 2 or rhs.ndim < 2:
+            raise ValueError("mma requires matrix operands")
+        output_shape = np.broadcast_shapes(lhs.shape[:-2], rhs.shape[:-2]) + (
+            lhs.shape[-2],
+            rhs.shape[-1],
+        )
+        if accumulator.shape != output_shape:
+            raise ValueError(f"Invalid mma accumulator shape: {accumulator.shape}")
         result = np.matmul(lhs, rhs) + accumulator
         return Tile(result.astype(accumulator.dtype))
 
@@ -936,6 +1038,45 @@ def cutile_unpatch_lang(scope=None):
         scope.restore()
 
 
+def _parameter_annotations(fn):
+    """Resolve constant and integer-scalar annotations for both execution paths."""
+    constant_type = type(get_args(ct.Constant[int])[1])
+    scalar_alias = getattr(ct, "ScalarInt64", None)
+    scalar_type: Any = (
+        type(get_args(scalar_alias)[1]) if scalar_alias is not None else ()
+    )
+    result = {}
+    for name, annotation in get_type_hints(fn, include_extras=True).items():
+        if get_origin(annotation) is not Annotated:
+            continue
+        metadata = get_args(annotation)[1:]
+        is_constant = any(isinstance(item, constant_type) for item in metadata)
+        scalar_dtype = next(
+            (item.dtype for item in metadata if isinstance(item, scalar_type)), None
+        )
+        result[name] = (is_constant, scalar_dtype)
+    return result
+
+
+def _check_integer_scalar(value, dtype):
+    if not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_)):
+        raise TypeError("ScalarAnnotation requires an integer scalar")
+    bounds = np.iinfo(_numpy_dtype(dtype))
+    if not bounds.min <= value <= bounds.max:
+        raise ValueError(f"Integer argument is out of range of {dtype}")
+
+
+def _wrap_argument(arg, scalar_dtype=None):
+    if scalar_dtype is not None:
+        _check_integer_scalar(arg, scalar_dtype)
+        return Tile(arg, scalar_dtype)
+    if isinstance(arg, np.ndarray):
+        return Array(arg)
+    if isinstance(arg, (bool, int, float, np.generic)):
+        return Tile(arg)
+    return arg
+
+
 class CuTileInterpretedFunction:
     """Execute a Python kernel over a grid with optional tracing callbacks."""
 
@@ -981,16 +1122,16 @@ class CuTileInterpretedFunction:
         grid_dims += (1,) * (3 - len(grid_dims))
         cutile_builder.set_grid_dim(*grid_dims)
 
-        # Wrap NumPy arguments without copying their data.
-        args = tuple(Array(arg) if isinstance(arg, np.ndarray) else arg for arg in args)
-        kwargs = {
-            name: Array(arg) if isinstance(arg, np.ndarray) else arg
-            for name, arg in kwargs.items()
-        }
+        bound = inspect.signature(self.fn).bind(*args, **kwargs)
+        bound.apply_defaults()
+        annotations = _parameter_annotations(self.fn)
+        for name, arg in bound.arguments.items():
+            is_constant, scalar_dtype = annotations.get(name, (False, None))
+            if not is_constant:
+                bound.arguments[name] = _wrap_argument(arg, scalar_dtype)
+        args, kwargs = bound.args, bound.kwargs
 
         if client_manager is not None:
-            bound = inspect.signature(self.fn).bind(*args, **kwargs)
-            bound.apply_defaults()
             for name, arg in bound.arguments.items():
                 trace_arg = (
                     _TraceArray(arg)
