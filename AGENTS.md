@@ -30,8 +30,8 @@ PRs are squash-merged, so keep a stack of PRs up to date with merges, not rebase
 
 - Push new work as new commits on the branch it belongs to.
 - Then update every PR above it, bottom-up, one at a time. Use the PR page's **Update branch** button (Update with merge commit) or `gh pr update-branch <number>` without `--rebase`.
-- Take a lower PR's changes only through these merges. Never add a commit that sets files back to the base branch's version: when the bottom PR of a GitHub stack merges, GitHub can rebase the next PR onto `main`, which replays that commit as a revert of the merged change.
-- After the bottom PR is squash-merged and the next PR is retargeted to `main`, record the squash commit with `git merge -s ours <squash-sha>`, then run `git merge origin/main`. Only do this once `git diff <squash-sha> <lower-branch-tip>` is empty and that tip is already merged into the branch.
+- When the bottom PR is squash-merged, GitHub rebases the next PR onto `main` and force-updates its branch, dropping its merge commits; the PRs above it are left alone. Reset your local branch to the rebased one instead of pushing the old one. In the PR above it, merge the pre-rebase tip first if it is not merged yet; then, once `git diff <old-tip> <rebased-tip>` is empty, run `git merge -s ours <rebased-tip>`. A plain merge of the rebased tip conflicts even where only the lower PR changed code, because the rebase cut their shared history.
+- Take a lower PR's changes only through merges. Never add a commit that sets files back to the base branch's version: that rebase replays it as a revert of the merged change.
 - Do not use `gh stack sync`, which rebases and force-pushes, or `gh stack push`, which force-pushes.
 
 ## Security & Configuration Tips
