@@ -30,6 +30,7 @@ PRs are squash-merged, so keep a stack of PRs up to date with merges, not rebase
 
 - Push new work as new commits on the branch it belongs to.
 - Then update every PR above it, bottom-up, one at a time. Use the PR page's **Update branch** button (Update with merge commit) or `gh pr update-branch <number>` without `--rebase`.
+- Take a lower PR's changes only through these merges. Never add a commit that sets files back to the base branch's version: when the bottom PR of a GitHub stack merges, GitHub can rebase the next PR onto `main`, which replays that commit as a revert of the merged change.
 - After the bottom PR is squash-merged and the next PR is retargeted to `main`, record the squash commit with `git merge -s ours <squash-sha>`, then run `git merge origin/main`. Only do this once `git diff <squash-sha> <lower-branch-tip>` is empty and that tip is already merged into the branch.
 - Do not use `gh stack sync`, which rebases and force-pushes, or `gh stack push`, which force-pushes.
 
