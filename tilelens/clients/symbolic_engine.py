@@ -3220,7 +3220,8 @@ class SymbolicClient(Client):
         ptr = self._materialize_memory_operand(ptr)
         mask = self._materialize_memory_operand(mask)
         ptr_sym = self._symbolic_memory_ptr(ptr)
-        value_sym = SymbolicExpr.from_value(value)
+        # SMEM-sourced stores (Gluon TMA/async copy) carry no register value.
+        value_sym = SymbolicExpr.from_value(value) if value is not None else None
         mask_sym = SymbolicExpr.from_value(mask) if mask is not None else None
         ret = SymbolicExpr.create("store", ptr_sym, value_sym, mask_sym)
 
