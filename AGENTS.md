@@ -16,7 +16,7 @@ TileLens is a Python package with a TypeScript web UI. Core code lives in `tilel
 
 ## Coding Style & Naming Conventions
 
-Use Python 3.12+ and TypeScript modules. Follow file-local style: 4-space indentation for Python and descriptive snake_case names for functions, variables, and test helpers. Python tests are discovered from `*.py`, classes ending in `Test`, and functions named `test_*`. Ruff is configured in `pyproject.toml` with `E731` ignored; run pre-commit when available. Keep generated package assets in sync when editing `frontend/`.
+Use Python 3.10+ and TypeScript modules. Follow file-local style: 4-space indentation for Python and descriptive snake_case names for functions, variables, and test helpers. Python tests are discovered from `*.py`, classes ending in `Test`, and functions named `test_*`. Ruff is configured in `pyproject.toml` with `E731` ignored; run pre-commit when available. Keep generated package assets in sync when editing `frontend/`.
 
 ## Testing Guidelines
 

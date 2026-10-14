@@ -14,7 +14,7 @@ authors = [
 ]
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
@@ -76,8 +76,12 @@ index-strategy = "unsafe-best-match"
 
 [tool.uv.sources]
 neuronx-cc = [
+  {url = "https://pip.repos.neuron.amazonaws.com/neuronx-cc/neuronx_cc-2.22.12471.0%2Bb4a00d10-cp310-cp310-linux_x86_64.whl", marker = "python_version == '3.10'"},
+  {url = "https://pip.repos.neuron.amazonaws.com/neuronx-cc/neuronx_cc-2.22.12471.0%2Bb4a00d10-cp311-cp311-linux_x86_64.whl", marker = "python_version == '3.11'"},
   {url = "https://pip.repos.neuron.amazonaws.com/neuronx-cc/neuronx_cc-2.22.12471.0%2Bb4a00d10-cp312-cp312-linux_x86_64.whl", marker = "python_version == '3.12'"},
 ]
 nki = [
+  {url = "https://pip.repos.neuron.amazonaws.com/nki/nki-0.2.0%2Bg82fdb402-cp310-cp310-linux_x86_64.whl", marker = "python_version == '3.10'"},
+  {url = "https://pip.repos.neuron.amazonaws.com/nki/nki-0.2.0%2Bg82fdb402-cp311-cp311-linux_x86_64.whl", marker = "python_version == '3.11'"},
   {url = "https://pip.repos.neuron.amazonaws.com/nki/nki-0.2.0%2Bg82fdb402-cp312-cp312-linux_x86_64.whl", marker = "python_version == '3.12'"},
 ]
