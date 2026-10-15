@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tilelens"
-version = "3.1.1"
+version = "3.1.2"
 description = "A visualization tool for Triton"
 authors = [
   {name = "Deep Learning Profiling Tools Team", email = "kzhou6@gmu.edu"}
