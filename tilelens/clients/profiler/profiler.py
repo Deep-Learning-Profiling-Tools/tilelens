@@ -80,7 +80,6 @@ class Profiler(Client):
 
         # Case 4: Buffer Load Check, on the compiled kernel's ASM. AMD only:
         # has_buffer_load stays None until an amdgcn ASM is captured.
-        self.compiled = False
         self.has_buffer_load: bool | None = None
         self.disable_buffer_load_check = cfg.profiler_disable_buffer_load_check
         self.potential_buffer_load_issue_found = False
@@ -112,7 +111,6 @@ class Profiler(Client):
         if not ret:
             return
 
-        self.compiled = True
         if (
             not self.disable_buffer_load_check
             and hasattr(ret, "asm")
@@ -519,16 +517,8 @@ class Profiler(Client):
                 + "-" * 11
             )
             print("=" * 60)
-            if not self.compiled:
-                print(
-                    "Buffer Load check skipped: the kernel was not compiled. "
-                    "Call kernel.warmup(...) to compile it."
-                )
-            elif self.has_buffer_load is None:
-                print(
-                    "Buffer Load check skipped: the compiled kernel is not an AMD "
-                    "(amdgcn) kernel."
-                )
+            if self.has_buffer_load is None:
+                print("Buffer Load check skipped: no AMD (amdgcn) kernel was compiled.")
             elif self.potential_buffer_load_issue_found:
                 print("\n>>>>>> Warning: Potential Buffer Load Issue Detected! <<<<<<")
                 print(

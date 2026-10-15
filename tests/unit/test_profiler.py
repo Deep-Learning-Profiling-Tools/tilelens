@@ -276,14 +276,6 @@ def test_check_32bit_range_no_buffer_load(_isolate_profiler_cfg):
 # ======== Buffer Load Check: Skip Tests =========
 
 
-def test_buffer_load_check_skipped_without_a_compile(_isolate_profiler_cfg, capsys):
-    cfg.profiler_disable_buffer_load_check = False
-
-    Profiler().finalize()
-
-    assert "the kernel was not compiled" in capsys.readouterr().out
-
-
 def test_buffer_load_check_skipped_on_a_non_amd_compile(_isolate_profiler_cfg, capsys):
     cfg.profiler_disable_buffer_load_check = False
     profiler = Profiler()
@@ -291,7 +283,7 @@ def test_buffer_load_check_skipped_on_a_non_amd_compile(_isolate_profiler_cfg, c
     profiler.post_warmup_callback(None, SimpleNamespace(asm={"ptx": "ld.global.f32"}))
     profiler.finalize()
 
-    assert "not an AMD (amdgcn) kernel" in capsys.readouterr().out
+    assert "Buffer Load check skipped" in capsys.readouterr().out
 
 
 # ======== Pre-run Callback Tests =========
