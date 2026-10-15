@@ -10,9 +10,20 @@ from ...utils.traceback_utils import (
     extract_user_frames,
     extract_complete_statement_from_line,
 )
+from triton.runtime.driver import driver
 from triton.runtime.interpreter import _get_np_dtype, TensorHandle
 import numpy as np
 from dataclasses import dataclass, replace
+
+
+def _has_active_driver() -> bool:
+    """Return whether Triton has a backend driver that can compile kernels."""
+    try:
+        driver.active
+    except RuntimeError:
+        # e.g. CPU-only hosts: "0 active drivers ([]). There should only be one."
+        return False
+    return True
 
 
 @dataclass(frozen=False)
@@ -81,6 +92,7 @@ class Profiler(Client):
         # Case 4: Buffer Load Check
         self.has_buffer_load = False
         self.disable_buffer_load_check = cfg.profiler_disable_buffer_load_check
+        self.buffer_load_check_skipped_no_driver = False
         self.potential_buffer_load_issue_found = False
 
         # Block sampling
@@ -104,7 +116,16 @@ class Profiler(Client):
 
     def pre_warmup_callback(self, jit_fn, *args, **kwargs) -> bool:
         # Skip warmup if buffer load check is disabled
-        return not self.disable_buffer_load_check
+        if self.disable_buffer_load_check:
+            return False
+        # The buffer load check inspects compiled ASM; without a backend driver
+        # Triton cannot compile the kernel, so drop the check instead of failing
+        # the launch.
+        if not _has_active_driver():
+            self.disable_buffer_load_check = True
+            self.buffer_load_check_skipped_no_driver = True
+            return False
+        return True
 
     def post_warmup_callback(self, jit_fn, ret) -> None:
         if not ret:
@@ -506,7 +527,10 @@ class Profiler(Client):
 
             print("\n" + "=" * 60 + "\n")
 
-        if not self.disable_buffer_load_check:
+        if (
+            not self.disable_buffer_load_check
+            or self.buffer_load_check_skipped_no_driver
+        ):
             print("\n" + "=" * 60)
             print(
                 "-" * 10
@@ -516,7 +540,12 @@ class Profiler(Client):
                 + "-" * 11
             )
             print("=" * 60)
-            if self.potential_buffer_load_issue_found:
+            if self.buffer_load_check_skipped_no_driver:
+                print(
+                    "Skipped: no active Triton driver to compile the kernel "
+                    "(e.g. CPU-only host)."
+                )
+            elif self.potential_buffer_load_issue_found:
                 print("\n>>>>>> Warning: Potential Buffer Load Issue Detected! <<<<<<")
                 print(
                     "\nSome memory access offsets are within 32-bit range, "
