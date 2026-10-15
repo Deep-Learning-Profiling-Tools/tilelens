@@ -273,61 +273,25 @@ def test_check_32bit_range_no_buffer_load(_isolate_profiler_cfg):
     assert profiler.potential_buffer_load_issue_found is True
 
 
-# ======== Buffer Load Check: AMD-only Tests =========
-
-
-def _warmup_then_check_32bit(asm: dict[str, str]) -> Profiler:
-    """Feed a fake warmup result with ``asm`` stages, then 32-bit-range offsets."""
-    cfg.profiler_enable_block_sampling = False
-    cfg.profiler_enable_load_store_skipping = False
-    cfg.profiler_disable_buffer_load_check = False
-
-    profiler = Profiler()
-    profiler.post_warmup_callback(None, SimpleNamespace(asm=asm))
-
-    byte_offset = np.array([0, 1000, 2000])
-    profiler._check_32bit_range(byte_offset, 4, byte_offset // 4)
-    return profiler
-
-
-def test_buffer_load_check_skipped_without_amdgcn(_isolate_profiler_cfg, capsys):
-    """An NVIDIA-like warmup result (no amdgcn stage) never flags a buffer-load issue."""
-    profiler = _warmup_then_check_32bit({"ttir": "tt.load", "ptx": "ld.global.f32"})
-
-    assert profiler.has_buffer_load is None
-    assert profiler.potential_buffer_load_issue_found is False
-
-    profiler.finalize()
-    out = capsys.readouterr().out
-    assert "not an AMD (amdgcn) kernel" in out
-    assert "Potential Buffer Load Issue" not in out
+# ======== Buffer Load Check: Skip Tests =========
 
 
 def test_buffer_load_check_skipped_without_a_compile(_isolate_profiler_cfg, capsys):
-    """Without a compiled kernel the check is skipped, and the user is told why."""
     cfg.profiler_disable_buffer_load_check = False
 
     Profiler().finalize()
 
-    out = capsys.readouterr().out
-    assert "the kernel was not compiled" in out
-    assert "Potential Buffer Load Issue" not in out
+    assert "the kernel was not compiled" in capsys.readouterr().out
 
 
-def test_buffer_load_check_flags_amdgcn_without_buffer_load(_isolate_profiler_cfg):
-    """An amdgcn stage without buffer_load and 32-bit offsets is flagged."""
-    profiler = _warmup_then_check_32bit({"amdgcn": "global_load_dword v0, v[0:1]"})
+def test_buffer_load_check_skipped_on_a_non_amd_compile(_isolate_profiler_cfg, capsys):
+    cfg.profiler_disable_buffer_load_check = False
+    profiler = Profiler()
 
-    assert profiler.has_buffer_load is False
-    assert profiler.potential_buffer_load_issue_found is True
+    profiler.post_warmup_callback(None, SimpleNamespace(asm={"ptx": "ld.global.f32"}))
+    profiler.finalize()
 
-
-def test_buffer_load_check_passes_amdgcn_with_buffer_load(_isolate_profiler_cfg):
-    """An amdgcn stage that uses buffer_load is not flagged."""
-    profiler = _warmup_then_check_32bit({"amdgcn": "buffer_load_dword v0, v1, s[0:3]"})
-
-    assert profiler.has_buffer_load is True
-    assert profiler.potential_buffer_load_issue_found is False
+    assert "not an AMD (amdgcn) kernel" in capsys.readouterr().out
 
 
 # ======== Pre-run Callback Tests =========

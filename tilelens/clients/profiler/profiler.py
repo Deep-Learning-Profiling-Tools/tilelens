@@ -78,9 +78,8 @@ class Profiler(Client):
         # Per-operation statistics for detailed analysis
         self.mask_op_stats: list[MaskOpStats] = []
 
-        # Case 4: Buffer Load Check
-        # The check reads the compiled kernel's ASM, and only applies to AMD
-        # (amdgcn); has_buffer_load stays None until such an ASM is captured.
+        # Case 4: Buffer Load Check, on the compiled kernel's ASM. AMD only:
+        # has_buffer_load stays None until an amdgcn ASM is captured.
         self.compiled = False
         self.has_buffer_load: bool | None = None
         self.disable_buffer_load_check = cfg.profiler_disable_buffer_load_check
@@ -199,7 +198,6 @@ class Profiler(Client):
         if num_outside == 0:
             # All offsets are within 32-bit range
             # If we're on AMD GPU and buffer_load is NOT found, this is an error
-            # (has_buffer_load stays None when no amdgcn stage was captured, e.g. NVIDIA)
             if self.has_buffer_load is False:
                 # Buffer Load optimization should be used when offsets are within 32-bit range.
                 self.potential_buffer_load_issue_found = True
