@@ -99,21 +99,6 @@ class KernelTraceSupport:
             # interpreted chain lacks.
             layer.cache_results = False
             layer.do_bench = self.dummy_benchmarker
-            # Triton's reset_to_zero/restore_value hooks close over just the
-            # Autotuner they were built for; point them at the copy, which
-            # keeps restore_copies.
-            for name in ("pre_hook", "post_hook"):
-                hook = getattr(layer, name)
-                closure = getattr(hook, "__closure__", None)
-                if closure and len(closure) == 1 and closure[0].cell_contents is runner:
-                    rebound = types.FunctionType(
-                        hook.__code__,
-                        hook.__globals__,
-                        hook.__name__,
-                        hook.__defaults__,
-                        (types.CellType(layer),),
-                    )
-                    setattr(layer, name, rebound)
         else:
             layer.warmup = self._heuristics_warmup(layer)
         return layer
@@ -231,11 +216,8 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
                     "nested traced calls require matching clients; "
                     f"outer={outer_clients}, inner={inner_clients}"
                 )
-            return self.interpreted_fn(*args, **kwargs)
 
-        # Outside a traced launch, behave as the untraced function: Triton's
-        # interpreter, or JITFunction's refusal outside a kernel.
-        return self.fn(*args, **kwargs)
+        return self.interpreted_fn(*args, **kwargs)
 
     def warmup(self, *args, **kwargs):
         with self.client_manager.patch_warmup(self.jit_fn):
