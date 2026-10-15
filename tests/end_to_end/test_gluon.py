@@ -6,6 +6,8 @@ import torch
 from triton import knobs
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.amd import cdna3 as amd_cdna3
+from triton.experimental.gluon.language.amd import cdna4 as amd_cdna4
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as amd_cdna4_cp
 from triton.experimental.gluon.language.nvidia import blackwell, hopper
 from triton.experimental.gluon.language.nvidia.blackwell import tma as blackwell_tma
@@ -19,8 +21,9 @@ from triton.experimental.gluon.nvidia.hopper import (
 )
 
 import tilelens
+from tilelens.clients.race_detector.race_detector import SymbolicRaceDetector
 from tilelens.clients.sanitizer.sanitizer import SymbolicSanitizer
-from tilelens.core.data import Load
+from tilelens.core.data import Load, Store
 from tilelens.core.simulation.gluon import GluonInterpretedFunction, gluon_builder
 
 try:
@@ -118,6 +121,61 @@ def _masked_1d_memcpy_kernel(
     mask = offsets < xnumel
     value = gl.load(in_ptr + offsets, mask=mask, other=0.0)
     gl.store(out_ptr + offsets, value, mask=mask)
+
+
+@gluon.jit
+def _positional_mask_1d_memcpy_kernel(
+    in_ptr,
+    out_ptr,
+    xnumel,
+    BLOCK: gl.constexpr,
+    layout: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    offsets = pid * BLOCK + gl.arange(0, BLOCK, layout=layout)
+    mask = offsets < xnumel
+    value = gl.load(in_ptr + offsets, mask, 0.0)
+    gl.store(out_ptr + offsets, value, mask)
+
+
+@gluon.jit
+def _amd_buffer_atomic_add_kernel(
+    in_ptr,
+    out_ptr,
+    xnumel,
+    BLOCK: gl.constexpr,
+    layout: gl.constexpr,
+):
+    offsets = gl.arange(0, BLOCK, layout=layout)
+    value = gl.load(in_ptr + offsets)
+    amd_cdna3.buffer_atomic_add(out_ptr, offsets, value)
+
+
+@gluon.jit
+def _amd_buffer_atomic_add_positional_mask_kernel(
+    in_ptr,
+    out_ptr,
+    xnumel,
+    BLOCK: gl.constexpr,
+    layout: gl.constexpr,
+):
+    offsets = gl.arange(0, BLOCK, layout=layout)
+    mask = offsets < xnumel
+    value = gl.load(in_ptr + offsets, mask=mask, other=0.0)
+    amd_cdna3.buffer_atomic_add(out_ptr, offsets, value, mask)
+
+
+@gluon.jit
+def _amd_cdna4_buffer_atomic_max_kernel(
+    in_ptr,
+    out_ptr,
+    xnumel,
+    BLOCK: gl.constexpr,
+    layout: gl.constexpr,
+):
+    offsets = gl.arange(0, BLOCK, layout=layout)
+    value = gl.load(in_ptr + offsets)
+    amd_cdna4.buffer_atomic_max(out_ptr, offsets, value)
 
 
 @gluon.jit
@@ -844,6 +902,78 @@ def test_gluon_sanitizer_allows_masked_in_bounds_kernel():
 
     assert ret is None
     assert sanitizer.records == []
+
+
+@pytest.mark.parametrize(
+    "kernel_fn",
+    [_masked_1d_memcpy_kernel, _positional_mask_1d_memcpy_kernel],
+    ids=["keyword_mask", "positional_mask"],
+)
+def test_gluon_sanitizer_honors_store_mask_on_tail_block(kernel_fn):
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    kernel = tilelens.trace(client=sanitizer, frontend="gluon")(kernel_fn)
+
+    # BLOCK > numel: both tensors end inside the block, so only the mask keeps
+    # the tail lanes of the store in bounds.
+    inp = torch.arange(40, dtype=torch.float32)
+    out = torch.empty_like(inp)
+    layout = gl.BlockedLayout([1], [32], [1], [0])
+    ret = kernel[(1,)](inp, out, inp.numel(), 64, layout, num_warps=1)
+
+    assert ret is None
+    assert sanitizer.records == []
+
+
+def test_gluon_sanitizer_reports_masked_store_past_end():
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    kernel = tilelens.trace(
+        client=sanitizer,
+        frontend="gluon",
+    )(_masked_1d_memcpy_kernel)
+
+    # The mask admits lanes 40..47; the load stays in bounds but the store
+    # writes past the end of out.
+    inp = torch.arange(64, dtype=torch.float32)
+    out = torch.empty((40,), dtype=torch.float32)
+    xnumel = 48
+    layout = gl.BlockedLayout([1], [32], [1], [0])
+    ret = kernel[(1,)](inp, out, xnumel, 64, layout, num_warps=1)
+
+    assert ret is None
+    assert sanitizer.records
+    assert all(record.op_type is Store for record in sanitizer.records)
+    out_end = out.data_ptr() + out.numel() * out.element_size()
+    mask_end = out.data_ptr() + xnumel * out.element_size()
+    for record in sanitizer.records:
+        assert record.tensor.data_ptr() == out.data_ptr()
+        assert out_end <= record.violation_address < mask_end
+
+
+@pytest.mark.parametrize(
+    "kernel_fn",
+    [
+        _amd_buffer_atomic_add_kernel,
+        _amd_buffer_atomic_add_positional_mask_kernel,
+        _amd_cdna4_buffer_atomic_max_kernel,
+    ],
+    ids=["cdna3_add_unmasked", "cdna3_add_positional_mask", "cdna4_max_unmasked"],
+)
+def test_gluon_symbolic_clients_run_amd_buffer_atomic_kernels(kernel_fn):
+    # buffer_atomic_* take (ptr, offsets, value, mask); the stored value must
+    # not be mistaken for the mask, which would try to concretize a gl.load.
+    inp = torch.arange(64, dtype=torch.float32)
+    layout = gl.BlockedLayout([1], [64], [1], [0])
+
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    kernel = tilelens.trace(client=sanitizer, frontend="gluon")(kernel_fn)
+    ret = kernel[(1,)](inp, torch.zeros_like(inp), inp.numel(), 64, layout, num_warps=1)
+    assert ret is None
+    assert sanitizer.records == []
+
+    detector = SymbolicRaceDetector()
+    kernel = tilelens.trace(client=detector, frontend="gluon")(kernel_fn)
+    ret = kernel[(1,)](inp, torch.zeros_like(inp), inp.numel(), 64, layout, num_warps=1)
+    assert ret is None
 
 
 def test_gluon_core_ops_run_scalar_range_memcpy_on_cpu():
