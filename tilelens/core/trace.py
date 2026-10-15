@@ -98,7 +98,21 @@ class KernelTraceSupport:
             # interpreted chain lacks.
             layer.cache_results = False
             layer.do_bench = self.dummy_benchmarker
+        else:
+            layer.warmup = self._heuristics_warmup(layer)
         return layer
+
+    @staticmethod
+    def _heuristics_warmup(layer: Any) -> Callable:
+        # KernelInterface.warmup would pass warmup= a second time and skip
+        # fn.warmup, where the clients vote: fill in the heuristics, then call
+        # fn.warmup.
+        def warmup(*args, **kwargs):
+            for name, heur in layer.values.items():
+                kwargs[name] = heur({**dict(zip(layer.arg_names, args)), **kwargs})
+            return layer.fn.warmup(*args, **kwargs)
+
+        return warmup
 
     def _copy_callable_attrs(
         self,
@@ -171,8 +185,9 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
         self._copy_callable_attrs(runner, self.base_fn, src_fallback=self.jit_fn)
 
     def run(self, *args, **kwargs):
-        if kwargs.get("warmup"):
-            self.warmup(*args, **kwargs)
+        with self.client_manager.patch_warmup(self.jit_fn):
+            if self.warmup_runner:
+                self.warmup_runner.warmup(*args, **kwargs)
 
         with self.client_manager.patch_run(self.base_fn, frontend_name="triton"):
             kwargs.update({"client_manager": self.client_manager})

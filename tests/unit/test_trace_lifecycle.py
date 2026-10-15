@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 
 import tilelens
+from tilelens.clients.profiler.profiler import Profiler
 
 
 @pytest.fixture(autouse=True)
@@ -41,3 +42,23 @@ def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain():
 
     torch.testing.assert_close(out, x + 1)
     assert vars(user) == before and user.cache == {}
+
+
+def test_a_profiler_compiles_each_launch(monkeypatch):
+    @triton.heuristics({"BLOCK": lambda args: args["x_ptr"].numel()})
+    @triton.jit
+    def heur_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+        offs = tl.arange(0, BLOCK)
+        tl.store(out_ptr + offs, tl.load(x_ptr + offs) + 1)
+
+    traced = tilelens.trace(Profiler())(heur_kernel)
+    compiles = []
+
+    def run(*args, grid, warmup, BLOCK, **kwargs):
+        compiles.append((warmup, BLOCK))
+
+    monkeypatch.setattr(traced.jit_fn, "run", run)
+
+    traced[(1,)](torch.arange(8, dtype=torch.float32), torch.zeros(8))
+
+    assert compiles == [(True, 8)]
