@@ -7,8 +7,6 @@ import triton.language as tl
 
 import tilelens
 from tilelens.clients.profiler.profiler import Profiler
-from tilelens.core.callbacks import ForLoopCallbacks, OpCallbacks
-from tilelens.core.client import Client
 from tilelens.core.trace import launches
 
 
@@ -21,47 +19,6 @@ def _real_jit():
     with knobs.runtime.scope():
         knobs.runtime.interpret = False
         yield
-
-
-class _EagerClient(Client):
-    """Interpreting client that records whether a warmup reached it."""
-
-    NAME = "eager"
-
-    def __init__(self):
-        super().__init__()
-        self.warmed_up = False
-
-    def pre_run_callback(self, fn):
-        return True
-
-    def post_run_callback(self, fn):
-        return True
-
-    def arg_callback(self, name, arg, arg_cvt):
-        pass
-
-    def grid_callback(self, grid):
-        pass
-
-    def grid_idx_callback(self, grid_idx):
-        pass
-
-    def register_op_callback(self, op_type, *args, **kwargs):
-        return OpCallbacks()
-
-    def register_for_loop_callback(self):
-        return ForLoopCallbacks()
-
-    def finalize(self):
-        return []
-
-    def pre_warmup_callback(self, jit_fn, *args, **kwargs):
-        self.warmed_up = True
-        return False
-
-    def post_warmup_callback(self, jit_fn, ret):
-        pass
 
 
 def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain():
@@ -82,28 +39,23 @@ def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain():
     before = dict(vars(user))
     x, out = torch.arange(8, dtype=torch.float32), torch.zeros(8)
 
-    tilelens.trace(_EagerClient())(user)[(2,)](x, out, 8)
+    tilelens.trace("tracer")(user)[(2,)](x, out, 8)
 
     torch.testing.assert_close(out, x + 1)
     assert vars(user) == before and user.cache == {}
 
 
-def test_a_launch_does_not_warm_up():
-    @triton.heuristics({"BLOCK": lambda args: 8})
+def test_a_launch_does_not_warm_up(monkeypatch):
     @triton.jit
-    def heur_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    def add_one(x_ptr, BLOCK: tl.constexpr):
         offs = tl.arange(0, BLOCK)
-        tl.store(out_ptr + offs, tl.load(x_ptr + offs) + 1)
+        tl.store(x_ptr + offs, tl.load(x_ptr + offs) + 1)
 
+    traced = tilelens.trace("tracer")(add_one)
     # Only the profiler compiles each launch.
-    client = _EagerClient()
-    traced = tilelens.trace(client)(heur_kernel)
-    x, out = torch.arange(8, dtype=torch.float32), torch.zeros(8)
+    monkeypatch.setattr(traced, "warmup", lambda *a, **k: pytest.fail("warmed up"))
 
-    traced[(1,)](x, out)
-
-    torch.testing.assert_close(out, x + 1)
-    assert not client.warmed_up
+    traced[(1,)](torch.zeros(8), BLOCK=8)
 
 
 def test_a_profiler_compiles_each_launch(monkeypatch):
@@ -132,7 +84,7 @@ def test_each_traced_launch_is_recorded_separately():
         offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         tl.store(x_ptr + offs, tl.load(x_ptr + offs) + 1, mask=offs < n)
 
-    traced = tilelens.trace(_EagerClient())(add_one)
+    traced = tilelens.trace("tracer")(add_one)
     before = len(launches)
     x = torch.zeros(8)
 
