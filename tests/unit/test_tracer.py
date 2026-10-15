@@ -2,6 +2,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
+import torch
+import triton.language as tl
+from triton.runtime.interpreter import TensorHandle
 
 from tilelens.clients.tracer.tracer import Tracer, _convert_grid_idx
 from tilelens.core.data import Transfer
@@ -158,3 +162,21 @@ def test_tracer_transfer_records_element_strides_as_bytes():
     assert np.array_equal(record.src_offsets, linear * 4)
     assert np.array_equal(record.dst_offsets, linear * 2)
     assert record.bytes == dst_data.nbytes
+
+
+# ======== Out-of-bounds Guard Tests ===========
+
+
+def test_check_in_bounds_accepts_python_bool_mask():
+    tracer = Tracer()
+    tensor = torch.zeros(4)
+    tracer.arg_callback("x_ptr", tensor, None)
+    base = tensor.data_ptr()
+
+    def ptr(*offsets):
+        lanes = np.array([base + offset for offset in offsets], dtype=np.uint64)
+        return TensorHandle(lanes, tl.pointer_type(tl.float32))
+
+    tracer._check_in_bounds("load", ptr(0, 4, 8, 12), True)
+    with pytest.raises(IndexError, match="out-of-bounds load"):
+        tracer._check_in_bounds("load", ptr(8, 12, 16), True)

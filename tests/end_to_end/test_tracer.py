@@ -1,3 +1,5 @@
+import numpy as np
+import pytest
 import torch
 import triton
 import triton.language as tl
@@ -223,3 +225,178 @@ def test_kernel_cache_autotune_with_dummy_benchmarker():
         assert (
             bench_fn is not None and bench_fn.__name__ == "dummy_benchmarker"
         ), f"Expected dummy_benchmarker, got: {bench_fn}"
+
+
+def _fenced(values, dtype=np.float32, pad=64):
+    """
+    Return a tensor whose storage holds exactly `values`, plus the sentinel
+    memory on both sides of it. Out-of-bounds writes would land in the
+    sentinels instead of the heap, so tests can check them deterministically.
+    """
+    buf = np.full(len(values) + 2 * pad, -7, dtype=dtype)
+    buf[pad:-pad] = values
+    return torch.from_numpy(buf[pad:-pad]), (buf[:pad], buf[-pad:])
+
+
+def _untouched(fences):
+    return all((fence == -7).all() for fence in fences)
+
+
+@triton.jit
+def unmasked_store_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offs, mask=offs < n_elements, other=0.0)
+    tl.store(out_ptr + offs, x)
+
+
+@pytest.mark.parametrize("grid_idx", [None, 0])
+def test_tracer_refuses_out_of_bounds_load(grid_idx):
+    traced = tilelens.trace(client=Tracer(grid_idx=grid_idx))(copy_kernel)
+    x, x_fences = _fenced(np.arange(10))
+    out, out_fences = _fenced(np.zeros(10))
+
+    with pytest.raises(IndexError, match=r"(?s)out-of-bounds load .*`x_ptr`"):
+        traced[(3,)](x, out, BLOCK_SIZE=4)
+    assert _untouched(x_fences) and _untouched(out_fences)
+
+
+@pytest.mark.parametrize("num_sms", [1, 4])
+def test_tracer_refuses_out_of_bounds_store(monkeypatch, num_sms):
+    monkeypatch.setattr(tilelens.config, "num_sms", num_sms)
+    traced = tilelens.trace(client=Tracer())(unmasked_store_kernel)
+    x = torch.arange(10, dtype=torch.float32)
+    out, fences = _fenced(np.zeros(10))
+
+    with pytest.raises(IndexError, match=r"(?s)out-of-bounds store .*`out_ptr`"):
+        traced[(3,)](x, out, x.numel(), BLOCK_SIZE=4)
+    assert _untouched(fences)
+
+
+@triton.jit
+def unmasked_atomic_add_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    tl.atomic_add(out_ptr + offs, 1)
+
+
+@triton.jit
+def unmasked_atomic_cas_kernel(out_ptr, BLOCK_SIZE: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    tl.atomic_cas(out_ptr + offs, tl.zeros_like(offs), tl.full(offs.shape, 1, tl.int32))
+
+
+@pytest.mark.parametrize(
+    "kernel, op_name",
+    [
+        (unmasked_atomic_add_kernel, "atomic"),
+        (unmasked_atomic_cas_kernel, "atomic_cas"),
+    ],
+)
+def test_tracer_refuses_out_of_bounds_atomic(kernel, op_name):
+    traced = tilelens.trace(client=Tracer())(kernel)
+    out, fences = _fenced(np.zeros(10), dtype=np.int32)
+
+    with pytest.raises(IndexError, match=f"out-of-bounds {op_name} "):
+        traced[(3,)](out, BLOCK_SIZE=4)
+    assert _untouched(fences)
+
+
+@triton.jit
+def unmasked_atomic_max_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    offs = tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offs, mask=offs < n_elements, other=-1.0)
+    tl.atomic_max(out_ptr + offs, x)
+
+
+def test_tracer_refuses_sign_split_float_atomic_max():
+    # Triton issues float atomic_max as two calls masked by sign; here the call
+    # for the negative lanes holds only the out-of-bounds ones
+    traced = tilelens.trace(client=Tracer())(unmasked_atomic_max_kernel)
+    x = torch.arange(1, 9, dtype=torch.float32)
+    out, fences = _fenced(np.zeros(8))
+
+    with pytest.raises(IndexError, match="out-of-bounds atomic "):
+        traced[(1,)](x, out, x.numel(), BLOCK_SIZE=16)
+    assert _untouched(fences)
+
+
+@triton.jit
+def packed_word_store_kernel(x_ptr, BLOCK_SIZE: tl.constexpr):
+    words = x_ptr.to(tl.pointer_type(tl.int32))
+    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    tl.store(words + offs, 1)
+
+
+def test_tracer_refuses_word_overlapping_storage_end():
+    # x holds 10 bytes, so the int32 word at byte 8 overlaps its end
+    traced = tilelens.trace(client=Tracer())(packed_word_store_kernel)
+    x, fences = _fenced(np.zeros(10), dtype=np.int8)
+
+    with pytest.raises(IndexError, match=r"(?s)out-of-bounds store .*`x_ptr`"):
+        traced[(2,)](x, BLOCK_SIZE=2)
+    assert _untouched(fences)
+
+
+def test_tracer_refuses_out_of_bounds_store_through_reinterpret():
+    traced = tilelens.trace(client=Tracer())(unmasked_store_kernel)
+    x = torch.arange(10, dtype=torch.float16)
+    out, fences = _fenced(np.zeros(10), dtype=np.int16)
+
+    with pytest.raises(IndexError, match=r"(?s)out-of-bounds store .*`out_ptr`"):
+        traced[(3,)](x, triton.reinterpret(out, tl.float16), x.numel(), BLOCK_SIZE=4)
+    assert _untouched(fences)
+
+
+@triton.jit
+def tuple_store_kernel(x_ptr, ptrs, BLOCK_SIZE: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    tl.store(ptrs[1] + offs, tl.load(x_ptr + offs))
+
+
+def test_tracer_refuses_out_of_bounds_store_through_tuple_arg():
+    traced = tilelens.trace(client=Tracer())(tuple_store_kernel)
+    x = torch.zeros(16)
+    out, fences = _fenced(np.zeros(10))
+
+    with pytest.raises(IndexError, match=r"(?s)out-of-bounds store .*`ptrs\[1\]`"):
+        traced[(3,)](x, (x, out), BLOCK_SIZE=4)
+    assert _untouched(fences)
+
+
+@triton.jit
+def shifted_copy_kernel(x_ptr, out_ptr, SHIFT: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    offs = tl.arange(0, BLOCK_SIZE)
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs - SHIFT))
+
+
+def test_tracer_allows_view_access_within_base_storage():
+    base = torch.arange(16, dtype=torch.float32)
+    out = torch.empty(8)
+    traced = tilelens.trace(client=Tracer())(shifted_copy_kernel)
+
+    # reads base[0:8] through a view that starts at base[4]
+    traced[(1,)](base[4:8], out, SHIFT=4, BLOCK_SIZE=8)
+
+    torch.testing.assert_close(out, base[:8])
+
+
+@triton.jit
+def pointer_table_kernel(table_ptr, arg_ptr, out_ptr, BLOCK_SIZE: tl.constexpr):
+    rows = tl.arange(0, 2)
+    cols = tl.arange(0, BLOCK_SIZE)
+    row_ptrs = tl.load(table_ptr + rows).to(tl.pointer_type(tl.float32))
+    values = tl.load(row_ptrs[:, None] + cols[None, :])
+    tl.store(out_ptr + rows[:, None] * BLOCK_SIZE + cols[None, :], values)
+
+
+def test_tracer_allows_pointer_table_gather():
+    # one row is a kernel arg and one is not, so a single gather touches known
+    # and unknown storage; pointers built from integers are not judged
+    arg_row = torch.arange(4, dtype=torch.float32)
+    other_row = torch.arange(4, 8, dtype=torch.float32)
+    table = torch.tensor([arg_row.data_ptr(), other_row.data_ptr()])
+    out = torch.empty(8)
+    traced = tilelens.trace(client=Tracer())(pointer_table_kernel)
+
+    traced[(1,)](table, arg_row, out, BLOCK_SIZE=4)
+
+    torch.testing.assert_close(out, torch.arange(8, dtype=torch.float32))

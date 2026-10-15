@@ -11,6 +11,9 @@ from ...core.data import (
     Dot,
     Grid,
     Allocate,
+    AtomicCas,
+    AtomicRMW,
+    IntToPtr,
 )
 from ...utils.traceback_utils import extract_user_frames
 from tilelens.core.masked_load_store import masked_load
@@ -29,6 +32,21 @@ def _convert_grid_idx(grid_idx) -> tuple[int, int, int] | None:
     return grid_idx
 
 
+def _storage_ranges(name, arg):
+    """Yield (name, tensor, start, end) for each torch storage behind a kernel arg."""
+    if isinstance(arg, (tuple, list)):
+        for i, item in enumerate(arg):
+            yield from _storage_ranges(f"{name}[{i}]", item)
+        return
+    # triton.reinterpret wrappers and host TensorDescriptors keep the tensor in `base`
+    tensor = arg if hasattr(arg, "untyped_storage") else getattr(arg, "base", None)
+    if hasattr(tensor, "untyped_storage"):
+        storage = tensor.untyped_storage()
+        if storage.nbytes():
+            start = storage.data_ptr()
+            yield name, tensor, start, start + storage.nbytes()
+
+
 class Tracer(Client):
     NAME = "tracer"
 
@@ -42,6 +60,8 @@ class Tracer(Client):
         self.grid_idx = _convert_grid_idx(grid_idx)
         self.records: list = []
         self.tensors: list = []
+        # (arg name, tensor, start, end) of the storages behind the kernel args
+        self.storages: list = []
         self.sample = True
 
     def _get_tensor(self, data_ptr):
@@ -53,6 +73,95 @@ class Tracer(Client):
                 break
             ret_idx = i
         return self.tensors[ret_idx]
+
+    def _check_in_bounds(self, op_name: str, ptr, mask) -> None:
+        """
+        Raise IndexError before an access runs off the storage of a tensor arg.
+
+        Triton's interpreter performs loads, stores and atomics on raw host
+        memory, so an active lane past the end of an allocation reads or
+        corrupts whatever follows it (glibc heap metadata, for instance, which
+        later crashes the process at exit). The tracer only judges memory it
+        was given: when any lane of the pointer block, masked-off lanes
+        included, touches a tensor arg's storage, every active lane must lie
+        fully inside some known storage. Accesses that never touch a known
+        storage, and every access of a program after it casts an integer to a
+        pointer (pointer tables), are left alone, so this is a best-effort
+        guard; the Sanitizer is the complete out-of-bounds check.
+        """
+        element_ty = getattr(getattr(ptr, "dtype", None), "element_ty", None)
+        data = getattr(ptr, "data", None)
+        if element_ty is None or not isinstance(data, np.ndarray) or not self.storages:
+            return
+        if self._get_thread_local("int_to_ptr", False):
+            return  # pointers built from integers cannot be attributed to an arg
+
+        lanes = data.reshape(-1)
+        mask_data = True if mask is None else getattr(mask, "data", mask)
+        try:
+            active = np.broadcast_to(
+                np.asarray(mask_data, dtype=bool), data.shape
+            ).reshape(-1)
+        except ValueError:
+            return  # the frontend adapter did not pair mask lanes with pointer lanes
+        active_lanes = lanes[active]
+        if active_lanes.size == 0:
+            return
+        # pointer elements (pointer tables) have no primitive_bitwidth
+        itemsize = max(1, getattr(element_ty, "primitive_bitwidth", 64) // 8)
+        lowest, highest = int(active_lanes.min()), int(active_lanes.max())
+        if any(
+            start <= lowest and highest + itemsize <= end
+            for _, _, start, end in self.storages
+        ):
+            return  # common case: every active lane is inside one storage
+
+        inside = np.zeros(active_lanes.shape, dtype=bool)
+        for _, _, start, end in self.storages:
+            inside |= (active_lanes >= start) & (active_lanes <= end - itemsize)
+        if inside.all():
+            return
+        # Masked-off lanes help attribute the access: Triton splits a float
+        # atomic_max/min into two calls by sign, and the call holding only the
+        # out-of-bounds lanes still points at the tensor through its other lanes.
+        touched = [
+            storage
+            for storage in self.storages
+            if ((lanes > storage[2] - itemsize) & (lanes < storage[3])).any()
+        ]
+        if not touched:
+            return
+
+        outside = active_lanes[~inside]
+        first_bad = int(outside[0])
+        name, tensor, start, end = min(
+            touched, key=lambda s: max(s[2] - first_bad, first_bad - s[3] + 1, 0)
+        )
+        base = tensor.data_ptr()
+        ranges = " and ".join(
+            f"[{int(part.min()) - base}, {int(part.max()) - base + itemsize})"
+            for part in (outside[outside < start], outside[outside >= start])
+            if part.size
+        )
+        frames = extract_user_frames(num_frames=1)
+        where = (
+            f"{frames[0].filename}:{frames[0].lineno} in {frames[0].func_name}\n"
+            f"    {frames[0].line_of_code.strip()}"
+            if frames
+            else "an unknown kernel location"
+        )
+        raise IndexError(
+            f"Tracer refused an out-of-bounds {op_name} in program "
+            f"{self._get_thread_local('program_id')} at {where}\n"
+            f"  {outside.size} of {active_lanes.size} active lanes fall outside "
+            f"`{name}` (dtype={tensor.dtype}, shape={tuple(tensor.shape)}): they "
+            f"touch bytes {ranges} from its data_ptr, but its storage spans "
+            f"[{start - base}, {end - base}).\n"
+            "  Triton's interpreter would run this access on raw host memory, "
+            "reading or writing memory outside the tensor. Mask the out-of-range "
+            'lanes, or run the kernel under the Sanitizer (tilelens.trace("sanitizer")) '
+            "for a full out-of-bounds report."
+        )
 
     def pre_run_callback(self, fn: Callable) -> bool:
         return True
@@ -69,8 +178,11 @@ class Tracer(Client):
     def arg_callback(self, name, arg, arg_cvt):
         if hasattr(arg, "data_ptr"):
             self.tensors.append(arg)
+        self.storages.extend(_storage_ranges(name, arg))
 
     def grid_idx_callback(self, grid_idx: tuple[int, ...]):
+        self._set_thread_local("program_id", grid_idx)
+        self._set_thread_local("int_to_ptr", False)
         if self.grid_idx is not None and grid_idx != self.grid_idx:
             self.sample = False
         else:
@@ -96,6 +208,8 @@ class Tracer(Client):
 
         @self.lock_fn
         def pre_load_callback(ptr, mask, keys):
+            if keys is None:
+                self._check_in_bounds("load", ptr, mask)
             if not self.sample:
                 return
 
@@ -114,6 +228,8 @@ class Tracer(Client):
 
         @self.lock_fn
         def pre_store_callback(ptr, mask, keys):
+            if keys is None:
+                self._check_in_bounds("store", ptr, mask)
             if not self.sample:
                 return
 
@@ -135,6 +251,17 @@ class Tracer(Client):
             rec = Store(tensor.data_ptr(), offsets, mask_data)
             rec.call_path = extract_user_frames(num_frames=1)
             self.records.append(rec)
+
+        @self.lock_fn
+        def pre_atomic_rmw_callback(ptr, mask):
+            self._check_in_bounds("atomic", ptr, mask)
+
+        @self.lock_fn
+        def pre_atomic_cas_callback(ptr):
+            self._check_in_bounds("atomic_cas", ptr, None)
+
+        def post_int_to_ptr_callback(ret, *args):
+            self._set_thread_local("int_to_ptr", True)
 
         @self.lock_fn
         def pre_transfer_callback(src, dst, mem_src, mem_dst):
@@ -210,6 +337,9 @@ class Tracer(Client):
             Allocate: OpCallbacks(after_callback=post_allocate_callback),
             Load: OpCallbacks(before_callback=pre_load_callback),
             Store: OpCallbacks(before_callback=pre_store_callback),
+            AtomicRMW: OpCallbacks(before_callback=pre_atomic_rmw_callback),
+            AtomicCas: OpCallbacks(before_callback=pre_atomic_cas_callback),
+            IntToPtr: OpCallbacks(after_callback=post_int_to_ptr_callback),
             Transfer: OpCallbacks(before_callback=pre_transfer_callback),
             ReduceSum: OpCallbacks(after_callback=post_reduce_sum_callback),
             Dot: OpCallbacks(after_callback=post_dot_callback),
@@ -230,4 +360,5 @@ class Tracer(Client):
     def finalize(self) -> list:
         with self._lock_context():
             self.tensors.clear()
+            self.storages.clear()
             return self.records
