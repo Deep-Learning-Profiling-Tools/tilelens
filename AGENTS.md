@@ -10,6 +10,7 @@ TileLens is a Python package with a TypeScript web UI. Core code lives in `tilel
 - `uv sync --extra nki --extra test`: install NKI plus test dependencies; specify all extras in one command.
 - `uv run pytest tests/`: run the default Python suite, excluding tests marked `nki`.
 - `uv run pytest tests/ -m ""`: run all Python tests, including NKI tests when dependencies are installed.
+- Without a GPU, the profiler tests in `tests/unit/test_multithreading.py` cannot compile. Add `--ignore=tests/unit/test_multithreading.py` to the commands above and run that file with `TRITON_INTERPRET=1 uv run pytest tests/unit/test_multithreading.py`.
 - `npm install`: install web UI tooling.
 - `npm run build:frontend`: compile TypeScript and copy web UI package assets.
 - `npm run test:frontend`: build the web UI and run Node-based web UI tests.
