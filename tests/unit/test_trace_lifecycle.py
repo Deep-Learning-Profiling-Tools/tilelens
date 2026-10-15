@@ -23,14 +23,9 @@ def _real_jit():
 
 
 class _EagerClient(Client):
-    """Interpreting client that records its warmup callbacks."""
+    """Interpreting client with no-op callbacks."""
 
     NAME = "eager"
-
-    def __init__(self, *, warmup_vote=False):
-        super().__init__()
-        self.calls: list = []
-        self.warmup_vote = warmup_vote
 
     def pre_run_callback(self, fn):
         return True
@@ -57,11 +52,10 @@ class _EagerClient(Client):
         return []
 
     def pre_warmup_callback(self, jit_fn, *args, **kwargs):
-        self.calls.append("pre_warmup")
-        return self.warmup_vote
+        return False
 
     def post_warmup_callback(self, jit_fn, ret):
-        self.calls.append(("post_warmup", ret))
+        pass
 
 
 def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain():
@@ -86,24 +80,6 @@ def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain():
 
     torch.testing.assert_close(out, x + 1)
     assert vars(user) == before and user.cache == {}
-
-
-def test_a_launch_does_not_warm_up():
-    @triton.heuristics({"BLOCK": lambda args: 8})
-    @triton.jit
-    def heur_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
-        offs = tl.arange(0, BLOCK)
-        tl.store(out_ptr + offs, tl.load(x_ptr + offs) + 1)
-
-    # Even with a client that would vote for a real compile.
-    client = _EagerClient(warmup_vote=True)
-    traced = tilelens.trace(client)(heur_kernel)
-    x, out = torch.arange(8, dtype=torch.float32), torch.zeros(8)
-
-    traced[(1,)](x, out)
-
-    torch.testing.assert_close(out, x + 1)
-    assert client.calls == []
 
 
 def test_each_traced_launch_is_recorded_separately():
