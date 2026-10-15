@@ -40,7 +40,7 @@ TileLens helps developers inspect Triton kernels with visualization, profiling, 
 ## Getting Started
 
 ### Prerequisites
-- Python >= 3.10
+- Python >= 3.12
 
 
 ### Installation of TileLens
