@@ -13,6 +13,7 @@ from typing import (
 
 import torch
 from z3 import (
+    And,
     If,
     Implies,
     Int,
@@ -364,6 +365,8 @@ class SymbolicRaceDetector(RaceDetector, SymbolicClient):
         self._record_hits: dict[
             int, list[tuple[int, tuple[tuple[Any, int | None], ...]]]
         ] = {}
+        # Every range each loop site ran over (_fence_epoch).
+        self._loop_ranges: dict[Any, set[tuple[int, int, int]]] = {}
         # id(load/atomic SymbolicExpr node) -> event_id, for dependency
         # order (data.py AccessEventRecord.dep_loads).
         self._dep_anchor_ids: dict[int, int] = {}
@@ -915,6 +918,68 @@ class SymbolicRaceDetector(RaceDetector, SymbolicClient):
             return False
         return all(spans_a[it][1] < spans_b[it][0] for it in spans_a)
 
+    def _fence_epoch(self, record: AccessEventRecord) -> Any:
+        """The solver's fence epoch: the number of barriers one program
+        instance has executed before an execution of ``record``. An int
+        when every captured execution agrees, else a term over the
+        record's loop iterators (the ``loop_i_*`` variables of its
+        iterations): affine in a single loop's iterator when that fits
+        every iteration of the loop, else an If-chain over the captured
+        iterations. An iteration that was not captured, or was captured
+        with two epochs, maps to an unconstrained value."""
+        by_key: dict[tuple, set[int]] = {}
+        for seq, key in self._hits_of(record):
+            by_key.setdefault(key, set()).add(bisect_left(self.fences, seq))
+        epochs = set().union(*by_key.values())
+        if len(epochs) == 1:
+            return next(iter(epochs))
+        iterators = {v.decl().name(): v for v in record.copy_local_vars}
+        affine = self._affine_epoch(by_key, iterators)
+        if affine is not None:
+            return affine
+        term: Any = Int(f"fence_epoch_unknown_{record.event_id}")
+        for key, found in by_key.items():
+            if len(found) != 1:
+                continue
+            conditions = [
+                iterators[f"loop_i_{site}"] == value
+                for site, value in key
+                if value is not None and f"loop_i_{site}" in iterators
+            ]
+            if not conditions or len(conditions) != len(key):
+                continue
+            term = If(And(*conditions), IntVal(next(iter(found))), term)
+        return term
+
+    def _affine_epoch(self, by_key: dict, iterators: dict) -> Any:
+        """``e0 + k * (i - i0) / d`` for a record in one loop whose epoch
+        grows by k per iteration over EVERY iteration of the loop's range
+        (so no iteration the solver allows gets an extrapolated epoch);
+        else None. Keeps the solver's terms linear where the If-chain
+        would have one branch per iteration."""
+        points = []
+        for key, found in by_key.items():
+            if len(found) != 1 or len(key) != 1 or key[0][1] is None:
+                return None
+            points.append((key[0][1], next(iter(found))))
+        sites = {key[0][0] for key in by_key}
+        if len(sites) != 1 or len(points) < 2:
+            return None
+        site = next(iter(sites))
+        var = iterators.get(f"loop_i_{site}")
+        ranges = self._loop_ranges.get(site, set())
+        if var is None or len(ranges) != 1:
+            return None
+        if {v for v, _ in points} != set(range(*next(iter(ranges)))):
+            return None
+        points.sort()
+        (v0, e0), (v1, e1) = points[0], points[1]
+        d, k = v1 - v0, e1 - e0
+        if any((v - v0) % d or e != e0 + k * ((v - v0) // d) for v, e in points):
+            return None
+        offset = var - v0 if d == 1 else (var - v0) / d
+        return IntVal(e0) + k * offset
+
     def _hits_of(
         self, record: AccessEventRecord
     ) -> list[tuple[int, tuple[tuple[Any, int | None], ...]]]:
@@ -922,6 +987,10 @@ class SymbolicRaceDetector(RaceDetector, SymbolicClient):
 
     def _loop_key(self) -> tuple[tuple[Any, int | None], ...]:
         """The current iteration of every enclosing loop."""
+        for ctx in self.loop_stack:
+            self._loop_ranges.setdefault(ctx.loop_site, set()).add(
+                (ctx.start, ctx.stop, ctx.step)
+            )
         return tuple((ctx.loop_site, ctx.current_value) for ctx in self.loop_stack)
 
     def finalize(self) -> list:
@@ -934,7 +1003,10 @@ class SymbolicRaceDetector(RaceDetector, SymbolicClient):
           - Initial atomic source covers scalar tensors and small contiguous
             flag arrays (``numel <= 1024``); larger or non-contiguous
             tensors are conservatively reported as races.
-          - Synchronization through a third program instance is not modeled.
+          - A third program instance is an atomic's rf source, but
+            synchronization passed on through it is not modeled (a lock
+            handed from one instance to another through a third is
+            over-reported).
           - Float atomic-RMW return values are not modeled — downstream use
             of the return marks the launch unsupported.
           - Atomic CAS/RMW inside loops are not modeled — the launch is
@@ -966,6 +1038,7 @@ class SymbolicRaceDetector(RaceDetector, SymbolicClient):
                 grid=self._launch_grid,
                 arange_dict=self._arange_dict_snapshot,
                 fence_between=self._fence_between,
+                fence_epoch=self._fence_epoch,
             )
             reports = solver.find_races()
             if not reports and not solver.check_feasibility():
@@ -1038,6 +1111,7 @@ class SymbolicRaceDetector(RaceDetector, SymbolicClient):
         self.records = []
         self.fences = []
         self._record_hits = {}
+        self._loop_ranges = {}
         self._dep_anchor_ids = {}
         self.last_reports = []
         # Pessimistic until finalize() proves otherwise; every finalize()
