@@ -143,7 +143,9 @@ class ClientManager:
                 self.clients[new_client.NAME] = new_client
 
     @contextmanager
-    def patch_warmup(self, jit_fn):
+    def patch_warmup(
+        self, jit_fn, real_compile: Callable[[Callable, tuple, dict], Any]
+    ):
         if not hasattr(jit_fn, "warmup"):
             yield
             return
@@ -157,7 +159,7 @@ class ClientManager:
                 ):
                     return None
                 kwargs.pop("warmup", None)
-                ret = fn(*args, **kwargs)
+                ret = real_compile(fn, args, kwargs)
                 for client in self.clients.values():
                     client.post_warmup_callback(jit_fn, ret)
                 return ret
