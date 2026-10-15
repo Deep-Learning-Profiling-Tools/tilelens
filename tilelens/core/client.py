@@ -1,4 +1,4 @@
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -39,7 +39,7 @@ LAUNCH_PREFERENCES: tuple[LaunchPreference, ...] = ("skip", "indifferent")
 # front end and the backend's "ttir" passes, nothing after them.
 IR_STAGE_NAMES = frozenset({"ttir"})
 
-# (jit_fn, args, kwargs) -> (args, kwargs): the arguments a real compile of
+# (jit_fn, args, kwargs) -> (args, kwargs): the arguments a host compile of
 # one JITFunction call must see, supplied by the trace.
 RealArgs = Callable[[Any, tuple, dict], tuple[tuple, dict]]
 
@@ -294,43 +294,6 @@ class Client(ABC):
     @grid_idx.setter
     def grid_idx(self, value: tuple[int, ...] | None) -> None:
         self._set_thread_local("grid_idx", value)
-
-
-class _WarmupGate:
-    """The warmup one ClientManager.patch_warmup scope puts on a jit_fn.
-
-    It calls through to ``inner``, the warmup it found, and hides
-    ``below``, the instance-level warmup it replaced (None: there was none,
-    so the class's). Overlapping scopes on one jit_fn (e.g. on two host
-    threads) stack their gates and may close in any order: ``remove`` takes
-    a gate out wherever it sits, so once every scope has closed, jit_fn
-    holds exactly the warmup it held before the first one opened.
-    """
-
-    def __init__(self, jit_fn: Any, vote: Callable[[Any, tuple, dict], Any]):
-        self.inner = jit_fn.warmup
-        self.below = vars(jit_fn).get("warmup")
-        self._vote = vote
-
-    def __call__(self, *args, **kwargs):
-        return self._vote(self.inner, args, kwargs)
-
-    def remove(self, jit_fn: Any) -> None:
-        top = vars(jit_fn).get("warmup")
-        if top is self:
-            # Leave no bound method behind in the instance dict: it would
-            # hide a later class-level change to JITFunction.warmup.
-            if self.below is None:
-                del jit_fn.warmup
-            else:
-                jit_fn.warmup = self.below
-            return
-        # A gate put on later sits above this one: route it past this one.
-        while isinstance(top, _WarmupGate):
-            if top.below is self:
-                top.inner, top.below = self.inner, self.below
-                return
-            top = top.below
 
 
 _MISSING = object()
@@ -667,45 +630,32 @@ class ClientManager:
             raise interrupt from exc
 
     @contextmanager
-    def patch_warmup(
-        self,
-        jit_fn,
-        compile_context: Callable[[], AbstractContextManager] = nullcontext,
-        real_args: RealArgs | None = None,
-    ):
-        """Gate ``jit_fn.warmup`` on this manager's warmup votes for the
-        scope. The real compile, and only it, runs inside
-        ``compile_context()``, on the arguments ``real_args`` maps the call
-        to. On exit the scope takes its gate out again (see _WarmupGate).
-        """
+    def patch_warmup(self, jit_fn):
         if not hasattr(jit_fn, "warmup"):
             yield
             return
 
-        def vote(warmup, args, kwargs):
-            # Poll every client, also after a True vote, so each one sees
-            # pre_warmup_callback before the post_warmup_callback all get.
-            votes = [
-                client.pre_warmup_callback(jit_fn, *args, **kwargs)
-                for client in self.clients.values()
-            ]
-            if not any(votes):
-                return None
-            kwargs.pop("warmup", None)
-            if real_args is not None:
-                args, kwargs = real_args(jit_fn, args, kwargs)
-            with compile_context():
-                ret = warmup(*args, **kwargs)
-            for client in self.clients.values():
-                client.post_warmup_callback(jit_fn, ret)
-            return ret
+        def patcher(fn):
+            @wraps(fn)
+            def wrapped(*args, **kwargs):
+                if all(
+                    not client.pre_warmup_callback(jit_fn, *args, **kwargs)
+                    for client in self.clients.values()
+                ):
+                    return None
+                kwargs.pop("warmup", None)
+                ret = fn(*args, **kwargs)
+                for client in self.clients.values():
+                    client.post_warmup_callback(jit_fn, ret)
+                return ret
 
-        gate = _WarmupGate(jit_fn, vote)
-        jit_fn.warmup = gate
+            return wrapped
+
+        jit_fn.warmup = patcher(jit_fn.warmup)
         try:
             yield
         finally:
-            gate.remove(jit_fn)
+            jit_fn.warmup = jit_fn.warmup.__wrapped__
 
     @contextmanager
     def ir_capture(self, jit_fn, *, real_args: RealArgs | None = None):
@@ -946,30 +896,27 @@ class ClientManager:
         # callbacks would otherwise replace an interpreting peer's patches.
         interpreting = self.interpreting_clients()
         with patch_calls(frontend_name):
-            lang_patched = False
-            try:
-                # Collect all for-loop callbacks from clients
-                all_loop_callbacks = []
-                for client in interpreting:
-                    for namespace, attrs in namespaces.items():  # patch ops
-                        for attr, op in attrs.items():
-                            callbacks = client.register_op_callback(op)
-                            patch_op(
-                                namespace,
-                                attr,
-                                callbacks,
-                                frontend_name=frontend_name,
-                            )
-                    all_loop_callbacks.append(client.register_for_loop_callback())
+            # Collect all for-loop callbacks from clients
+            all_loop_callbacks = []
+            for client in interpreting:
+                for namespace, attrs in namespaces.items():  # patch ops
+                    for attr, op in attrs.items():
+                        callbacks = client.register_op_callback(op)
+                        patch_op(
+                            namespace,
+                            attr,
+                            callbacks,
+                            frontend_name=frontend_name,
+                        )
+                all_loop_callbacks.append(client.register_for_loop_callback())
 
-                self._populate_loop_hooks(all_loop_callbacks)
-                patch_for_loop(frontend_name)
-                patch_lang(fn, frontend_name, client_manager=self)
-                lang_patched = True
+            self._populate_loop_hooks(all_loop_callbacks)
+            patch_for_loop(frontend_name)
+            patch_lang(fn, frontend_name, client_manager=self)
+            try:
                 yield
             finally:
-                if lang_patched:
-                    unpatch_lang(frontend_name)
+                unpatch_lang(frontend_name)
                 for namespace, attrs in namespaces.items():
                     for attr, op in attrs.items():
                         unpatch_op(namespace, attr, frontend_name)

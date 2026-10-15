@@ -67,7 +67,8 @@ jobs:
     - name: Test with pytest
       run: |
         cd tilelens
-        uv run pytest tests -n auto --ignore=tests/end_to_end/test_triton_kernels.py
+        uv run pytest tests -n auto --ignore=tests/end_to_end/test_triton_kernels.py --ignore=tests/unit/test_multithreading.py
+        TRITON_INTERPRET=1 uv run pytest tests/unit/test_multithreading.py tests/end_to_end/test_core.py::test_autotune_interpreter_mode
 
     - name: Install TileLens with NKI extras
       run: |
@@ -83,7 +84,7 @@ jobs:
     - name: Run full (Triton + NKI) pytest suite
       run: |
         cd tilelens
-        uv run pytest tests -m "" -n auto --ignore=tests/end_to_end/test_triton_kernels.py
+        uv run pytest tests -m "" -n auto --ignore=tests/end_to_end/test_triton_kernels.py --ignore=tests/unit/test_multithreading.py
 
   test-pip-install:
     runs-on: ubuntu-latest

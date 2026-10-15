@@ -10,10 +10,7 @@ import triton.language as tl
 import tilelens
 from tilelens.clients.profiler.profiler import Profiler
 from tilelens.core.config import config as cfg
-import os
 
-# TODO: remove this fixture once we unpatch tilelens properly
-os.environ["TRITON_INTERPRET"] = "1"
 trace_state = importlib.import_module("tilelens.core.trace")
 
 
