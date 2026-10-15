@@ -312,9 +312,8 @@ def test_cli_rejects_trace_decorator(tmp_path: Path):
         "Please ensure the package is properly installed."
     )
 
-    # 3) Run subprocess, with @triton.jit building a JITFunction, which the
-    # CLI keeps
-    env = {**os.environ, "TRITON_INTERPRET": "0"}
+    # 3) Run subprocess
+    env = os.environ.copy()
     proc = subprocess.run(
         [exe, str(my_program)],
         cwd=str(tmp_path),
@@ -361,7 +360,6 @@ def kernel(ptr, BLOCK: tl.constexpr):
     # On CPU nothing can compile, so the buffer-load check is off there.
     env = {
         **os.environ,
-        "TRITON_INTERPRET": "0",
         "PROFILER_DISABLE_BUFFER_LOAD_CHECK": "1" if device == "cpu" else "0",
     }
     proc = subprocess.run(

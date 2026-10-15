@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 
 import tilelens
 import triton
-from triton import knobs
 from tilelens.core.config import config as cfg
 from tilelens.core.trace import TraceInterface
 from tilelens.wrapper import (
@@ -169,17 +168,13 @@ def test_patched_jit_preserves_device_function_dependencies(_isolate_cli_active)
     cfg.cli_active = True
     patched_jit = create_patched_jit(profiler_wrapper, triton.jit, frontend="triton")
 
-    with knobs.runtime.scope():
-        # test_multithreading turns the interpreter on for the whole process.
-        knobs.runtime.interpret = False
+    @patched_jit
+    def add_one(value):
+        return value + 1
 
-        @patched_jit
-        def add_one(value):
-            return value + 1
-
-        @patched_jit
-        def add_two(value):
-            return add_one(add_one(value))
+    @patched_jit
+    def add_two(value):
+        return add_one(add_one(value))
 
     # Triton's dependency hashing accepts only JITFunction callees.
     assert isinstance(add_one, triton.JITFunction)
