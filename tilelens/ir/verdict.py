@@ -1,4 +1,5 @@
-"""The structured record an IR client adds to ``Launch.records``.
+"""The structured record an IR client adds to ``Launch.records`` (the eager
+sanitizer adds one too, for a launch it reports unsupported).
 
 Plain frozen records: statuses and scopes are strings in the reporting
 client's own vocabulary, and nothing here aggregates, ranks or interprets
@@ -101,7 +102,8 @@ class ConfigVerdict:
 
 @dataclass(frozen=True)
 class IRVerdict:
-    """One IR client's result for one traced launch."""
+    """One IR client's result for one traced launch (or the eager
+    sanitizer's, for a launch it reports unsupported)."""
 
     client: str  # the client's NAME
     status: str
