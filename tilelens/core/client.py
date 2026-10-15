@@ -64,6 +64,10 @@ class Client(ABC):
         """
         ...
 
+    def block_start_callback(self, fn: Callable) -> None:
+        """Called after every client agrees that a block should execute."""
+        return None
+
     @abstractmethod
     def arg_callback(self, name, arg, arg_cvt):
         ...
@@ -205,7 +209,11 @@ class ClientManager:
     def pre_run_callback(self, fn: Callable) -> bool:
         with self._lock_context():
             rets = [client.pre_run_callback(fn) for client in self.clients.values()]
-            return all(rets) if rets else True
+            should_run = all(rets) if rets else True
+            if should_run:
+                for client in self.clients.values():
+                    client.block_start_callback(fn)
+            return should_run
 
     def post_run_callback(self, fn: Callable) -> bool:
         with self._lock_context():

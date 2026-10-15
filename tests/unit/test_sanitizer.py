@@ -1,9 +1,14 @@
 import numpy as np
 import pytest
 import torch
+import triton
+import triton.language as tl
 from typing import cast
 from z3 import Int
 
+import tilelens
+from tilelens.core.callbacks import ForLoopCallbacks, OpCallbacks
+from tilelens.core.client import Client, ClientManager
 from tilelens.core.config import config as cfg
 from tilelens.core.data import Load, Store
 from tilelens.core.symbolic_metadata import (
@@ -108,6 +113,69 @@ def test_pre_run_callback_cache_miss_on_grid_change(_isolate_fn_symbolic_cache):
     _populate_for_launch(b, (4, 1, 1))
     assert b.pre_run_callback(kernel) is True
     assert len(_isolate_fn_symbolic_cache) == 2
+
+
+def test_vetoed_block_does_not_count_as_active_sanitizer_block():
+    class VetoClient(Client):
+        NAME = "veto"
+
+        def pre_run_callback(self, fn):
+            return False
+
+        def post_run_callback(self, fn):
+            return True
+
+        def arg_callback(self, name, arg, arg_cvt):
+            return None
+
+        def grid_callback(self, grid):
+            return None
+
+        def grid_idx_callback(self, grid_idx):
+            return None
+
+        def register_op_callback(self, op_type, *args, **kwargs):
+            return OpCallbacks()
+
+        def register_for_loop_callback(self):
+            return ForLoopCallbacks()
+
+        def finalize(self):
+            return []
+
+        def pre_warmup_callback(self, jit_fn, *args, **kwargs):
+            return False
+
+        def post_warmup_callback(self, jit_fn, ret):
+            return None
+
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    manager = ClientManager([sanitizer, VetoClient()])
+    manager.grid_callback((1, 1, 1))
+    manager.grid_idx_callback((0, 0, 0))
+
+    assert manager.pre_run_callback(lambda: None) is False
+    assert sanitizer._active_blocks == 0
+
+
+@triton.jit
+def _masked_copy_kernel(x_ptr, y_ptr, N, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    tl.store(y_ptr + offs, tl.load(x_ptr + offs, mask=mask), mask=mask)
+
+
+def test_fn_cache_skipped_launch_drops_its_state(_isolate_fn_symbolic_cache):
+    """No block of the cache-skipped repeat reaches post_run_callback; its
+    tensors must still go, or x's full range hides the x[:64] OOB read."""
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    kernel = tilelens.trace(client=sanitizer)(_masked_copy_kernel)
+    x, y = torch.arange(128, dtype=torch.float32), torch.empty(128)
+    kernel[(1,)](x, y, 128, BLOCK=128)
+    kernel[(1,)](x, y, 128, BLOCK=128)
+    assert sanitizer.tensors == []
+    kernel[(1,)](x[:64], y, 128, BLOCK=128)
+    assert [record.op_type for record in sanitizer.records] == [Load]
 
 
 def test_post_run_callback_preserves_state_mid_full_grid():

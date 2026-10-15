@@ -14,9 +14,13 @@ class _DummyClient(Client):
         super().__init__()
         self.tensors = [] if tensors is None else list(tensors)
         self._records = [] if records is None else list(records)
+        self.block_start_calls = 0
 
     def pre_run_callback(self, fn):
         return True
+
+    def block_start_callback(self, fn):
+        self.block_start_calls += 1
 
     def post_run_callback(self, fn):
         return True
@@ -59,6 +63,26 @@ def test_client_manager_finalize_collects_client_tensors():
 
     assert tensor in manager.launch.tensors
     assert manager.launch.records == [record]
+
+
+def test_client_manager_only_marks_block_started_after_all_clients_accept():
+    class VetoClient(_DummyClient):
+        NAME = "veto"
+
+        def pre_run_callback(self, fn):
+            return False
+
+    accepted = _DummyClient()
+    veto = VetoClient()
+    manager = ClientManager([accepted, veto])
+
+    assert manager.pre_run_callback(lambda: None) is False
+    assert accepted.block_start_calls == 0
+    assert veto.block_start_calls == 0
+
+    manager = ClientManager([accepted])
+    assert manager.pre_run_callback(lambda: None) is True
+    assert accepted.block_start_calls == 1
 
 
 def test_lock_fn_keeps_runtime_lock_decision():
