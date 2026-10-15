@@ -197,11 +197,8 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
                     "nested traced calls require matching clients; "
                     f"outer={outer_clients}, inner={inner_clients}"
                 )
-            return self.interpreted_fn(*args, **kwargs)
 
-        # Outside a traced launch, behave as the untraced function: Triton's
-        # interpreter, or JITFunction's refusal outside a kernel.
-        return self.fn(*args, **kwargs)
+        return self.interpreted_fn(*args, **kwargs)
 
     def warmup(self, *args, **kwargs):
         with self.client_manager.patch_warmup(self.jit_fn):

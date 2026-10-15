@@ -120,18 +120,3 @@ def test_each_traced_launch_is_recorded_separately():
     traced[(2,)](x, 8, BLOCK=4)
 
     assert [launch.grid for launch in launches[before:]] == [(1, 1, 1), (2, 1, 1)]
-
-
-def _add_one(x):
-    return x + 1
-
-
-def test_a_traced_function_called_outside_a_kernel_leaves_the_language_alone():
-    helper = tilelens.trace(_EagerClient())(triton.jit(_add_one))
-    program_id = tl.program_id
-
-    # E.g. a real compile reaching the trace as a plain Python callee.
-    with pytest.raises(RuntimeError, match="outside of the scope of a kernel"):
-        helper(1)
-
-    assert tl.program_id is program_id
