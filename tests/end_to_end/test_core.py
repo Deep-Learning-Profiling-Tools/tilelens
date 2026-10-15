@@ -3,6 +3,7 @@ import torch
 
 import triton
 import triton.language as tl
+from triton import knobs
 
 import tilelens
 from tilelens.clients import Profiler, Sanitizer
@@ -79,8 +80,10 @@ def test_gluon_trace_handles_autotuner_wrapper():
 
     assert isinstance(my_gluon_kernel, GluonTrace)
     assert isinstance(my_gluon_kernel.runner, Autotuner)
-    assert isinstance(my_gluon_kernel.runner.fn, GluonInterpretedFunction)
-    assert my_gluon_kernel.runner.fn.fn is my_gluon_kernel.base_fn
+    leaf = my_gluon_kernel.runner.fn
+    assert isinstance(leaf.interpreted_fn, GluonInterpretedFunction)
+    assert leaf.interpreted_fn.fn is my_gluon_kernel.base_fn
+    assert leaf.fn is my_gluon_kernel.jit_fn
 
 
 def test_gluon_trace_handles_heuristics_wrapper():
@@ -99,8 +102,62 @@ def test_gluon_trace_handles_heuristics_wrapper():
 
     assert isinstance(my_gluon_kernel, GluonTrace)
     assert isinstance(my_gluon_kernel.runner, Heuristics)
-    assert isinstance(my_gluon_kernel.runner.fn, GluonInterpretedFunction)
-    assert my_gluon_kernel.runner.fn.fn is my_gluon_kernel.base_fn
+    leaf = my_gluon_kernel.runner.fn
+    assert isinstance(leaf.interpreted_fn, GluonInterpretedFunction)
+    assert leaf.interpreted_fn.fn is my_gluon_kernel.base_fn
+    assert leaf.fn is my_gluon_kernel.jit_fn
+
+
+def test_gluon_autotune_listener_sees_jit_function(monkeypatch):
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as ttgl
+
+    calls = []
+    monkeypatch.setattr(knobs.autotuning, "listener", lambda **kw: calls.append(kw))
+
+    @tilelens.trace("tracer", frontend="gluon")
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK": 1}, num_warps=1),
+            triton.Config({"BLOCK": 2}, num_warps=1),
+        ],
+        key=[],
+    )
+    @gluon.jit
+    def my_gluon_kernel(in_ptr, out_ptr, BLOCK: ttgl.constexpr):
+        ttgl.store(out_ptr, ttgl.load(in_ptr))
+
+    inp = torch.tensor([42.0])
+    out = torch.empty_like(inp)
+    my_gluon_kernel[(1,)](inp, out)
+
+    assert [call["fn"] for call in calls] == [my_gluon_kernel.jit_fn]
+    torch.testing.assert_close(out, inp, atol=0, rtol=0)
+
+
+def test_gluon_autotune_retrace_keeps_jit_function():
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as ttgl
+
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK": 1}, num_warps=1),
+            triton.Config({"BLOCK": 2}, num_warps=1),
+        ],
+        key=[],
+    )
+    @gluon.jit
+    def my_gluon_kernel(in_ptr, out_ptr, BLOCK: ttgl.constexpr):
+        ttgl.store(out_ptr, ttgl.load(in_ptr))
+
+    first = tilelens.trace("tracer", frontend="gluon")(my_gluon_kernel)
+    second = tilelens.trace("tracer", frontend="gluon")(my_gluon_kernel)
+
+    assert second.jit_fn is first.jit_fn
+    inp = torch.tensor([42.0])
+    out = torch.empty_like(inp)
+    second[(1,)](inp, out)
+    torch.testing.assert_close(out, inp, atol=0, rtol=0)
 
 
 def test_gluon_sanitizer_run_preserves_instrumentation_mode(monkeypatch):
@@ -368,3 +425,64 @@ def test_autotune_interpreter_mode():
 
     traced = tilelens.trace(client=Sanitizer())(noop_kernel)
     traced[(1,)](n=32)
+
+
+def _autotuned_fill_kernel(**autotune_kwargs):
+    # A JITFunction, not the InterpretedFunction triton.jit returns in
+    # interpreter mode, which tests/unit/test_multithreading.py turns on for
+    # the whole session.
+    with knobs.runtime.scope():
+        knobs.runtime.interpret = False
+
+        # Two configs, so a launch with a new key benchmarks them.
+        @triton.autotune(
+            configs=[triton.Config({"BLOCK": 32}), triton.Config({"BLOCK": 64})],
+            key=["n"],
+            **autotune_kwargs,
+        )
+        @triton.jit
+        def fill_kernel(x_ptr, n, BLOCK: tl.constexpr):
+            offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+            tl.store(x_ptr + offs, 1.0, mask=offs < n)
+
+    return fill_kernel
+
+
+def _fill_grid(meta):
+    return (triton.cdiv(100, meta["BLOCK"]),)
+
+
+def test_autotune_listener_sees_jit_function(monkeypatch):
+    calls = []
+    monkeypatch.setattr(knobs.autotuning, "listener", lambda **kw: calls.append(kw))
+    traced = tilelens.trace("tracer")(_autotuned_fill_kernel())
+
+    x = torch.zeros(100)
+    traced[_fill_grid](x, 100)
+
+    assert [call["fn"] for call in calls] == [traced.jit_fn]
+    assert torch.all(x == 1)
+
+
+def test_autotune_retrace_keeps_jit_function():
+    kernel = _autotuned_fill_kernel()
+    first = tilelens.trace("tracer")(kernel)
+    second = tilelens.trace("tracer")(kernel)
+
+    assert first.jit_fn is not None
+    assert second.jit_fn is first.jit_fn
+    x = torch.zeros(100)
+    second[_fill_grid](x, 100)
+    assert torch.all(x == 1)
+
+
+def test_autotune_interpreter_skips_disk_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    kernel = _autotuned_fill_kernel(cache_results=True)
+    traced = tilelens.trace("tracer")(kernel)
+
+    x = torch.zeros(100)
+    traced[_fill_grid](x, 100)
+
+    assert torch.all(x == 1)
+    assert not list(tmp_path.rglob("*.autotune.json"))

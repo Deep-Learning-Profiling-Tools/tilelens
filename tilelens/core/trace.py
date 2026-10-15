@@ -1,4 +1,4 @@
-from copy import deepcopy
+from copy import copy
 from collections.abc import Callable
 from typing import Any
 from ..utils.traceback_utils import CODE_KEYS, get_code_key
@@ -65,6 +65,33 @@ class LaunchInterface:
         )
 
 
+class _InterpretedLeaf:
+    """The interpreted kernel at the bottom of a traced Autotuner/Heuristics chain.
+
+    Everything is the interpreted function's, except ``fn``: that is the
+    kernel's JITFunction, not the Python function an InterpretedFunction's
+    ``fn`` is, since Triton's Autotuner follows ``.fn`` from its own down to
+    the JITFunction it tunes (its disk cache key; ``knobs.autotuning.listener``,
+    which Triton 3.8 calls after autotuning a launch).
+    """
+
+    def __init__(self, jit_fn: Any, interpreted_fn: Any) -> None:
+        self.jit_fn = jit_fn
+        self.interpreted_fn = interpreted_fn
+
+    @property
+    def fn(self) -> Any:
+        return self.jit_fn
+
+    def run(self, *args, **kwargs):
+        return self.interpreted_fn.run(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        if name in ("jit_fn", "interpreted_fn"):  # not set yet (e.g. mid-copy)
+            raise AttributeError(name)
+        return getattr(self.interpreted_fn, name)
+
+
 class KernelTraceSupport:
     @staticmethod
     def _is_autotuner(runner: Any) -> bool:
@@ -83,14 +110,24 @@ class KernelTraceSupport:
         fn()
         return (1.0, 1.0, 1.0)
 
-    def _interpreter_runner(self, runner: Any, interpreted_fn: Any) -> Any:
+    def _interpreter_runner(
+        self, runner: Any, interpreted_fn: Any, jit_fn: Any | None
+    ) -> Any:
+        leaf = (
+            interpreted_fn
+            if jit_fn is None
+            else _InterpretedLeaf(jit_fn, interpreted_fn)
+        )
         if self._is_autotuner(runner):
-            runner.fn = interpreted_fn
+            runner.fn = leaf
             # Kernel Cache: replace the benchmark with a dummy to skip performance testing.
             runner._do_bench = self.dummy_benchmarker
+            # Triton only turns the disk cache off for an autotuner decorated in
+            # interpreter mode; the dummy timings must never be persisted.
+            runner.cache_results = False
             return runner
         if self._is_heuristics(runner):
-            runner.fn = interpreted_fn
+            runner.fn = leaf
             return runner
         return interpreted_fn
 
@@ -99,7 +136,8 @@ class KernelTraceSupport:
             return jit_fn
         if jit_fn is None:
             return None
-        warmup_runner = deepcopy(runner)
+        # No deepcopy: the JITFunction under runner holds an RLock.
+        warmup_runner = copy(runner)
         warmup_runner.fn = jit_fn
         return warmup_runner
 
@@ -144,6 +182,9 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
         ) -> tuple[Any | None, Callable | None, Any | None]:
             if isinstance(source, TritonTrace):
                 return source.jit_fn, source.base_fn, source.interpreted_fn
+            if isinstance(source, _InterpretedLeaf):
+                # The leaf an earlier trace put under this autotuner or heuristics
+                return source.jit_fn, source.jit_fn.fn, source.interpreted_fn
             if isinstance(source, JITFunction):
                 base_fn = source.fn
                 return source, base_fn, InterpretedFunction(base_fn)
@@ -160,7 +201,7 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
             self.jit_fn, self.base_fn, self.interpreted_fn = unpack_kernel(runner.fn)
         else:
             self.jit_fn, self.base_fn, self.interpreted_fn = unpack_kernel(runner)
-        self.runner = self._interpreter_runner(runner, self.interpreted_fn)
+        self.runner = self._interpreter_runner(runner, self.interpreted_fn, self.jit_fn)
         self.warmup_runner = self._warmup_runner(runner, self.jit_fn)
 
         self.arg_names = runner.arg_names
@@ -304,22 +345,29 @@ class GluonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
         if not all(hasattr(runner, attr) for attr in ("fn", "run", "arg_names")):
             runner = gluon.jit(runner)
 
-        def unpack_kernel(source: Any) -> tuple[Callable, Any]:
+        def unpack_kernel(source: Any) -> tuple[Any, Callable, Any]:
             if isinstance(source, GluonTrace):
-                return source.base_fn, source.interpreted_fn
+                return source.jit_fn, source.base_fn, source.interpreted_fn
+            if isinstance(source, _InterpretedLeaf):
+                # The leaf an earlier trace put under this autotuner or heuristics
+                return source.jit_fn, source.jit_fn.fn, source.interpreted_fn
             if isinstance(source, Heuristics):
                 return unpack_kernel(source.fn)
             if all(hasattr(source, attr) for attr in ("fn", "arg_names")):
                 base_fn = source.fn
-                return base_fn, GluonInterpretedFunction(base_fn, source.arg_names)
+                return (
+                    source,
+                    base_fn,
+                    GluonInterpretedFunction(base_fn, source.arg_names),
+                )
             raise TypeError(f"Unsupported runner type: {type(source)}")
 
-        self.base_fn, self.interpreted_fn = unpack_kernel(
+        self.jit_fn, self.base_fn, self.interpreted_fn = unpack_kernel(
             runner.fn if self._is_autotuner(runner) else runner
         )
         self.fn = runner
         self.arg_names = runner.arg_names
-        self.runner = self._interpreter_runner(runner, self.interpreted_fn)
+        self.runner = self._interpreter_runner(runner, self.interpreted_fn, self.jit_fn)
 
         TraceInterface.__init__(self, client)
         self._copy_callable_attrs(runner, self.base_fn)
