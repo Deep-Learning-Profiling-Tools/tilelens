@@ -10,6 +10,8 @@ import torch
 
 from ..clients.profiler import data as profiler_data
 from ..clients.sanitizer import data as sanitizer_data
+from ..ir import launch as ir_launch
+from ..ir import verdict as ir_verdict
 from ..utils import traceback_utils
 from . import data as trace_data
 from .data import Launch, TensorSnapshot
@@ -22,7 +24,15 @@ _MANIFEST_NAME, _TENSORS_NAME = "manifest.json", "tensors.npz"
 ArrayMap = dict[str, np.ndarray]
 _TRACE_CLASSES = {
     f"{cls.__module__}:{cls.__qualname__}": cls
-    for module in (trace_data, profiler_data, sanitizer_data, traceback_utils)
+    for module in (
+        trace_data,
+        profiler_data,
+        sanitizer_data,
+        traceback_utils,
+        # Pure data: neither imports Triton.
+        ir_launch,
+        ir_verdict,
+    )
     for cls in vars(module).values()
     if isinstance(cls, type) and is_dataclass(cls)
 }

@@ -1,6 +1,15 @@
 import os
 
 
+# The target IR mode compiles kernels for unless a client or
+# TILELENS_IR_TARGET says otherwise: GPUTarget("cuda", 89, 32), so a
+# result never depends on the machine it was computed on. sm89 (Ada) is the
+# first capability Triton compiles fp8e4nv for, and still has no native TMA
+# (sm90+), so tensor descriptors are lowered to pointer math the reader
+# analyzes.
+DEFAULT_IR_TARGET = "cuda:89"
+
+
 def _get_env(env: str, default: str) -> str:
     """Prefer TileLens settings, falling back to the former variable names."""
     if env.startswith("TILELENS_"):
@@ -54,6 +63,13 @@ class Config:
     - sanitizer_report_max_segments: SANITIZER_REPORT_MAX_SEGMENTS, max
       number of address segments to list verbatim in the OOB report before
       truncating to a head/tail summary. Affects display only (min 2).
+    - ir_target: TILELENS_IR_TARGET, the target IR mode compiles kernels for
+      when the IR client names none (DEFAULT_IR_TARGET, "cuda:89", if unset):
+      e.g. "cuda:90" or "hip:gfx942", see
+      tilelens.core.host_compile.parse_ir_target. A value that names no
+      target is reported when a traced launch compiles. The IR target also
+      wins over TRITON_OVERRIDE_ARCH, which retargets only the JIT's own
+      (device) compiles.
     """
 
     def __init__(self) -> None:
@@ -87,6 +103,26 @@ class Config:
         self.sanitizer_report_max_segments: int = _get_int_env(
             "SANITIZER_REPORT_MAX_SEGMENTS", 8, minimum=2
         )
+        self.ir_target: str = _get_env("TILELENS_IR_TARGET", DEFAULT_IR_TARGET)
 
 
 config = Config()
+
+
+# The one Triton minor release IR mode runs on: the host compile
+# (tilelens.core.host_compile) uses its private API, so on any other release
+# it refuses.
+IR_TRITON_RELEASE = "3.8"
+
+
+def ir_triton_unsupported() -> str | None:
+    """Why IR mode cannot run on the installed Triton; None on Triton 3.8.x."""
+    import triton
+
+    version = triton.__version__
+    if version.split(".")[:2] == IR_TRITON_RELEASE.split("."):
+        return None
+    return (
+        f"IR mode supports Triton {IR_TRITON_RELEASE}.x only; the installed "
+        f"Triton is {version}"
+    )
