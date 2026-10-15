@@ -110,8 +110,8 @@ config = Config()
 
 
 # The one Triton minor release IR mode runs on: the host compile
-# (tilelens.core.host_compile) uses its private API, so on any other release
-# it refuses.
+# (tilelens.core.host_compile) and the TTIR walk (tilelens.ir._mlir_walk) use
+# its private API, so on any other release both refuse.
 IR_TRITON_RELEASE = "3.8"
 
 
