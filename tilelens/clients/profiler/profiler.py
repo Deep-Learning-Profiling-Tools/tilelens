@@ -51,6 +51,7 @@ class Profiler(Client):
         disable_for_loop_unroll_check: bool = False,
         disable_load_mask_percentage_check: bool = False,
         k: int | None = None,
+        compile: bool | None = None,
     ):
         super().__init__()  # Initialize parent class
         self.callpath = callpath
@@ -81,6 +82,10 @@ class Profiler(Client):
         # Case 4: Buffer Load Check
         self.has_buffer_load = False
         self.disable_buffer_load_check = cfg.profiler_disable_buffer_load_check
+        # Compile each launch first, for the buffer-load check's ASM.
+        self.compile = (
+            not self.disable_buffer_load_check if compile is None else compile
+        )
         self.potential_buffer_load_issue_found = False
 
         # Block sampling
@@ -103,8 +108,7 @@ class Profiler(Client):
         return True
 
     def pre_warmup_callback(self, jit_fn, *args, **kwargs) -> bool:
-        # Skip warmup if buffer load check is disabled
-        return not self.disable_buffer_load_check
+        return self.compile
 
     def post_warmup_callback(self, jit_fn, ret) -> None:
         if not ret:
