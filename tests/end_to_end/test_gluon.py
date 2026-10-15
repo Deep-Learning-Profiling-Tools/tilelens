@@ -7,7 +7,11 @@ import torch
 from triton import knobs
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.amd import cdna3
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as amd_cdna4_cp
+from triton.experimental.gluon.language.amd.gfx1250 import (
+    async_copy as amd_gfx1250_cp,
+)
 from triton.experimental.gluon.language.nvidia import blackwell, hopper
 from triton.experimental.gluon.language.nvidia.blackwell import tma as blackwell_tma
 from triton.experimental.gluon.language.nvidia.hopper import (
@@ -23,6 +27,7 @@ import tilelens
 from tilelens.clients.sanitizer.sanitizer import SymbolicSanitizer
 from tilelens.core.data import Load
 from tilelens.core.simulation.gluon import GluonInterpretedFunction, gluon_builder
+from tilelens.visualizer.draw import get_visualization_data
 
 try:
     from triton.experimental.gluon.language.nvidia.ampere import async_copy as cp
@@ -117,6 +122,58 @@ def _unmasked_store_1d_memcpy_kernel(
     offsets = gl.program_id(0) * BLOCK + gl.arange(0, BLOCK, layout=layout)
     value = gl.load(in_ptr + offsets, mask=offsets < xnumel, other=0.0)
     gl.store(out_ptr + offsets, value)
+
+
+@gluon.jit
+def _pointer_table_kernel(table_ptr, arg_ptr, out_ptr, BLOCK: gl.constexpr):
+    layout: gl.constexpr = gl.BlockedLayout([1, 1], [2, 16], [1, 1], [1, 0])
+    rows = gl.arange(0, 2, layout=gl.SliceLayout(1, layout))
+    cols = gl.arange(0, BLOCK, layout=gl.SliceLayout(0, layout))
+    row_ptrs = gl.load(table_ptr + rows).to(gl.pointer_type(gl.float32))
+    values = gl.load(row_ptrs[:, None] + cols[None, :])
+    gl.store(out_ptr + rows[:, None] * BLOCK + cols[None, :], values)
+
+
+@gluon.jit
+def _int_to_ptr_bitcast_copy_kernel(addr, src_ptr, out_ptr, BLOCK: gl.constexpr):
+    layout: gl.constexpr = gl.BlockedLayout([1], [32], [1], [0])
+    offs = gl.arange(0, BLOCK, layout=layout)
+    words = addr.to(gl.int64).to(gl.pointer_type(gl.int32))
+    floats = words.to(gl.pointer_type(gl.float32), bitcast=True)
+    gl.store(out_ptr + offs, gl.load(floats + offs))
+
+
+@gluon.jit
+def _atomic_add_kernel(out_ptr, xnumel, BLOCK: gl.constexpr, layout: gl.constexpr):
+    offsets = gl.program_id(0) * BLOCK + gl.arange(0, BLOCK, layout=layout)
+    gl.atomic_add(out_ptr + offsets, 1.0, mask=offsets < xnumel)
+
+
+@gluon.jit
+def _atomic_cas_kernel(out_ptr, xnumel, BLOCK: gl.constexpr, layout: gl.constexpr):
+    offsets = gl.program_id(0) * BLOCK + gl.arange(0, BLOCK, layout=layout)
+    gl.atomic_cas(
+        out_ptr + offsets,
+        gl.full([BLOCK], -7, gl.int32, layout),
+        gl.full([BLOCK], 1, gl.int32, layout),
+    )
+
+
+@gluon.jit
+def _buffer_atomic_add_kernel(
+    out_ptr, xnumel, BLOCK: gl.constexpr, layout: gl.constexpr
+):
+    offsets = gl.program_id(0) * BLOCK + gl.arange(0, BLOCK, layout=layout)
+    values = gl.full([BLOCK], 1.0, gl.float32, layout)
+    cdna3.buffer_atomic_add(out_ptr, offsets, values, mask=offsets < xnumel)
+
+
+@gluon.jit
+def _spin_lock_kernel(lock_ptr, out_ptr):
+    while gl.atomic_cas(lock_ptr, 0, 1) == 1:
+        pass
+    gl.store(out_ptr, gl.load(out_ptr) + 1)
+    gl.atomic_xchg(lock_ptr, 0)
 
 
 @gluon.jit
@@ -245,6 +302,125 @@ def _amd_async_copy_other_kernel(in_ptr, out_ptr, xnumel, BLOCK: gl.constexpr):
     amd_cdna4_cp.wait_group(0)
     values = smem.load(layout)
     gl.store(out_ptr + offsets, values)
+
+
+@gluon.jit
+def _ampere_async_load_kernel(
+    in_ptr,
+    out_ptr,
+    BLOCK: gl.constexpr,
+    layout: gl.constexpr,
+    smem_layout: gl.constexpr,
+):
+    offsets = gl.arange(0, BLOCK, layout=layout)
+    smem = gl.allocate_shared_memory(gl.float32, [BLOCK], layout=smem_layout)
+    cp.async_load(smem, in_ptr + offsets)
+    cp.commit_group()
+    cp.wait_group(0)
+    gl.store(out_ptr + offsets, smem.load(layout))
+
+
+@gluon.jit
+def _ampere_async_copy_global_to_shared_kernel(
+    in_ptr,
+    out_ptr,
+    BLOCK: gl.constexpr,
+    layout: gl.constexpr,
+    smem_layout: gl.constexpr,
+):
+    offsets = gl.arange(0, BLOCK, layout=layout)
+    smem = gl.allocate_shared_memory(gl.float32, [BLOCK], layout=smem_layout)
+    cp.async_copy_global_to_shared(smem, in_ptr + offsets)
+    cp.commit_group()
+    cp.wait_group(0)
+    gl.store(out_ptr + offsets, smem.load(layout))
+
+
+@gluon.jit
+def _cdna4_global_load_to_shared_kernel(
+    in_ptr,
+    out_ptr,
+    BLOCK: gl.constexpr,
+    layout: gl.constexpr,
+    smem_layout: gl.constexpr,
+):
+    offsets = gl.arange(0, BLOCK, layout=layout)
+    smem = gl.allocate_shared_memory(gl.float32, [BLOCK], layout=smem_layout)
+    amd_cdna4_cp.global_load_to_shared(smem, in_ptr + offsets)
+    amd_cdna4_cp.wait_group(0)
+    gl.store(out_ptr + offsets, smem.load(layout))
+
+
+@gluon.jit
+def _cdna4_buffer_load_to_shared_kernel(
+    in_ptr,
+    out_ptr,
+    BLOCK: gl.constexpr,
+    layout: gl.constexpr,
+    smem_layout: gl.constexpr,
+):
+    offsets = gl.arange(0, BLOCK, layout=layout)
+    smem = gl.allocate_shared_memory(gl.float32, [BLOCK], layout=smem_layout)
+    # the CPU simulation of buffer loads needs an explicit mask and other
+    amd_cdna4_cp.buffer_load_to_shared(
+        smem, in_ptr, offsets, mask=offsets < BLOCK, other=0.0
+    )
+    amd_cdna4_cp.wait_group(0)
+    gl.store(out_ptr + offsets, smem.load(layout))
+
+
+@gluon.jit
+def _gfx1250_global_to_shared_kernel(
+    in_ptr,
+    out_ptr,
+    BLOCK: gl.constexpr,
+    layout: gl.constexpr,
+    smem_layout: gl.constexpr,
+):
+    offsets = gl.arange(0, BLOCK, layout=layout)
+    smem = gl.allocate_shared_memory(gl.float32, [BLOCK], layout=smem_layout)
+    amd_gfx1250_cp.global_to_shared(smem, in_ptr + offsets)
+    amd_gfx1250_cp.wait_group(0)
+    gl.store(out_ptr + offsets, smem.load(layout))
+
+
+@gluon.jit
+def _gfx1250_shared_to_global_kernel(
+    out_ptr, BLOCK: gl.constexpr, layout: gl.constexpr, smem_layout: gl.constexpr
+):
+    offsets = gl.arange(0, BLOCK, layout=layout)
+    smem = gl.allocate_shared_memory(gl.float32, [BLOCK], layout=smem_layout)
+    smem.store(gl.full([BLOCK], 3.0, gl.float32, layout))
+    # the CPU simulation of shared_to_global needs an explicit mask
+    amd_gfx1250_cp.shared_to_global(out_ptr + offsets, smem, mask=offsets < BLOCK)
+    amd_gfx1250_cp.wait_group(0)
+
+
+@gluon.jit
+def _ampere_async_load_col_mask_kernel(
+    in_ptr,
+    out_ptr,
+    n_cols,
+    M: gl.constexpr,
+    N: gl.constexpr,
+    layout: gl.constexpr,
+    smem_layout: gl.constexpr,
+):
+    # a matmul-style K-tail mask that the builtin broadcasts over the tile
+    rows = gl.arange(0, M, layout=gl.SliceLayout(1, layout))
+    cols = gl.arange(0, N, layout=gl.SliceLayout(0, layout))
+    smem = gl.allocate_shared_memory(gl.float32, [M, N], layout=smem_layout)
+    cp.async_load(
+        smem,
+        in_ptr + rows[:, None] * n_cols + cols[None, :],
+        mask=cols[None, :] < n_cols,
+    )
+    cp.commit_group()
+    cp.wait_group(0)
+    mask = cols[None, :] < n_cols
+    gl.store(
+        out_ptr + rows[:, None] * n_cols + cols[None, :], smem.load(layout), mask=mask
+    )
 
 
 @gluon.jit
@@ -860,6 +1036,22 @@ def test_gluon_sanitizer_allows_masked_in_bounds_kernel():
     assert sanitizer.records == []
 
 
+def test_gluon_sanitizer_runs_spin_lock_kernel():
+    # Gluon atomics reach clients as Gluon-specific op types, which the
+    # symbolic clients do not override; as symbolic atomics the spin loop
+    # could not be evaluated
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    kernel = tilelens.trace(client=sanitizer, frontend="gluon")(_spin_lock_kernel)
+    lock = torch.zeros(1, dtype=torch.int32)
+    out = torch.zeros(1)
+
+    ret = kernel[(3,)](lock, out, num_warps=1)
+
+    assert ret is None
+    assert sanitizer.records == []
+    assert lock.item() == 0
+
+
 def test_gluon_core_ops_run_scalar_range_memcpy_on_cpu():
     inp = torch.arange(40, dtype=torch.float32)
     out = torch.full_like(inp, -1)
@@ -900,6 +1092,155 @@ def test_gluon_trace_refuses_out_of_bounds_store():
     assert isinstance(cause, IndexError)
     assert "out-of-bounds store" in str(cause)
     assert (buf[:64] == -7).all() and (buf[104:] == -7).all()
+
+
+@pytest.mark.parametrize(
+    "kernel_fn",
+    [
+        _ampere_async_load_kernel,
+        _ampere_async_copy_global_to_shared_kernel,
+        _cdna4_global_load_to_shared_kernel,
+        _cdna4_buffer_load_to_shared_kernel,
+        _gfx1250_global_to_shared_kernel,
+    ],
+)
+def test_gluon_trace_checks_async_copy_loads(kernel_fn):
+    layout = gl.BlockedLayout([1], [32], [1], [0])
+    smem_layout = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
+    kernel = tilelens.trace("tracer", frontend="gluon")(kernel_fn)
+    inp = torch.arange(64, dtype=torch.float32)
+    out = torch.full_like(inp, -1)
+
+    kernel[(1,)](inp, out, 64, layout, smem_layout, num_warps=1)
+
+    torch.testing.assert_close(out, inp, atol=0, rtol=0)
+    # the async copy is the kernel's only global read
+    assert any(isinstance(r, Load) for r in kernel.client_manager.launch.records)
+
+    # the same unmasked copy now reads 64 floats from a 40-float storage
+    buf = np.full(40 + 128, -7, dtype=np.float32)
+    short_inp = torch.from_numpy(buf[64:104])
+    with pytest.raises(Exception) as exc_info:
+        kernel[(1,)](short_inp, out, 64, layout, smem_layout, num_warps=1)
+
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, IndexError)
+    assert "out-of-bounds load" in str(cause)
+
+
+def test_gluon_trace_records_async_copy_with_broadcast_mask():
+    tilelens.clear()
+    layout = gl.BlockedLayout([1, 1], [4, 8], [1, 1], [1, 0])
+    smem_layout = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    kernel = tilelens.trace("tracer", frontend="gluon")(
+        _ampere_async_load_col_mask_kernel
+    )
+    inp = torch.arange(24, dtype=torch.float32)
+    out = torch.full_like(inp, -1)
+
+    kernel[(1,)](inp, out, 6, 4, 8, layout, smem_layout, num_warps=1)
+
+    torch.testing.assert_close(out, inp, atol=0, rtol=0)
+    loads = [r for r in kernel.client_manager.launch.records if isinstance(r, Load)]
+    assert loads and all(r.masks.shape == r.offsets.shape for r in loads)
+    get_visualization_data()
+
+
+def test_gluon_trace_refuses_out_of_bounds_async_copy_store():
+    # out's storage is exactly 40 floats; the rest of buf is sentinel memory
+    buf = np.full(40 + 128, -7, dtype=np.float32)
+    out = torch.from_numpy(buf[64:104])
+    layout = gl.BlockedLayout([1], [32], [1], [0])
+    smem_layout = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
+    kernel = tilelens.trace("tracer", frontend="gluon")(
+        _gfx1250_shared_to_global_kernel
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        kernel[(1,)](out, 64, layout, smem_layout, num_warps=1)
+
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, IndexError)
+    assert "out-of-bounds store" in str(cause)
+    assert (buf[:64] == -7).all() and (buf[104:] == -7).all()
+
+
+def test_gluon_trace_allows_pointer_table_gather():
+    # one row is a kernel arg and one is not, so a single gather touches known
+    # and unknown storage; pointers built from integers are not judged
+    arg_row = torch.arange(4, dtype=torch.float32)
+    other_row = torch.arange(4, 8, dtype=torch.float32)
+    table = torch.tensor([arg_row.data_ptr(), other_row.data_ptr()])
+    out = torch.empty(8)
+    kernel = tilelens.trace("tracer", frontend="gluon")(_pointer_table_kernel)
+
+    kernel[(1,)](table, arg_row, out, 4, num_warps=1)
+
+    torch.testing.assert_close(out, torch.arange(8, dtype=torch.float32))
+
+
+def test_gluon_sanitizer_allows_pointer_cast_after_int_to_ptr():
+    # the sanitizer must keep seeing a concrete pointer here: the follow-up
+    # pointer bitcast runs on the simulation builder without interception
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    kernel = tilelens.trace(client=sanitizer, frontend="gluon")(
+        _int_to_ptr_bitcast_copy_kernel
+    )
+    inp = torch.arange(32, dtype=torch.float32)
+    out = torch.empty_like(inp)
+
+    # inp also goes in as src_ptr so the sanitizer knows its storage
+    ret = kernel[(1,)](inp.data_ptr(), inp, out, 32, num_warps=1)
+
+    assert ret is None
+    assert sanitizer.records == []
+
+
+@pytest.mark.parametrize(
+    "kernel, dtype, op_name",
+    [
+        (_atomic_add_kernel, np.float32, "atomic"),
+        (_atomic_cas_kernel, np.int32, "atomic_cas"),
+        (_buffer_atomic_add_kernel, np.float32, "atomic"),
+    ],
+)
+def test_gluon_trace_refuses_out_of_bounds_atomics(kernel, dtype, op_name):
+    # out's storage is exactly 40 elements; the kernels' masks admit 48 lanes
+    # (atomic_cas has no mask) and the rest of buf is sentinel memory
+    buf = np.full(40 + 128, -7, dtype=dtype)
+    out = torch.from_numpy(buf[64:104])
+    layout = gl.BlockedLayout([1], [32], [1], [0])
+    traced = tilelens.trace("tracer", frontend="gluon")(kernel)
+
+    with pytest.raises(Exception) as exc_info:
+        traced[(1,)](out, 48, 64, layout, num_warps=1)
+
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, IndexError)
+    assert f"out-of-bounds {op_name} " in str(cause)
+    assert (buf[:64] == -7).all() and (buf[104:] == -7).all()
+
+
+def test_gluon_trace_runs_in_bounds_atomics():
+    layout = gl.BlockedLayout([1], [32], [1], [0])
+    added = torch.zeros(40)
+    buffer_added = torch.zeros(40)
+    swapped = torch.full((64,), -7, dtype=torch.int32)
+
+    # the second program's lanes past the end are masked off
+    tilelens.trace("tracer", frontend="gluon")(_atomic_add_kernel)[(2,)](
+        added, 40, 32, layout, num_warps=1
+    )
+    tilelens.trace("tracer", frontend="gluon")(_buffer_atomic_add_kernel)[(1,)](
+        buffer_added, 40, 64, layout, num_warps=1
+    )
+    tilelens.trace("tracer", frontend="gluon")(_atomic_cas_kernel)[(1,)](
+        swapped, 64, 64, layout, num_warps=1
+    )
+
+    torch.testing.assert_close(added, torch.ones(40), atol=0, rtol=0)
+    torch.testing.assert_close(buffer_added, torch.ones(40), atol=0, rtol=0)
+    assert (swapped == 1).all()
 
 
 def test_gluon_core_ops_run_masked_2d_memcpy_on_cpu():
