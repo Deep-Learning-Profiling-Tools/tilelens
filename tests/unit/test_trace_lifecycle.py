@@ -1,23 +1,11 @@
 """CPU-only tests of the traced-launch lifecycle."""
 
-import pytest
 import torch
 import triton
 import triton.language as tl
 
 import tilelens
 from tilelens.clients.profiler.profiler import Profiler
-
-
-@pytest.fixture(autouse=True)
-def _real_jit():
-    # tests/unit/test_multithreading.py sets TRITON_INTERPRET=1 at import
-    # time; these tests need @triton.jit to build real JITFunctions.
-    from triton import knobs
-
-    with knobs.runtime.scope():
-        knobs.runtime.interpret = False
-        yield
 
 
 def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain():
