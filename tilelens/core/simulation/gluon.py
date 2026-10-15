@@ -25,10 +25,23 @@ from triton.experimental.gluon.language import _standard as gluon_standard  # ty
 from triton.experimental.gluon.language import amd as gluon_amd  # type: ignore
 from triton.experimental.gluon.language.amd import cdna3 as gluon_amd_cdna3  # type: ignore
 from triton.experimental.gluon.language.amd import cdna4 as gluon_amd_cdna4  # type: ignore
+from triton.experimental.gluon.language.amd import gfx1250 as gluon_amd_gfx1250  # type: ignore
 from triton.experimental.gluon.language.amd import rdna3 as gluon_amd_rdna3  # type: ignore
 from triton.experimental.gluon.language.amd import rdna4 as gluon_amd_rdna4  # type: ignore
 from triton.experimental.gluon.language.amd.cdna4 import (  # type: ignore
     async_copy as gluon_amd_cdna4_async_copy,
+)
+from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
+    async_copy as gluon_amd_async_copy,
+)
+from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
+    cluster as gluon_amd_cluster,
+)
+from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
+    mbarrier as gluon_amd_mbarrier,
+)
+from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
+    tdm as gluon_amd_tdm,
 )
 from triton.experimental.gluon.language.nvidia.ampere import (  # type: ignore
     async_copy as gluon_ampere_async_copy,
@@ -38,6 +51,7 @@ from triton.experimental.gluon.language.nvidia.ampere import (  # type: ignore
 )
 from triton.experimental.gluon.language.nvidia import blackwell as gluon_blackwell  # type: ignore
 from triton.experimental.gluon.language.nvidia import hopper as gluon_hopper  # type: ignore
+from triton.experimental.gluon.language.nvidia.blackwell import clc as gluon_clc  # type: ignore
 from triton.experimental.gluon.language.nvidia.blackwell import (  # type: ignore
     tma as gluon_blackwell_tma,
 )
@@ -54,100 +68,14 @@ from triton.runtime.interpreter import (  # type: ignore
     _convert_float,
     _get_np_dtype,
     _implicit_cvt,
+    _mxfp_value_handle_to_float32,
     _patch_lang_core,
     _patch_lang_tensor,
+    _unpack_e2m1,
     interpreter_builder,
 )
 
 from ..frontend.base import _LangPatchScope
-
-try:
-    from triton.experimental.gluon.language.amd import gfx1250 as gluon_amd_gfx1250  # type: ignore
-    from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
-        async_copy as gluon_amd_async_copy,
-    )
-    from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
-        cluster as gluon_amd_cluster,
-    )
-    from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
-        mbarrier as gluon_amd_mbarrier,
-    )
-    from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
-        tdm as gluon_amd_tdm,
-    )
-except ImportError as exc:
-    if "is_hip_gfx1250" not in str(exc) or "triton.language.target_info" not in str(
-        exc
-    ):
-        raise
-    gluon_amd_gfx1250 = None
-    gluon_amd_async_copy = None
-    gluon_amd_cluster = None
-    gluon_amd_mbarrier = None
-    gluon_amd_tdm = None
-
-try:
-    from triton.experimental.gluon.language.nvidia.blackwell import clc as gluon_clc  # type: ignore
-except ImportError:
-    gluon_clc = None
-
-try:
-    from triton.runtime.interpreter import _mxfp_value_handle_to_float32  # type: ignore
-except ImportError:
-
-    def _mxfp_value_handle_to_float32(value_handle: TensorHandle) -> np.ndarray:
-        value_float = (
-            _convert_float(
-                value_handle.data,
-                value_handle.dtype,
-                tl.float16,
-                None,
-            )
-            .view(np.float16)
-            .astype(np.float32)
-        )
-        if value_handle.dtype == tl.float8e5:
-            value_float = np.where(
-                value_handle.data == np.uint8(0x7C),
-                np.float32("inf"),
-                value_float,
-            )
-            value_float = np.where(
-                value_handle.data == np.uint8(0xFC),
-                -np.float32("inf"),
-                value_float,
-            )
-            nan_mask = np.logical_and(
-                (value_handle.data & np.uint8(0x7C)) == np.uint8(0x7C),
-                (value_handle.data & np.uint8(3)) != np.uint8(0),
-            )
-            value_float = np.where(nan_mask, np.float32("nan"), value_float)
-        elif value_handle.dtype == tl.float8e4nv:
-            nan_mask = (value_handle.data & np.uint8(0x7F)) == np.uint8(0x7F)
-            value_float = np.where(nan_mask, np.float32("nan"), value_float)
-        return value_float
-
-
-try:
-    from triton.runtime.interpreter import _unpack_e2m1  # type: ignore
-except ImportError:
-
-    def _unpack_e2m1(data: np.ndarray, axis: int) -> np.ndarray:
-        data = np.moveaxis(data, axis, -1)
-        low = data & np.uint8(0x0F)
-        high = data >> np.uint8(4)
-        unpacked_shape = data.shape[:-1] + (data.shape[-1] * 2,)
-        unpacked = np.empty(unpacked_shape, dtype=np.uint8)
-        unpacked[..., 0::2] = low
-        unpacked[..., 1::2] = high
-        positive_lut = np.array(
-            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-            dtype=np.float32,
-        )
-        values = positive_lut[unpacked & np.uint8(0x07)]
-        signs = (unpacked & np.uint8(0x08)) != 0
-        return np.moveaxis(np.where(signs, -values, values), -1, axis)
-
 
 _MISSING = object()
 _HOST_TENSOR_DESCRIPTOR_TYPES = {"TensorDescriptor", "TensorDescriptorIm2Col"}
@@ -1322,8 +1250,6 @@ class Builder(interpreter_builder.__class__):
         partition_dim: int,
         partition_layout: Any,
     ):
-        if gluon_amd_tdm is None:
-            return partition_layout
         return gluon_amd_tdm.PartitionedSharedLayout(
             int(num_partitions),
             int(num_groups),
@@ -2408,47 +2334,39 @@ gluon_builder = Builder()
 gluon_semantic = GluonSemantic(gluon_builder)
 
 
-_GLUON_BUILTIN_MODULES: tuple[Any, ...] = tuple(
-    module
-    for module in (
-        tl.core,
-        gluon_core,
-        gl,
-        gluon_math,
-        gluon_standard,
-        gluon_amd,
-        gluon_amd_cdna3,
-        gluon_amd_cdna4,
-        gluon_amd_cdna4_async_copy,
-        gluon_amd_gfx1250,
-        gluon_amd_async_copy,
-        gluon_amd_cluster,
-        gluon_amd_mbarrier,
-        gluon_amd_tdm,
-        gluon_amd_rdna3,
-        gluon_amd_rdna4,
-        gluon_ampere_async_copy,
-        gluon_ampere_mbarrier,
-        gluon_blackwell,
-        gluon_blackwell_tma,
-        gluon_clc,
-        gluon_hopper,
-        gluon_hopper_mbarrier,
-        gluon_hopper_tma,
-    )
-    if module is not None
+_GLUON_BUILTIN_MODULES: tuple[Any, ...] = (
+    tl.core,
+    gluon_core,
+    gl,
+    gluon_math,
+    gluon_standard,
+    gluon_amd,
+    gluon_amd_cdna3,
+    gluon_amd_cdna4,
+    gluon_amd_cdna4_async_copy,
+    gluon_amd_gfx1250,
+    gluon_amd_async_copy,
+    gluon_amd_cluster,
+    gluon_amd_mbarrier,
+    gluon_amd_tdm,
+    gluon_amd_rdna3,
+    gluon_amd_rdna4,
+    gluon_ampere_async_copy,
+    gluon_ampere_mbarrier,
+    gluon_blackwell,
+    gluon_blackwell_tma,
+    gluon_clc,
+    gluon_hopper,
+    gluon_hopper_mbarrier,
+    gluon_hopper_tma,
 )
 
 
-_GLUON_BUILTIN_CLASSES: tuple[Any, ...] = tuple(
-    cls
-    for cls in (
-        gluon_core.tensor,
-        gluon_core.shared_memory_descriptor,
-        gluon_blackwell.tensor_memory_descriptor,
-        None if gluon_clc is None else gluon_clc.clc_result,
-    )
-    if cls is not None
+_GLUON_BUILTIN_CLASSES: tuple[Any, ...] = (
+    gluon_core.tensor,
+    gluon_core.shared_memory_descriptor,
+    gluon_blackwell.tensor_memory_descriptor,
+    gluon_clc.clc_result,
 )
 
 
@@ -2460,7 +2378,6 @@ _GLUON_NON_SEMANTIC_BUILTINS: tuple[tuple[Any, str, Callable], ...] = tuple(
         (gluon_amd_gfx1250, "_get_wmma_scale_layout_impl"),
         (gluon_blackwell, "_compute_tmem_reg_layout"),
     )
-    if module is not None and hasattr(module, name)
 )
 
 

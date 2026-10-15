@@ -422,16 +422,13 @@ class TritonFrontend(Frontend):
             targets.append((lang.dtype, ("to_ir",)))
             if lang == tl:
                 targets.append((lang.math, ()))
-        if hasattr(tl.core, "tensor_descriptor_base"):
-            targets.append((tl.core.tensor_descriptor_base, ()))
+        targets.append((tl.core.tensor_descriptor_base, ()))
         return targets
 
     def _triton_snapshot_scope(self, fn: Callable[..., Any]) -> _LangPatchScope:
         """
         Stores Triton attributes into a LangPatchScope for later unpatching.
         This is to be run before patching with the interpreter.
-        This is equivalent to what triton>=3.6.0 does natively
-        but also works for triton<3.6.0.
         """
 
         scope = _LangPatchScope()
@@ -905,8 +902,8 @@ class TritonFrontend(Frontend):
 
     def patch_lang(self, fn, client_manager=None) -> _LangPatchScope:
         # Snapshot before calling Triton's patcher because Triton mutates many
-        # attributes in-place and older Triton versions do not retain enough
-        # restore metadata for nested/generated kernels.
+        # attributes in-place but only records the language modules visible
+        # from `fn`; nested/generated kernels without a `tl` global need both.
         scope = self._triton_snapshot_scope(fn)
         triton_patch_lang(fn)
         for module in self._triton_extra_modules:
