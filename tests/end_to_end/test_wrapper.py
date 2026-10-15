@@ -312,8 +312,9 @@ def test_cli_rejects_trace_decorator(tmp_path: Path):
         "Please ensure the package is properly installed."
     )
 
-    # 3) Run subprocess
-    env = os.environ.copy()
+    # 3) Run subprocess, with @triton.jit building a JITFunction, which the
+    # CLI keeps
+    env = {**os.environ, "TRITON_INTERPRET": "0"}
     proc = subprocess.run(
         [exe, str(my_program)],
         cwd=str(tmp_path),
