@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 import tilelens
+from tilelens.clients import Sanitizer
 from tilelens.clients.profiler.profiler import Profiler
 from tilelens.core.config import config as cfg
 import os
@@ -142,7 +143,10 @@ def _profiler_load_store(x, out):
     tl.store(out + offset, vals)
 
 
-@tilelens.trace("sanitizer")
+two_blocks_sanitizer = Sanitizer()
+
+
+@tilelens.trace(client=two_blocks_sanitizer)
 @triton.jit
 def _sanitizer_two_blocks(x, out):
     pid = tl.program_id(0)
@@ -178,8 +182,7 @@ def test_sanitizer_handles_concurrent_blocks(two_sms):
     thread.start()
     thread.join(timeout=3)
     assert not thread.is_alive(), "sanitizer execution should complete under timeout"
-    # Symbolic sanitizer may not perform concrete stores; just ensure no OOB records
-    assert not trace_state.launches[-1].records, "sanitizer should not report OOB"
+    assert not two_blocks_sanitizer.records, "sanitizer should not report OOB"
 
 
 def test_sanitizer_handles_serial_blocks(one_sm):
@@ -190,7 +193,7 @@ def test_sanitizer_handles_serial_blocks(one_sm):
     thread.start()
     thread.join(timeout=3)
     assert not thread.is_alive(), "sanitizer execution should complete under timeout"
-    assert not trace_state.launches[-1].records, "sanitizer should not report OOB"
+    assert not two_blocks_sanitizer.records, "sanitizer should not report OOB"
 
 
 @pytest.fixture

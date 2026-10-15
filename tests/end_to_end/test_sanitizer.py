@@ -116,7 +116,7 @@ class LoadIndexChecker(SymbolicSanitizer):
         )
 
 
-load_index_checker: LoadIndexChecker = LoadIndexChecker(abort_on_error=False)
+load_index_checker: LoadIndexChecker = LoadIndexChecker()
 
 
 class LoopBoundsChecker(SymbolicSanitizer):
@@ -152,7 +152,7 @@ class LoopBoundsChecker(SymbolicSanitizer):
         )
 
 
-loop_bounds_checker: LoopBoundsChecker = LoopBoundsChecker(abort_on_error=True)
+loop_bounds_checker: LoopBoundsChecker = LoopBoundsChecker()
 
 
 class LoopDeferredCheckRecorder(SymbolicSanitizer):
@@ -206,12 +206,10 @@ class LoopDeferredCheckRecorder(SymbolicSanitizer):
         )
 
 
-loop_deferred_check_recorder: LoopDeferredCheckRecorder = LoopDeferredCheckRecorder(
-    abort_on_error=False
-)
-sort_pointer_sanitizer: SymbolicSanitizer = SymbolicSanitizer(abort_on_error=False)
-tuple_pointer_cast_checker: SymbolicSanitizer = SymbolicSanitizer(abort_on_error=False)
-tuple_pointer_item_checker: SymbolicSanitizer = SymbolicSanitizer(abort_on_error=False)
+loop_deferred_check_recorder: LoopDeferredCheckRecorder = LoopDeferredCheckRecorder()
+sort_pointer_sanitizer: SymbolicSanitizer = SymbolicSanitizer()
+tuple_pointer_cast_checker: SymbolicSanitizer = SymbolicSanitizer()
+tuple_pointer_item_checker: SymbolicSanitizer = SymbolicSanitizer()
 
 
 # ======== Kernels ===========
@@ -334,6 +332,7 @@ def test_loop_bounds_from_load():
     loop_bounds_kernel[(1,)](start, stop, out)
 
     assert loop_bounds_checker.observed_bounds == [(2, 6, 1)]
+    assert not loop_bounds_checker.records
 
 
 def test_loop_bounds_from_pid():
@@ -343,6 +342,7 @@ def test_loop_bounds_from_pid():
     loop_bounds_pid_kernel[(2,)](out)
 
     assert loop_bounds_checker.observed_bounds == [(0, 2, 1), (1, 3, 1)]
+    assert not loop_bounds_checker.records
 
 
 def test_loop_deferred_checks_after_context():
@@ -465,8 +465,7 @@ def test_nested_loop_no_false_positive():
 
 
 # Create a dedicated sanitizer for line number tests
-# abort_on_error=False is on purpose: so OOB violations are recorded
-line_number_checker: SymbolicSanitizer = SymbolicSanitizer(abort_on_error=False)
+line_number_checker: SymbolicSanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=line_number_checker)
@@ -587,8 +586,7 @@ def test_gemm_oob_call_stack():
 # ======== Block Tensor (Block Pointer) Tests ===========
 
 
-# abort_on_error=False is on purpose: so OOB violations are recorded
-block_sanitizer = SymbolicSanitizer(abort_on_error=False)
+block_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=block_sanitizer)
@@ -949,7 +947,7 @@ def test_cli_code_context_points_to_kernel():
 
 # ======== Reduce with return_indices Tests ===========
 
-reduce_indices_sanitizer = SymbolicSanitizer(abort_on_error=False)
+reduce_indices_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=reduce_indices_sanitizer)
@@ -1043,7 +1041,7 @@ def test_reduce_broadcast():
 
 # ======== Fake Tensor (Virtual Memory) OOB Tests ===========
 
-fake_tensor_sanitizer = SymbolicSanitizer(abort_on_error=True)
+fake_tensor_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=fake_tensor_sanitizer)
@@ -1054,17 +1052,55 @@ def fake_tensor_oob_kernel(x_ptr, out_ptr, N: tl.constexpr):
     tl.store(out_ptr, val)
 
 
-def test_oob_with_fake_tensor(_isolate_virtual_memory):
+def test_oob_with_fake_tensor(_isolate_virtual_memory, capsys):
     fake_tensor_sanitizer.records.clear()
 
     config.virtual_memory = True
     x = torch.randn(8)
     out = torch.empty(1)
-    with pytest.raises(SystemExit):
-        fake_tensor_oob_kernel[(1,)](x, out, N=8)
+    fake_tensor_oob_kernel[(1,)](x, out, N=8)
+    assert len(fake_tensor_sanitizer.records) == 1
+    assert "ILLEGAL MEMORY ACCESS" in capsys.readouterr().out
 
 
-@tilelens.trace(client=SymbolicSanitizer())
+def test_repeat_site_finding_recorded_but_printed_once(capsys):
+    sanitizer = SymbolicSanitizer()
+
+    @tilelens.trace(client=sanitizer)
+    @triton.jit
+    def repeat_site_oob_kernel(x_ptr, out_ptr, N: tl.constexpr):
+        tl.store(out_ptr, tl.load(x_ptr + N))
+
+    # Distinct N defeats the launch cache, so both launches report at one line.
+    for n in (8, 16):
+        repeat_site_oob_kernel[(1,)](torch.randn(n), torch.empty(1), N=n)
+    assert len(sanitizer.records) == 2
+    assert capsys.readouterr().out.count("ILLEGAL MEMORY ACCESS") == 1
+
+
+oob_bound_checker = LoopBoundsChecker()
+
+
+@tilelens.trace(client=oob_bound_checker)
+@triton.jit
+def oob_loop_bound_kernel(n_ptr):
+    for _ in range(tl.load(n_ptr + 1)):  # one past the end of n_ptr
+        pass
+
+
+def test_oob_loop_bound_reads_zero_not_raw_memory():
+    # The stray bound (5 here, garbage in general) could crash or hang a run.
+    storage = torch.tensor([0, 5])
+    oob_loop_bound_kernel[(1,)](storage[:1])
+    assert oob_bound_checker.observed_bounds == [(0, 0, 1)]
+    assert len(oob_bound_checker.records) == 1
+
+
+# Shared by the clean-only regression kernels below; none may report.
+clean_sanitizer = SymbolicSanitizer()
+
+
+@tilelens.trace(client=clean_sanitizer)
 @triton.jit
 def block_ptr_sum_kernel(
     s_ptr,
@@ -1090,9 +1126,10 @@ def test_reduce_symbolic_core_dtype():
     s = torch.randn(16, 16, device="cpu")
     z = torch.empty_like(s)
     block_ptr_sum_kernel[(1,)](s, z, T=16, S=16, BT=16, BS=16)
+    assert not clean_sanitizer.records
 
 
-@tilelens.trace(client=SymbolicSanitizer())
+@tilelens.trace(client=clean_sanitizer)
 @triton.jit
 def softmax_kernel(output_ptr, input_ptr, N, BLOCK: tl.constexpr):
     row = tl.program_id(0)
@@ -1110,9 +1147,10 @@ def test_reduce_symbolic_nonetype():
     x = torch.randn(4, 64, device="cpu")
     out = torch.empty_like(x)
     softmax_kernel[(4,)](out, x, 64, BLOCK=64)
+    assert not clean_sanitizer.records
 
 
-@tilelens.trace(client=SymbolicSanitizer())
+@tilelens.trace(client=clean_sanitizer)
 @triton.jit
 def exp_expand_kernel(x_ptr, out_ptr, N: tl.constexpr):
     offs = tl.arange(0, N)
@@ -1127,12 +1165,13 @@ def test_expand_dims_scalar_attr():
     x = torch.randn(8, device="cpu")
     out = torch.empty(8, device="cpu")
     exp_expand_kernel[(1,)](x, out, N=8)
+    assert not clean_sanitizer.records
 
 
 # ======== Non-contiguous Expanded Tensor Regression Test ===========
 
 
-@tilelens.trace(client=SymbolicSanitizer())
+@tilelens.trace(client=clean_sanitizer)
 @triton.jit
 def read_expanded_kernel(inp, out, stride_row, stride_col, M, N, BLOCK_N: tl.constexpr):
     row = tl.program_id(0)
@@ -1151,12 +1190,13 @@ def test_non_contiguous_expanded_tensor():
     assert not x.is_contiguous()
     out = torch.empty(M, N, device="cpu")
     read_expanded_kernel[(M,)](x, out, x.stride(0), x.stride(1), M, N, BLOCK_N=8)
+    assert not clean_sanitizer.records
 
 
 # ======== Sliced View with Nonzero storage_offset Regression Test ===========
 
 
-inner_stride1_offset_sanitizer = SymbolicSanitizer(abort_on_error=False)
+inner_stride1_offset_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=inner_stride1_offset_sanitizer)
@@ -1186,7 +1226,7 @@ def test_inner_stride1_nonzero_storage_offset_no_oob():
     assert len(inner_stride1_offset_sanitizer.records) == 0
 
 
-cumsum_sanitizer = SymbolicSanitizer(abort_on_error=False)
+cumsum_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=cumsum_sanitizer)
@@ -1209,7 +1249,7 @@ def test_sanitizer_supports_data_dependent_cumsum_index():
     assert len(cumsum_sanitizer.records) == 0
 
 
-ashr_index_sanitizer = SymbolicSanitizer(abort_on_error=False)
+ashr_index_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=ashr_index_sanitizer)
@@ -1230,7 +1270,7 @@ def test_sanitizer_supports_ashr_in_symbolic_address():
     assert len(ashr_index_sanitizer.records) == 0
 
 
-where_index_sanitizer = SymbolicSanitizer(abort_on_error=False)
+where_index_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=where_index_sanitizer)
@@ -1251,7 +1291,7 @@ def test_sanitizer_supports_where_in_symbolic_address():
     assert len(where_index_sanitizer.records) == 0
 
 
-masked_compaction_index_sanitizer = SymbolicSanitizer(abort_on_error=False)
+masked_compaction_index_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=masked_compaction_index_sanitizer)
@@ -1281,7 +1321,7 @@ def test_sanitizer_materializes_loaded_masked_compaction_store_indices():
 # ======== Data-Dependent Loop Bound (Integer Division) Tests ===========
 
 
-data_dep_div_sanitizer = SymbolicSanitizer(abort_on_error=False)
+data_dep_div_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=data_dep_div_sanitizer)
@@ -1320,7 +1360,7 @@ def test_data_dependent_loop_bound_div():
 # ======== Data-Dependent Loop Bound (tl.cdiv) Tests ===========
 
 
-cdiv_loop_sanitizer = SymbolicSanitizer(abort_on_error=False)
+cdiv_loop_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=cdiv_loop_sanitizer)
@@ -1368,7 +1408,7 @@ def test_data_dependent_cdiv_loop_bound():
 # ======== TensorWrapper Regression Test ===========
 
 
-@tilelens.trace(client=SymbolicSanitizer())
+@tilelens.trace(client=clean_sanitizer)
 @triton.jit
 def copy_kernel(src, dst, N, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
@@ -1518,12 +1558,13 @@ def test_reinterpret_tensor_wrapper():
     x = torch.ones(N, dtype=torch.float16, device="cpu")
     y = torch.empty(N, dtype=torch.float16, device="cpu")
     copy_kernel[(1,)](triton.reinterpret(x, tl.float16), y, N, BLOCK=64)
+    assert not clean_sanitizer.records
 
 
 # ======== Strided Tensor View OOB Tests (triton-lang/triton#10336) ===========
 
 
-strided_view_sanitizer = SymbolicSanitizer(abort_on_error=False)
+strided_view_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=strided_view_sanitizer)

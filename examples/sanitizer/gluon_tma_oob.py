@@ -37,13 +37,10 @@ def gluon_tma_oob_kernel(
         tma.async_copy_global_to_shared(desc, [m, 0], bar, smem)
 
 
-def run(abort_on_error: bool = True):
+def run():
     x = torch.zeros((BLOCK_M, BLOCK_N), dtype=torch.float32)
     layout = gl.NVMMASharedLayout.get_default_for([BLOCK_M, BLOCK_N], gl.float32)
-    kernel = tilelens.trace(
-        client=Sanitizer(abort_on_error=abort_on_error),
-        frontend="gluon",
-    )(gluon_tma_oob_kernel)
+    kernel = tilelens.trace(client=Sanitizer(), frontend="gluon")(gluon_tma_oob_kernel)
     return kernel[(1,)](
         x,
         BLOCK_M,

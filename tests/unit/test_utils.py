@@ -56,7 +56,7 @@ def _capture_sanitizer_traceback(
     with_oob_trace_source: bool, use_decorator: bool
 ) -> TracebackInfo:
     """Capture deferred sanitizer source location from an oob helper call."""
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     sanitizer.loop_stack.append(
         LoopContext(
             loop_site=LoopSite(1, loop_file_token(__file__)),
