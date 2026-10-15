@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 import tilelens
+import triton
 from tilelens.core.config import config as cfg
 from tilelens.core.trace import TraceInterface
 from tilelens.wrapper import (
@@ -163,6 +164,36 @@ def test_create_patched_jit_with_kwargs_and_custom_original_jit():
     assert result == "final_kernel"
 
 
+def test_patched_jit_preserves_device_function_dependencies(_isolate_cli_active):
+    cfg.cli_active = True
+    patched_jit = create_patched_jit(profiler_wrapper, triton.jit, frontend="triton")
+
+    @patched_jit
+    def add_one(value):
+        return value + 1
+
+    @patched_jit
+    def add_two(value):
+        return add_one(add_one(value))
+
+    # Triton's dependency hashing accepts only JITFunction callees.
+    assert isinstance(add_one, triton.JITFunction)
+    assert add_two.cache_key
+
+
+def test_cli_jit_function_warmup_skips_the_trace(_isolate_cli_active):
+    cfg.cli_active = True
+
+    @triton.jit
+    def kernel(x):
+        pass
+
+    original_run = MagicMock()
+    kernel.run = original_run
+    profiler_wrapper(kernel).run(grid=(1,), warmup=True)
+    original_run.assert_called_once_with(grid=(1,), warmup=True)
+
+
 # ======== create_patched_autotune Tests ===========
 
 
@@ -241,6 +272,11 @@ def test_trace_decorator_works_when_cli_inactive(_isolate_cli_active):
     decorator = tilelens.trace("tracer")
     result = decorator(mock_kernel)
     assert isinstance(result, TraceInterface)
+
+
+def test_trace_rejects_an_unknown_frontend():
+    with pytest.raises(ValueError, match="Unknown frontend"):
+        tilelens.trace(frontend="bogus")(lambda: None)
 
 
 def test_apply_wrapper_rejects_non_cli_invocation():

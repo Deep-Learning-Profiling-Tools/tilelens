@@ -1084,7 +1084,34 @@ class TritonFrontend(Frontend):
         finally:
             self._current_client_manager = previous_client_manager
 
+    def wrap_kernel(self, kernel, client):
+        from ..trace import TritonTrace
+
+        traced = TritonTrace(kernel, client)
+        if not cfg.cli_active or not isinstance(kernel, JITFunction):
+            return traced
+
+        # Device helpers must remain JITFunctions for dependency hashing and
+        # code generation. Instrument their launch path instead of replacing
+        # the callable that another kernel references.
+        original_run = kernel.run
+
+        def run(*args, **kwargs):
+            # JITFunction.warmup re-enters run(warmup=True) for the real
+            # compile; tracing it would recurse.
+            if kwargs.get("warmup", False):
+                return original_run(*args, **kwargs)
+            return traced.run(*args, **kwargs)
+
+        kernel.run = run
+        kernel._tilelens_trace = traced
+        return kernel
+
     def _jit_function_call(self, jit_function, *args, **kwargs):
+        traced = getattr(jit_function, "_tilelens_trace", None)
+        if traced is not None:
+            return traced(*args, **kwargs)
+
         if (
             self._current_client_manager is not None
             and not self._jit_function_uses_core_module(jit_function)
