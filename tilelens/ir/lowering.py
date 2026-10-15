@@ -91,7 +91,7 @@ class TermLeaves(Protocol):
         """The iteration index ``k`` of the loop ``loop_ssa``."""
 
     def observed(self, t: Observed) -> ArithRef:
-        """The old value the atomic at ``t.access_index`` observed."""
+        """The value the access at ``t.access_index`` observed."""
 
     def data_dep(self, t: DataDep) -> ArithRef:
         """A value the reader could not model (``t.why`` says which)."""

@@ -140,7 +140,9 @@ class ArtifactLog:
         ] = {}
         self._failures: list[CompileFailure] = []
 
-    def record(self, event: LaunchEvent) -> None:
+    def record(self, event: LaunchEvent) -> LaunchBinding:
+        """Record one before_launch event; returns the binding recorded for
+        it (the one ``specializations`` lists)."""
         binding = bind_launch(event, self.call)
         entry = self._compiled.get(event.specialization)
         if entry is None:
@@ -148,6 +150,7 @@ class ArtifactLog:
             self._compiled[event.specialization] = (artifacts, [binding])
         else:
             entry[1].append(binding)
+        return binding
 
     def record_failure(self, event: LaunchEvent) -> None:
         self._failures.append(

@@ -140,7 +140,8 @@ class Op:
     results: tuple[int, ...]  # value indices
     result_types: tuple[str, ...]
     # What the reader reads (read-only, see _ATTRS): integers are ints, enums
-    # their printed keyword ("slt"), program-id axes 0-2;
+    # their printed keyword ("slt"), program-id axes 0-2, a barrier's
+    # address spaces their bits;
     # arith.constant "value" is an int (sign-extended) / bool for i1, else
     # ("float", None) / ("dense", None); scf.for "unsignedCmp" is a bool.
     attrs: Mapping[str, Any]
@@ -786,13 +787,31 @@ def _screen(text: str) -> None:
 # What the reader reads off an op, per op name: (key in Op.attrs, getter,
 # attribute name, names of an enum's integers or None, required). An enum
 # reads as its integer and is named by the keyword the printer prints for it
-# (arith::CmpIPredicate); a program-id axis stays 0-2. Every int attribute
-# here is an inherent one the op's verifier types as a signless integer, so
-# get_int_attr never meets the type its getInt() asserts on.
+# (arith::CmpIPredicate, tt::RMWOp: "exch"); a program-id axis stays 0-2 and
+# a bit enum its bits. Every int attribute here is an inherent one the op's
+# verifier types as a signless integer, so get_int_attr never meets the type
+# its getInt() asserts on.
 
 _CMPI = ("eq", "ne", "slt", "sle", "sgt", "sge", "ult", "ule", "ugt", "uge")
 _AXIS = (0, 1, 2)
+# tt::RMWOp, tt::MemSemantic and tt::MemSyncScope count from 1
+_RMW_OP = (None, "and", "or", "xor", "add", "fadd", "max", "min", "umax", "umin", "exch")  # fmt: skip
+_SEM = (None, "relaxed", "acquire", "release", "acq_rel")
+_SCOPE = (None, "gpu", "cta", "sys")
+# ttg::AddrSpace is a bit enum, kept as its bits: local 1, global_read 2,
+# global_write 4, tensor_read 8, tensor_write 16 (`all` is 31)
+_ADDR_SPACE = tuple(range(32))
 _ATTRS: Mapping[str, tuple[tuple[str, str, str, tuple | None, bool], ...]] = {
+    "tt.atomic_rmw": (
+        ("rmw_op", "int", "atomic_rmw_op", _RMW_OP, True),
+        ("sem", "int", "sem", _SEM, True),
+        ("scope", "int", "scope", _SCOPE, True),
+    ),
+    "tt.atomic_cas": (
+        ("sem", "int", "sem", _SEM, True),
+        ("scope", "int", "scope", _SCOPE, True),
+    ),
+    "ttg.barrier": (("addr_space", "int", "addrSpace", _ADDR_SPACE, True),),
     "tt.get_program_id": (("axis", "int", "axis", _AXIS, True),),
     "tt.get_num_programs": (("axis", "int", "axis", _AXIS, True),),
     "tt.make_range": (

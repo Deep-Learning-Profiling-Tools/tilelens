@@ -13,6 +13,7 @@ import gc
 import pickle
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -243,6 +244,19 @@ def test_select_of_pointers():
     _clean(check_graph(g, _bind(params={"n": 16}, x_ptr=_facts(16))))
     ((f,),) = [check_graph(g, _bind(params={"n": 8}, x_ptr=_facts(100))).findings]
     assert f.violation_offset == 100
+
+
+def test_the_race_detector_facts_change_no_check():
+    """Fences, deps, block paths and pid_axes are read for other clients."""
+    g = _graph("reader_ttir/fences.ttir")
+    assert g.fences and any(a.deps for a in g.accesses)
+    accesses = tuple(replace(a, deps=(), block_path=()) for a in g.accesses)
+    bare = replace(g, fences=(), pid_axes=frozenset(), accesses=accesses)
+    for numel, found in ((16, False), (4, True)):  # the loop stores past 4
+        binding = _bind((4, 1, 1), {"n": 8}, x_ptr=_facts(numel))
+        result = check_graph(g, binding)
+        assert result == check_graph(bare, binding)
+        assert bool(result.findings) is found
 
 
 def test_aranges_along_one_dim_share_the_lane():
