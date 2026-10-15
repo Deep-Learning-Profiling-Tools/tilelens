@@ -5,7 +5,9 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 import tilelens
+import triton
 from tilelens.core.config import config as cfg
+from tilelens.core.frontend.base import FRONTEND_REGISTRY, Frontend
 from tilelens.core.trace import TraceInterface
 from tilelens.wrapper import (
     create_patched_jit,
@@ -163,6 +165,25 @@ def test_create_patched_jit_with_kwargs_and_custom_original_jit():
     assert result == "final_kernel"
 
 
+def test_patched_jit_preserves_device_function_dependencies(_isolate_cli_active):
+    cfg.cli_active = True
+    patched_jit = create_patched_jit(profiler_wrapper, triton.jit, frontend="triton")
+
+    @patched_jit(noinline=True)
+    def add_one(value):
+        return value + 1
+
+    @patched_jit
+    def add_two(value):
+        return add_one(add_one(value))
+
+    # Hashing follows both global and closure references before compilation.
+    assert isinstance(add_one, triton.JITFunction)
+    assert add_one.noinline is True
+    assert isinstance(add_two, triton.JITFunction)
+    assert add_two.cache_key
+
+
 # ======== create_patched_autotune Tests ===========
 
 
@@ -241,6 +262,21 @@ def test_trace_decorator_works_when_cli_inactive(_isolate_cli_active):
     decorator = tilelens.trace("tracer")
     result = decorator(mock_kernel)
     assert isinstance(result, TraceInterface)
+
+
+def test_trace_supports_registered_frontend(monkeypatch):
+    class PythonFrontend(Frontend):
+        def wrap_kernel(self, kernel, client):
+            return lambda value: kernel(value) + 1
+
+    frontend = PythonFrontend("python", None, {}, {}, {})
+    monkeypatch.setitem(FRONTEND_REGISTRY, frontend.name, frontend)
+
+    @tilelens.trace(frontend="python")
+    def double(value):
+        return value * 2
+
+    assert double(3) == 7
 
 
 def test_apply_wrapper_rejects_non_cli_invocation():
