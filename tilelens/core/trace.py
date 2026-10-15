@@ -186,12 +186,9 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
         self._copy_callable_attrs(runner, self.base_fn, src_fallback=self.jit_fn)
 
     def run(self, *args, **kwargs):
-        # The profiler's buffer-load check reads each launch's compiled kernel.
-        if kwargs.get("warmup") or any(
-            isinstance(client, Profiler)
-            for client in self.client_manager.clients.values()
-        ):
-            self.warmup(*args, **kwargs)
+        with self.client_manager.patch_warmup(self.jit_fn):
+            if self.warmup_runner:
+                self.warmup_runner.warmup(*args, **kwargs)
 
         with self.client_manager.patch_run(self.base_fn, frontend_name="triton"):
             kwargs.update({"client_manager": self.client_manager})
