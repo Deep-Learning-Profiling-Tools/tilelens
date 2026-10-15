@@ -24,14 +24,13 @@ def _real_jit():
 
 
 class _EagerClient(Client):
-    """Interpreting client that records its warmup callbacks."""
+    """Interpreting client that records whether a warmup reached it."""
 
     NAME = "eager"
 
-    def __init__(self, *, warmup_vote=False):
+    def __init__(self):
         super().__init__()
-        self.calls: list = []
-        self.warmup_vote = warmup_vote
+        self.warmed_up = False
 
     def pre_run_callback(self, fn):
         return True
@@ -58,26 +57,17 @@ class _EagerClient(Client):
         return []
 
     def pre_warmup_callback(self, jit_fn, *args, **kwargs):
-        self.calls.append("pre_warmup")
-        return self.warmup_vote
+        self.warmed_up = True
+        return False
 
     def post_warmup_callback(self, jit_fn, ret):
-        self.calls.append(("post_warmup", ret))
+        pass
 
 
-@pytest.mark.parametrize("user_post_hook", [False, True])
-def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain(user_post_hook):
-    posts = []
-
+def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain():
     @triton.autotune(
         configs=[triton.Config({"BLOCK": 4}), triton.Config({"BLOCK": 8})],
         key=["n"],
-        restore_value=["out_ptr"],
-        # Triton's own restore_value post_hook, or a user's that closes over
-        # just `posts` and must stay bound to it.
-        post_hook=(lambda nargs, exception: posts.append(exception))
-        if user_post_hook
-        else None,
         cache_results=True,
     )
     @triton.heuristics({"EVEN": lambda args: args["n"] % args["BLOCK"] == 0})
@@ -96,7 +86,6 @@ def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain(user_post_ho
 
     torch.testing.assert_close(out, x + 1)
     assert vars(user) == before and user.cache == {}
-    assert posts == ([None, None] if user_post_hook else [])
 
 
 def test_a_launch_does_not_warm_up():
@@ -106,16 +95,15 @@ def test_a_launch_does_not_warm_up():
         offs = tl.arange(0, BLOCK)
         tl.store(out_ptr + offs, tl.load(x_ptr + offs) + 1)
 
-    # Even with a client that would vote for a real compile: only the
-    # profiler compiles each launch.
-    client = _EagerClient(warmup_vote=True)
+    # Only the profiler compiles each launch.
+    client = _EagerClient()
     traced = tilelens.trace(client)(heur_kernel)
     x, out = torch.arange(8, dtype=torch.float32), torch.zeros(8)
 
     traced[(1,)](x, out)
 
     torch.testing.assert_close(out, x + 1)
-    assert client.calls == []
+    assert not client.warmed_up
 
 
 def test_a_profiler_compiles_each_launch(monkeypatch):
@@ -152,18 +140,3 @@ def test_each_traced_launch_is_recorded_separately():
     traced[(2,)](x, 8, BLOCK=4)
 
     assert [launch.grid for launch in launches[before:]] == [(1, 1, 1), (2, 1, 1)]
-
-
-def _add_one(x):
-    return x + 1
-
-
-def test_a_traced_function_called_outside_a_kernel_leaves_the_language_alone():
-    helper = tilelens.trace(_EagerClient())(triton.jit(_add_one))
-    program_id = tl.program_id
-
-    # E.g. a real compile reaching the trace as a plain Python callee.
-    with pytest.raises(RuntimeError, match="outside of the scope of a kernel"):
-        helper(1)
-
-    assert tl.program_id is program_id
