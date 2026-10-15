@@ -165,7 +165,10 @@ def test_create_patched_jit_with_kwargs_and_custom_original_jit():
     assert result == "final_kernel"
 
 
-def test_patched_jit_preserves_device_function_dependencies(_isolate_cli_active):
+def test_patched_jit_preserves_device_function_dependencies(
+    _isolate_cli_active, monkeypatch
+):
+    monkeypatch.setenv("TRITON_INTERPRET", "0")
     cfg.cli_active = True
     patched_jit = create_patched_jit(profiler_wrapper, triton.jit, frontend="triton")
 
