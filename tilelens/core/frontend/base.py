@@ -2,9 +2,12 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from tilelens.core.data import Op
+
+if TYPE_CHECKING:
+    from tilelens.core.client import Client
 
 
 _MISSING = object()
@@ -115,6 +118,12 @@ class Frontend:
     def maybe_yield_for_multism(self) -> None:
         return None
 
+    def wrap_kernel(self, kernel: Any, client: "str | Client") -> Any:
+        """Create this frontend's traced callable, including CLI adaptation."""
+        raise NotImplementedError(
+            f"Frontend '{self.name}' does not implement kernel wrapping"
+        )
+
     def run_op_overrider(
         self,
         op: Callable,
@@ -206,7 +215,13 @@ def register_frontend(frontend: Frontend) -> Frontend:
 
 def get_frontend(name: str) -> Frontend:
     if name not in FRONTEND_REGISTRY:
-        import_module(f"tilelens.core.frontend.{name}")
+        module_name = f"tilelens.core.frontend.{name}"
+        try:
+            import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name != module_name:
+                raise
+            raise ValueError(f"Unknown frontend: {name}") from exc
     try:
         return FRONTEND_REGISTRY[name]
     except KeyError as exc:

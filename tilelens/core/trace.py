@@ -1,5 +1,4 @@
 import copy
-from contextlib import contextmanager
 from collections.abc import Callable
 from typing import Any
 from ..utils.traceback_utils import CODE_KEYS, get_code_key
@@ -9,6 +8,7 @@ from ..clients import Sanitizer, Profiler, RaceDetector, Tracer
 from ..clients.race_detector.race_detector import NullRaceDetector
 from .client import ClientManager, Client
 from .data import Launch
+from .frontend.base import get_frontend
 import types
 
 
@@ -234,85 +234,13 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
             return self.interpreted_fn(*args, **kwargs)
 
         # Outside a traced launch, behave as the untraced function: Triton's
-        # interpreter, or JITFunction's refusal outside a kernel (also when a
-        # real compile calls the trace as plain Python).
+        # interpreter, or JITFunction's refusal outside a kernel.
         return self.fn(*args, **kwargs)
 
     def warmup(self, *args, **kwargs):
-        with self.client_manager.patch_warmup(self.jit_fn, self._real_compile):
+        with self.client_manager.patch_warmup(self.jit_fn):
             if self.warmup_runner:
                 self.warmup_runner.warmup(*args, **kwargs)
-
-    def _real_compile(self, warmup: Callable, args: tuple, kwargs: dict) -> Any:
-        # Triton accepts only JITFunction callees, so the compile must see each
-        # traced helper it reaches, by argument or by name, as its JITFunction.
-        args = tuple(_untraced(arg) for arg in args)
-        kwargs = {name: _untraced(value) for name, value in kwargs.items()}
-        with _unwrapped_trace_globals(self.base_fn):
-            return warmup(*args, **kwargs)
-
-
-def _untraced(value: Any) -> Any:
-    """``value`` with each TritonTrace in it (also inside a tuple) replaced
-    by its JITFunction: Triton's code generator calls any other callee as
-    plain Python."""
-    if isinstance(value, TritonTrace):
-        return value.jit_fn
-    if isinstance(value, tuple):
-        items = [_untraced(item) for item in value]
-        return type(value)(*items) if hasattr(value, "_fields") else type(value)(items)
-    return value
-
-
-def _traced_references(
-    base_fn: Callable | None,
-) -> list[tuple[dict, str, TritonTrace]]:
-    """(namespace, name, trace) for each name ``base_fn`` or a trace it
-    reaches mentions, looked up in its globals and, as Triton does for
-    ``mod.fn``, in the modules those reach."""
-    found: list[tuple[dict, str, TritonTrace]] = []
-    visited_fns: set[int] = set()
-    pending: list[Any] = [base_fn]
-    while pending:
-        fn = pending.pop()
-        if id(fn) in visited_fns:
-            continue
-        visited_fns.add(id(fn))
-        # Python 3.12+ inlines comprehensions, so their names are here too.
-        names = fn.__code__.co_names
-        namespaces = [fn.__globals__]
-        visited_namespaces = {id(fn.__globals__)}
-        while namespaces:
-            namespace = namespaces.pop()
-            for name in names:
-                value = namespace.get(name)
-                if isinstance(value, TritonTrace):
-                    found.append((namespace, name, value))
-                    pending.append(value.base_fn)
-                elif (
-                    isinstance(value, types.ModuleType)
-                    and id(vars(value)) not in visited_namespaces
-                ):
-                    visited_namespaces.add(id(vars(value)))
-                    namespaces.append(vars(value))
-    return found
-
-
-@contextmanager
-def _unwrapped_trace_globals(base_fn: Callable | None):
-    """Bind each TritonTrace a real compile of ``base_fn`` reaches back to its
-    JITFunction for the scope: under the CLI wrappers device functions are
-    traces too, and Triton's dependency walker rejects them ("Unsupported
-    function referenced"). Traces captured in closures, or reached only
-    through an untraced JITFunction, are not swapped."""
-    swapped = _traced_references(base_fn)
-    try:
-        for namespace, name, trace in swapped:
-            namespace[name] = trace.jit_fn
-        yield
-    finally:
-        for namespace, name, trace in swapped:
-            namespace[name] = trace
 
 
 class NKITrace(LaunchInterface, TraceInterface):
@@ -503,7 +431,10 @@ def trace(client: str | Client | None = None, frontend: str = "triton"):
         return isinstance(selected, NullRaceDetector)
 
     def decorator(kernel) -> TritonTrace | NKITrace | GluonTrace | Any:
-        if cfg.cli_active and isinstance(kernel, TraceInterface):
+        if cfg.cli_active and (
+            isinstance(kernel, TraceInterface)
+            or isinstance(getattr(kernel, "_tilelens_trace", None), TraceInterface)
+        ):
             raise RuntimeError(
                 "@tilelens.trace() decorator cannot be used together with "
                 "CLI wrapper (e.g., tile-sanitizer / tile-profiler). "
@@ -529,15 +460,7 @@ def trace(client: str | Client | None = None, frontend: str = "triton"):
 
         trace_source(kernel)
 
-        # First-time wrapping
-        if frontend in ("nki", "nki_beta2"):
-            return NKITrace(kernel, client, beta2=("beta2" in frontend))
-        elif frontend == "gluon":
-            return GluonTrace(kernel, client)
-        elif frontend == "triton":
-            return TritonTrace(kernel, client)
-        else:
-            raise ValueError(f"Unknown frontend: {frontend}")
+        return get_frontend(frontend).wrap_kernel(kernel, client)
 
     return decorator
 

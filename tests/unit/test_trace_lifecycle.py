@@ -1,7 +1,5 @@
 """CPU-only tests of the traced-launch lifecycle."""
 
-import types
-
 import pytest
 import torch
 import triton
@@ -11,7 +9,7 @@ import tilelens
 from tilelens.clients.profiler.profiler import Profiler
 from tilelens.core.callbacks import ForLoopCallbacks, OpCallbacks
 from tilelens.core.client import Client
-from tilelens.core.trace import _unwrapped_trace_globals, launches
+from tilelens.core.trace import launches
 
 
 @pytest.fixture(autouse=True)
@@ -160,37 +158,6 @@ def _add_one(x):
     return x + 1
 
 
-def _unwrap_helper(x):
-    return _unwrap_traced_leaf(x)  # noqa: F821
-
-
-def test_unwrapped_trace_globals_swaps_only_what_the_kernel_reaches(monkeypatch):
-    leaf, helper, unrelated = (
-        tilelens.trace(_EagerClient())(triton.jit(fn))
-        for fn in (_add_one, _unwrap_helper, _add_one)
-    )
-    monkeypatch.setitem(globals(), "_unwrap_traced_leaf", leaf)
-    pkg = types.ModuleType("tilelens_test_pkg")
-    pkg.api = types.ModuleType("tilelens_test_pkg.api")
-    pkg.api.helper = helper
-    kernel_globals = {"helper": helper, "pkg": pkg, "unrelated": unrelated}
-    exec("def kernel_fn():\n    return helper, pkg.api.helper\n", kernel_globals)
-
-    with pytest.raises(KeyError):
-        with _unwrapped_trace_globals(kernel_globals["kernel_fn"]):
-            # Direct, through a two-level module path, and transitively
-            # through the traced helper's own globals.
-            assert kernel_globals["helper"] is helper.jit_fn
-            assert pkg.api.helper is helper.jit_fn
-            assert globals()["_unwrap_traced_leaf"] is leaf.jit_fn
-            # Not reachable from the kernel's code: left alone.
-            assert kernel_globals["unrelated"] is unrelated
-            raise KeyError("restore on error")
-
-    assert kernel_globals["helper"] is helper and pkg.api.helper is helper
-    assert globals()["_unwrap_traced_leaf"] is leaf
-
-
 def test_a_traced_function_called_outside_a_kernel_leaves_the_language_alone():
     helper = tilelens.trace(_EagerClient())(triton.jit(_add_one))
     program_id = tl.program_id
@@ -200,27 +167,3 @@ def test_a_traced_function_called_outside_a_kernel_leaves_the_language_alone():
         helper(1)
 
     assert tl.program_id is program_id
-
-
-def test_a_voted_compile_sees_traced_helpers_as_jit_functions(monkeypatch):
-    # As under the CLI wrappers, the device function is itself traced.
-    helper = tilelens.trace(_EagerClient())(triton.jit(_add_one))
-    monkeypatch.setitem(globals(), "_codegen_helper", helper)
-
-    @triton.jit
-    def kernel(x_ptr, FN: tl.constexpr, FNS: tl.constexpr):
-        tl.store(x_ptr, FN(_codegen_helper(tl.load(x_ptr))))  # noqa: F821
-
-    traced = tilelens.trace(_EagerClient(warmup_vote=True))(kernel)
-    seen = []
-
-    def run(x, FN, *, grid, warmup, FNS):
-        # What the compile resolves: the constexpr arguments and the global.
-        seen.append((FN, FNS, globals()["_codegen_helper"]))
-
-    monkeypatch.setattr(traced.jit_fn, "run", run)
-
-    # FN by position, FNS by keyword inside a tuple.
-    traced.warmup(torch.zeros(1), helper, FNS=(helper,), grid=(1,))
-
-    assert seen == [(helper.jit_fn, (helper.jit_fn,), helper.jit_fn)]

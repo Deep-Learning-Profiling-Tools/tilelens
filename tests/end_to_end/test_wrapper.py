@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from string import Template
 import shutil
+import pytest
+import torch
 from tilelens.wrapper import (
     SANITIZER_COMMAND,
     PROFILER_COMMAND,
@@ -328,3 +330,46 @@ def test_cli_rejects_trace_decorator(tmp_path: Path):
     assert (
         "CLI wrapper" in proc.stderr
     ), f"Expected error message about CLI wrapper conflict in stderr, got:\n{proc.stderr}"
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_profiler_cli_instruments_device_functions(tmp_path: Path, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("the profiler's compile needs a GPU")
+    script = tmp_path / "device_functions.py"
+    script.write_text(
+        """import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def add_one(value):
+    for _ in range(1):
+        value += 1
+    return value
+
+@triton.jit
+def kernel(ptr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.store(ptr + offsets, add_one(tl.load(ptr + offsets)))
+
+"""
+        + f"kernel[(1,)](torch.zeros(8, device={device!r}), BLOCK=8)\n",
+        encoding="utf-8",
+    )
+    # On CPU nothing can compile, so the buffer-load check is off there.
+    env = {
+        **os.environ,
+        "TRITON_INTERPRET": "0",
+        "PROFILER_DISABLE_BUFFER_LOAD_CHECK": "1" if device == "cpu" else "0",
+    }
+    proc = subprocess.run(
+        [PROFILER_COMMAND, str(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    # The loop inside the device function is instrumented.
+    assert "Total for-loops detected: 1" in proc.stdout
