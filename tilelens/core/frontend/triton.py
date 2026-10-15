@@ -53,6 +53,7 @@ from ..data import (
     FpToFp,
     Idiv,
     IntToPtr,
+    InlineAsm,
     InterpreterDivergence,
     Join,
     Load,
@@ -124,9 +125,13 @@ from .base import (
 class _InterpreterDivergences:
     """TileLens's own op namespace: the frontend's divergence checks call
     ``report`` so an InterpreterDivergence reaches the clients through their
-    op callbacks like any other op."""
+    op callbacks like any other op, and its inline-asm approximation calls
+    ``inline_asm`` for an InlineAsm op."""
 
     def report(self, kind: str, source_location: tuple[str, int, str]) -> None:
+        return None
+
+    def inline_asm(self) -> None:
         return None
 
 
@@ -194,6 +199,7 @@ TRITON_NAMESPACES: dict[Any, dict[str, type[Op]]] = {
     },
     interpreter_divergences: {
         "report": InterpreterDivergence,
+        "inline_asm": InlineAsm,
     },
 }
 
@@ -510,6 +516,7 @@ class TritonFrontend(Frontend):
             **kwargs,
         ):
             _warn_inline_asm_approximation_once()
+            interpreter_divergences.inline_asm()
             if isinstance(dtype, (list, tuple)):
                 return tuple(args[0].to(_dtype) for _dtype in dtype)
             return args[0].to(dtype)
