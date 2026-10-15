@@ -1,4 +1,3 @@
-import pytest
 import warnings
 from types import SimpleNamespace
 
@@ -85,13 +84,8 @@ def test_scope_removes_tensor_magic_methods_added_by_interpreter():
 
 def test_scope_restores_tensor_descriptor_base_builtins(monkeypatch):
     """Scope must restore descriptor builtins on tensor_descriptor_base."""
-    if not hasattr(tl.core, "tensor_descriptor_base"):
-        pytest.skip("tensor_descriptor_base is not available")
-
     descriptor = tl.core.tensor_descriptor_base
     attr = "load"
-    if not hasattr(descriptor, attr):
-        pytest.skip("descriptor load is not available")
 
     original = getattr(descriptor, attr)
     sentinel = object()

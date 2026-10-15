@@ -9,10 +9,17 @@ from triton.experimental.gluon.language import _math as gluon_math  # type: igno
 from triton.experimental.gluon.language import _semantic as gluon_semantic  # type: ignore
 from triton.experimental.gluon.language.amd import cdna3 as gluon_amd_cdna3  # type: ignore
 from triton.experimental.gluon.language.amd import cdna4 as gluon_amd_cdna4  # type: ignore
+from triton.experimental.gluon.language.amd import gfx1250 as gluon_amd_gfx1250  # type: ignore
 from triton.experimental.gluon.language.amd import rdna3 as gluon_amd_rdna3  # type: ignore
 from triton.experimental.gluon.language.amd import rdna4 as gluon_amd_rdna4  # type: ignore
 from triton.experimental.gluon.language.amd.cdna4 import (  # type: ignore
     async_copy as gluon_amd_cdna4_async_copy,
+)
+from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
+    async_copy as gluon_amd_async_copy,
+)
+from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
+    tdm as gluon_amd_tdm,
 )
 from triton.experimental.gluon.language.nvidia.blackwell import (  # type: ignore
     tma as gluon_blackwell_tma,
@@ -51,23 +58,6 @@ from ..symbolic_metadata import (
 
 from .base import AdapterResult, Frontend, _LangPatchScope, register_frontend
 from .triton import TritonFrontend
-
-try:
-    from triton.experimental.gluon.language.amd import gfx1250 as gluon_amd_gfx1250  # type: ignore
-    from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
-        async_copy as gluon_amd_async_copy,
-    )
-    from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
-        tdm as gluon_amd_tdm,
-    )
-except ImportError as exc:
-    if "is_hip_gfx1250" not in str(exc) or "triton.language.target_info" not in str(
-        exc
-    ):
-        raise
-    gluon_amd_gfx1250 = None
-    gluon_amd_async_copy = None
-    gluon_amd_tdm = None
 
 _WARP_SPECIALIZE_SCHEDULER: Any = None
 _MISSING = object()
@@ -309,8 +299,6 @@ def _gluon_make_range_adapter(start: Any, end: Any, *_args: Any, **_kwargs: Any)
 
 
 def _existing_ops(namespace: Any, attrs: dict[str, type[Op]]) -> dict[str, type[Op]]:
-    if namespace is None:
-        return {}
     namespace_attrs = vars(namespace)
     return {attr: op_type for attr, op_type in attrs.items() if attr in namespace_attrs}
 

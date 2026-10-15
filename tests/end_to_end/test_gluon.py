@@ -6,30 +6,22 @@ import torch
 from triton import knobs
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.amd.cdna4 import async_copy as amd_cdna4_cp
 from triton.experimental.gluon.language.nvidia import blackwell, hopper
 from triton.experimental.gluon.language.nvidia.blackwell import tma as blackwell_tma
 from triton.experimental.gluon.language.nvidia.hopper import (
     mbarrier,
     tma,
 )
-from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+from triton.experimental.gluon.nvidia.hopper import (
+    TensorDescriptor,
+    TensorDescriptorIm2Col,
+)
 
 import tilelens
 from tilelens.clients.sanitizer.sanitizer import SymbolicSanitizer
 from tilelens.core.data import Load
 from tilelens.core.simulation.gluon import GluonInterpretedFunction, gluon_builder
-
-try:
-    from triton.experimental.gluon.language.amd.cdna4 import (
-        async_copy as amd_cdna4_cp,
-    )
-except ImportError:
-    amd_cdna4_cp = None
-
-try:
-    from triton.experimental.gluon.nvidia.hopper import TensorDescriptorIm2Col
-except ImportError:
-    TensorDescriptorIm2Col = None
 
 try:
     from triton.experimental.gluon.language.nvidia.ampere import async_copy as cp
@@ -39,11 +31,6 @@ except ImportError:
 _HAS_AMPERE_ASYNC_COPY = (
     cp is not None and getattr(cp, "async_copy_global_to_local", None) is not None
 )
-_HAS_AMD_CDNA4_ASYNC_COPY = (
-    amd_cdna4_cp is not None
-    and getattr(amd_cdna4_cp, "global_load_to_shared", None) is not None
-)
-_HAS_TMA_IM2COL = TensorDescriptorIm2Col is not None
 
 
 def _run_gluon_on_cpu(fn, grid, *args, **kwargs):
@@ -942,10 +929,6 @@ def test_gluon_async_copy_runs_masked_1d_copy_on_cpu():
     torch.testing.assert_close(out, inp, atol=0, rtol=0)
 
 
-@pytest.mark.skipif(
-    not _HAS_AMD_CDNA4_ASYNC_COPY,
-    reason="Gluon AMD CDNA4 async copy builtins are unavailable",
-)
 def test_gluon_amd_async_copy_preserves_masked_other_on_cpu():
     inp = torch.arange(40, dtype=torch.float32)
     out = torch.full((64,), -1, dtype=torch.float32)
@@ -1058,10 +1041,6 @@ def test_gluon_tma_runs_float_atomics_on_cpu():
     torch.testing.assert_close(max_dst, expected_max, atol=0, rtol=0)
 
 
-@pytest.mark.skipif(
-    not _HAS_TMA_IM2COL,
-    reason="Gluon TensorDescriptorIm2Col is unavailable in this Triton build",
-)
 def test_gluon_tma_im2col_runs_simple_tile_on_cpu():
     inp = torch.arange(1, 17, dtype=torch.float32).unsqueeze(1).repeat(1, 32)
     inp = inp.reshape(1, 4, 4, 32)
@@ -1071,10 +1050,6 @@ def test_gluon_tma_im2col_runs_simple_tile_on_cpu():
     torch.testing.assert_close(out, inp.reshape(16, 32), atol=0, rtol=0)
 
 
-@pytest.mark.skipif(
-    not _HAS_TMA_IM2COL,
-    reason="Gluon TensorDescriptorIm2Col is unavailable in this Triton build",
-)
 def test_gluon_tma_im2col_zero_fills_padded_pixels_on_cpu():
     inp = torch.arange(1, 17, dtype=torch.float32).unsqueeze(1).repeat(1, 32)
     inp = inp.reshape(1, 4, 4, 32)
@@ -1088,10 +1063,6 @@ def test_gluon_tma_im2col_zero_fills_padded_pixels_on_cpu():
     torch.testing.assert_close(out[:, 0], expected_first_channel, atol=0, rtol=0)
 
 
-@pytest.mark.skipif(
-    not _HAS_TMA_IM2COL,
-    reason="Gluon TensorDescriptorIm2Col is unavailable in this Triton build",
-)
 def test_gluon_tma_im2col_honors_runtime_offsets_on_cpu():
     inp = torch.arange(1, 17, dtype=torch.float32).unsqueeze(1).repeat(1, 32)
     inp = inp.reshape(1, 4, 4, 32)
@@ -1125,8 +1096,6 @@ def test_gluon_builder_preserves_tensor_memory_fp4_padding():
         False,
         True,
     )
-    if not hasattr(layout, "fp4_padded"):
-        pytest.skip("Gluon TensorMemoryLayout has no fp4_padded field")
     assert layout.fp4_padded is True
 
 
