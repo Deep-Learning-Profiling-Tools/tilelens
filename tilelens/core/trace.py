@@ -120,8 +120,9 @@ class KernelTraceSupport:
 
     @staticmethod
     def _heuristics_warmup(layer: Any) -> Callable:
-        # KernelInterface.warmup calls run(warmup=True), bypassing fn.warmup,
-        # where patch_warmup votes: fill in the heuristics, then call fn.warmup.
+        # KernelInterface.warmup would pass warmup= a second time and skip
+        # fn.warmup, where the clients vote: fill in the heuristics, then call
+        # fn.warmup.
         def warmup(*args, **kwargs):
             for name, heur in layer.values.items():
                 kwargs[name] = heur({**dict(zip(layer.arg_names, args)), **kwargs})
@@ -200,9 +201,9 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
         self._copy_callable_attrs(runner, self.base_fn, src_fallback=self.jit_fn)
 
     def run(self, *args, **kwargs):
-        # A profiler with compile=True reads each launch's compiled kernel.
+        # The profiler's buffer-load check reads each launch's compiled kernel.
         if kwargs.get("warmup") or any(
-            isinstance(client, Profiler) and client.compile
+            isinstance(client, Profiler)
             for client in self.client_manager.clients.values()
         ):
             self.warmup(*args, **kwargs)
