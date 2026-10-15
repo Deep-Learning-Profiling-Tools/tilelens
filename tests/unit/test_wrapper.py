@@ -181,6 +181,19 @@ def test_patched_jit_preserves_device_function_dependencies(_isolate_cli_active)
     assert add_two.cache_key
 
 
+def test_cli_jit_function_warmup_skips_the_trace(_isolate_cli_active):
+    cfg.cli_active = True
+
+    @triton.jit
+    def kernel(x):
+        pass
+
+    original_run = MagicMock()
+    kernel.run = original_run
+    profiler_wrapper(kernel).run(grid=(1,), warmup=True)
+    original_run.assert_called_once_with(grid=(1,), warmup=True)
+
+
 # ======== create_patched_autotune Tests ===========
 
 

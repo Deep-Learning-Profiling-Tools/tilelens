@@ -1097,6 +1097,8 @@ class TritonFrontend(Frontend):
         original_run = kernel.run
 
         def run(*args, **kwargs):
+            # JITFunction.warmup re-enters run(warmup=True) for the real
+            # compile; tracing it would recurse.
             if kwargs.get("warmup", False):
                 return original_run(*args, **kwargs)
             return traced.run(*args, **kwargs)
