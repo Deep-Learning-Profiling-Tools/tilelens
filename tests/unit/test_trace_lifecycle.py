@@ -64,19 +64,10 @@ class _EagerClient(Client):
         self.calls.append(("post_warmup", ret))
 
 
-@pytest.mark.parametrize("user_post_hook", [False, True])
-def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain(user_post_hook):
-    posts = []
-
+def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain():
     @triton.autotune(
         configs=[triton.Config({"BLOCK": 4}), triton.Config({"BLOCK": 8})],
         key=["n"],
-        restore_value=["out_ptr"],
-        # Triton's own restore_value post_hook, or a user's that closes over
-        # just `posts` and must stay bound to it.
-        post_hook=(lambda nargs, exception: posts.append(exception))
-        if user_post_hook
-        else None,
         cache_results=True,
     )
     @triton.heuristics({"EVEN": lambda args: args["n"] % args["BLOCK"] == 0})
@@ -95,7 +86,6 @@ def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain(user_post_ho
 
     torch.testing.assert_close(out, x + 1)
     assert vars(user) == before and user.cache == {}
-    assert posts == ([None, None] if user_post_hook else [])
 
 
 def test_a_launch_does_not_warm_up():

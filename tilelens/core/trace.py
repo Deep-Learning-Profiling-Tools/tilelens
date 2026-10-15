@@ -98,21 +98,6 @@ class KernelTraceSupport:
             # interpreted chain lacks.
             layer.cache_results = False
             layer.do_bench = self.dummy_benchmarker
-            # Triton's reset_to_zero/restore_value hooks close over just the
-            # Autotuner they were built for; point them at the copy, which
-            # keeps restore_copies.
-            for name in ("pre_hook", "post_hook"):
-                hook = getattr(layer, name)
-                closure = getattr(hook, "__closure__", None)
-                if closure and len(closure) == 1 and closure[0].cell_contents is runner:
-                    rebound = types.FunctionType(
-                        hook.__code__,
-                        hook.__globals__,
-                        hook.__name__,
-                        hook.__defaults__,
-                        (types.CellType(layer),),
-                    )
-                    setattr(layer, name, rebound)
         return layer
 
     def _copy_callable_attrs(
