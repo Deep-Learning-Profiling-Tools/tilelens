@@ -106,7 +106,8 @@ def test_a_launch_does_not_warm_up():
         offs = tl.arange(0, BLOCK)
         tl.store(out_ptr + offs, tl.load(x_ptr + offs) + 1)
 
-    # Even with a client that would vote for a real compile.
+    # Even with a client that would vote for a real compile: only the
+    # profiler compiles each launch.
     client = _EagerClient(warmup_vote=True)
     traced = tilelens.trace(client)(heur_kernel)
     x, out = torch.arange(8, dtype=torch.float32), torch.zeros(8)
@@ -117,15 +118,14 @@ def test_a_launch_does_not_warm_up():
     assert client.calls == []
 
 
-@pytest.mark.parametrize("compile", [False, True])
-def test_a_profiler_compiles_each_launch_only_with_compile(compile, monkeypatch):
-    @triton.heuristics({"BLOCK": lambda args: 8})
+def test_a_profiler_compiles_each_launch(monkeypatch):
+    @triton.heuristics({"BLOCK": lambda args: args["x_ptr"].numel()})
     @triton.jit
     def heur_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
         offs = tl.arange(0, BLOCK)
         tl.store(out_ptr + offs, tl.load(x_ptr + offs) + 1)
 
-    traced = tilelens.trace(Profiler(compile=compile))(heur_kernel)
+    traced = tilelens.trace(Profiler())(heur_kernel)
     compiles = []
 
     def run(*args, grid, warmup, BLOCK, **kwargs):
@@ -135,8 +135,7 @@ def test_a_profiler_compiles_each_launch_only_with_compile(compile, monkeypatch)
 
     traced[(1,)](torch.arange(8, dtype=torch.float32), torch.zeros(8))
 
-    # With the heuristic's constexpr filled in.
-    assert compiles == ([(True, 8)] if compile else [])
+    assert compiles == [(True, 8)]
 
 
 def test_each_traced_launch_is_recorded_separately():
