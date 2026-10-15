@@ -299,7 +299,18 @@ def test_buffer_load_check_skipped_without_amdgcn(_isolate_profiler_cfg, capsys)
 
     profiler.finalize()
     out = capsys.readouterr().out
-    assert "Buffer Load check skipped" in out
+    assert "not an AMD (amdgcn) kernel" in out
+    assert "Potential Buffer Load Issue" not in out
+
+
+def test_buffer_load_check_skipped_without_a_compile(_isolate_profiler_cfg, capsys):
+    """Without a compiled kernel the check is skipped, and the user is told why."""
+    cfg.profiler_disable_buffer_load_check = False
+
+    Profiler().finalize()
+
+    out = capsys.readouterr().out
+    assert "the kernel was not compiled" in out
     assert "Potential Buffer Load Issue" not in out
 
 
