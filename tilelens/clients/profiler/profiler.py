@@ -78,8 +78,7 @@ class Profiler(Client):
         # Per-operation statistics for detailed analysis
         self.mask_op_stats: list[MaskOpStats] = []
 
-        # Case 4: Buffer Load Check, on the compiled kernel's ASM. AMD only:
-        # has_buffer_load stays None until an amdgcn ASM is captured.
+        # Case 4: Buffer Load Check. AMD only: None until an amdgcn ASM is captured.
         self.has_buffer_load: bool | None = None
         self.disable_buffer_load_check = cfg.profiler_disable_buffer_load_check
         self.potential_buffer_load_issue_found = False

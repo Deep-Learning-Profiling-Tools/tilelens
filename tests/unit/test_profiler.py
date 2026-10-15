@@ -1,5 +1,4 @@
 import numpy as np
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -276,12 +275,10 @@ def test_check_32bit_range_no_buffer_load(_isolate_profiler_cfg):
 # ======== Buffer Load Check: Skip Tests =========
 
 
-def test_buffer_load_check_skipped_on_a_non_amd_compile(_isolate_profiler_cfg, capsys):
+def test_buffer_load_check_skipped_without_an_amd_kernel(_isolate_profiler_cfg, capsys):
     cfg.profiler_disable_buffer_load_check = False
-    profiler = Profiler()
 
-    profiler.post_warmup_callback(None, SimpleNamespace(asm={"ptx": "ld.global.f32"}))
-    profiler.finalize()
+    Profiler().finalize()
 
     assert "Buffer Load check skipped" in capsys.readouterr().out
 
