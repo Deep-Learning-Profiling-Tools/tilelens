@@ -13,6 +13,21 @@ import types
 
 launches: list[Launch] = []
 
+# The clients trace() takes by name, each built with its defaults.
+_NAMED_CLIENTS: dict[str, type[Client]] = {
+    "sanitizer": Sanitizer,
+    "profiler": Profiler,
+    "race_detector": RaceDetector,
+    "tracer": Tracer,
+}
+
+
+def _named_client_type(name: str) -> type[Client]:
+    try:
+        return _NAMED_CLIENTS[name.lower()]
+    except KeyError:
+        raise ValueError(f"Unknown client: {name}") from None
+
 
 class TraceInterface:
     def __init__(self, client: str | Client) -> None:
@@ -22,22 +37,21 @@ class TraceInterface:
     @staticmethod
     def _normalize_client(client: str | Client) -> Client:
         if isinstance(client, str):
-            name = client.lower()
-            if name == "sanitizer":
-                return Sanitizer()
-            if name == "profiler":
-                return Profiler()
-            if name == "race_detector":
-                return RaceDetector()
-            if name == "tracer":
-                return Tracer()
-            raise ValueError(f"Unknown client: {client}")
+            return _named_client_type(client)()
         elif isinstance(client, Client):
             return client
         else:
             raise TypeError(f"Expected str or Client, got {type(client)}")
 
     def add_client(self, new_client: str | Client) -> None:
+        if isinstance(new_client, str):
+            # A name asks for a default client, which one of its class already
+            # in the trace serves: none of the caller's settings are lost.
+            client_type = _named_client_type(new_client)
+            existing = self.client_manager.get_client(client_type.NAME)
+            if isinstance(existing, client_type):
+                return
+            new_client = client_type()
         self.client_manager.add_clients([self._normalize_client(new_client)])
 
     def finalize(self):

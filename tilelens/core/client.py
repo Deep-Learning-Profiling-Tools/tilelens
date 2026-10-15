@@ -134,13 +134,25 @@ class ClientManager:
         return self.clients.get(name)
 
     def add_clients(self, new_clients_list: list[Client]) -> None:
+        # A trace holds one client per NAME, and none is dropped or replaced
+        # silently: the same object again is a no-op, and any other client
+        # whose NAME is taken is refused. The whole batch is checked before
+        # anything is added, so a refused call leaves the trace unchanged.
+        resulting = dict(self.clients)
         for new_client in new_clients_list:
-            duplicate = any(
-                isinstance(existing_client, new_client.__class__)
-                for existing_client in self.clients.values()
-            )
-            if not duplicate:
-                self.clients[new_client.NAME] = new_client
+            taken = resulting.get(new_client.NAME)
+            if taken is new_client:
+                continue
+            if taken is not None:
+                raise ValueError(
+                    f"this trace already has a client named {new_client.NAME!r} "
+                    f"({type(taken).__name__}), so another one "
+                    f"({type(new_client).__name__}) cannot be added. Configure "
+                    "the client already in the trace, or trace the kernel "
+                    "separately for each client."
+                )
+            resulting[new_client.NAME] = new_client
+        self.clients.update(resulting)
 
     @contextmanager
     def patch_warmup(self, jit_fn):

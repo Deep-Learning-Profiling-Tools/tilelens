@@ -1,4 +1,7 @@
+import re
 from contextlib import contextmanager
+
+import pytest
 
 from tilelens.core.callbacks import ForLoopCallbacks, OpCallbacks
 from tilelens.core.client import Client, ClientManager
@@ -59,6 +62,28 @@ def test_client_manager_finalize_collects_client_tensors():
 
     assert tensor in manager.launch.tensors
     assert manager.launch.records == [record]
+
+
+def test_add_clients_never_drops_or_replaces_a_client_silently():
+    first = _DummyClient()
+    manager = ClientManager([first])
+    manager.add_clients([first])  # the same object again is a no-op
+
+    class _SameName(_DummyClient):
+        pass
+
+    class _Other(_DummyClient):
+        NAME = "other"
+
+    for refused, named in (
+        ([_DummyClient()], "'dummy' (_DummyClient), so another one (_DummyClient)"),
+        ([_SameName()], "'dummy' (_DummyClient), so another one (_SameName)"),
+        ([_Other(), _Other()], "'other' (_Other), so another one (_Other)"),
+    ):
+        with pytest.raises(ValueError, match=re.escape(named)):
+            manager.add_clients(refused)
+    # A refused batch adds nothing, its first client included.
+    assert manager.clients == {"dummy": first}
 
 
 def test_lock_fn_keeps_runtime_lock_decision():
