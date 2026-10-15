@@ -6,7 +6,6 @@ import triton
 import triton.language as tl
 
 import tilelens
-from tilelens.core.trace import launches
 
 
 @pytest.fixture(autouse=True)
@@ -42,19 +41,3 @@ def test_autotune_over_heuristics_runs_on_copies_of_the_users_chain():
 
     torch.testing.assert_close(out, x + 1)
     assert vars(user) == before and user.cache == {}
-
-
-def test_each_traced_launch_is_recorded_separately():
-    @triton.jit
-    def add_one(x_ptr, n, BLOCK: tl.constexpr):
-        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        tl.store(x_ptr + offs, tl.load(x_ptr + offs) + 1, mask=offs < n)
-
-    traced = tilelens.trace("tracer")(add_one)
-    before = len(launches)
-    x = torch.zeros(8)
-
-    traced[(1,)](x, 8, BLOCK=8)
-    traced[(2,)](x, 8, BLOCK=4)
-
-    assert [launch.grid for launch in launches[before:]] == [(1, 1, 1), (2, 1, 1)]

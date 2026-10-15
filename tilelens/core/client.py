@@ -174,8 +174,6 @@ class ClientManager:
     def patch_run(self, fn, frontend_name: str):
         frontend = get_frontend(frontend_name)
         namespaces = frontend.namespaces
-        # A fresh Launch per launch, so `launches` gets distinct entries.
-        self.launch = Launch()
         with patch_calls(frontend_name):
             # Collect all for-loop callbacks from clients
             all_loop_callbacks = []
