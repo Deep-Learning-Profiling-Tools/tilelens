@@ -7,7 +7,7 @@
 </div>
 <br/>
 
-Welcome to TileLens, a visualization, profiling, and debugging toolkit for deep learning kernels written in tile-based languages. TileLens currently supports Triton, Gluon, and AWS Neuron NKI, and aims to make tile-based kernel programming more intuitive.
+Welcome to TileLens, a visualization, profiling, and debugging toolkit for deep learning kernels written in tile-based languages. TileLens currently supports Triton and Gluon, with AWS Neuron NKI and NVIDIA cuTile support in active development, and aims to make tile-based kernel programming more intuitive.
 
 Visit our [site](https://deep-learning-profiling-tools.github.io/tilelens/) to see our tool in action!
 
