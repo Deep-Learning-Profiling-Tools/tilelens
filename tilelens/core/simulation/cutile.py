@@ -48,7 +48,9 @@ DTYPES = {
     ct.float8_e5m2: STORAGE_DTYPES["float8_e5m2"],
 }
 NUMPY_DTYPES = {dtype: token for token, dtype in DTYPES.items()}
-
+if hasattr(ct, "float8_e8m0fnu"):
+    DTYPES[ct.float8_e8m0fnu] = STORAGE_DTYPES["float8_e8m0fnu"]
+    NUMPY_DTYPES[DTYPES[ct.float8_e8m0fnu]] = ct.float8_e8m0fnu
 
 # Save signatures before patching the language module.
 _LANG_FUNCTIONS = {
@@ -74,6 +76,7 @@ def _is_float(dtype):
         DTYPES[ct.bfloat16],
         DTYPES[ct.float8_e4m3fn],
         DTYPES[ct.float8_e5m2],
+        STORAGE_DTYPES["float8_e8m0fnu"],
     )
 
 
@@ -82,6 +85,7 @@ def _is_low_precision(dtype):
         DTYPES[ct.bfloat16],
         DTYPES[ct.float8_e4m3fn],
         DTYPES[ct.float8_e5m2],
+        STORAGE_DTYPES["float8_e8m0fnu"],
     )
 
 
@@ -319,6 +323,9 @@ class Tile:
     def extract(self, index, shape):
         return cutile_builder.extract(self, index, shape)
 
+    def insert(self, index, value):
+        return cutile_builder.insert(self, index, value)
+
     # Python operators
     def __add__(self, other):
         return cutile_builder.add(self, other)
@@ -370,14 +377,6 @@ class Tile:
             raise TypeError("Only scalar tiles can control Python branches")
         return bool(self.data)
 
-    def __neg__(self):
-        value = (
-            self.data.astype(np.int32)
-            if self.data.dtype == np.dtype(np.bool_)
-            else self.data
-        )
-        return Tile(np.negative(value))
-
     def __eq__(self, other):
         return cutile_builder.equal(self, other)
 
@@ -396,6 +395,12 @@ class Tile:
     def __rmod__(self, other):
         return cutile_builder.mod(other, self)
 
+    def __divmod__(self, other):
+        return cutile_builder.divmod(self, other)
+
+    def __rdivmod__(self, other):
+        return cutile_builder.divmod(other, self)
+
     def __xor__(self, other):
         return cutile_builder.bitwise_xor(self, other)
 
@@ -413,6 +418,52 @@ class Tile:
 
     def __rxor__(self, other):
         return cutile_builder.bitwise_xor(other, self)
+
+    def __pow__(self, other, modulo=None):
+        if modulo is not None:
+            raise TypeError("cuTile does not support three-argument pow")
+        return cutile_builder.pow(self, other)
+
+    def __rpow__(self, other, modulo=None):
+        if modulo is not None:
+            raise TypeError("cuTile does not support three-argument pow")
+        return cutile_builder.pow(other, self)
+
+    def __rlshift__(self, other):
+        return cutile_builder.bitwise_lshift(other, self)
+
+    def __rrshift__(self, other):
+        return cutile_builder.bitwise_rshift(other, self)
+
+    def __abs__(self):
+        return cutile_builder.abs(self)
+
+    def __invert__(self):
+        return cutile_builder.bitwise_not(self)
+
+    def __pos__(self):
+        if self.data.dtype == np.dtype(np.bool_):
+            return cutile_builder.astype(self, ct.int32)
+        return self
+
+    def __neg__(self):
+        return cutile_builder.negative(self)
+
+    def __rmatmul__(self, other):
+        return cutile_builder.matmul(other, self)
+
+    # Needed before an eager Python f-string reaches Builder.print.
+    def __str__(self):
+        return cutile_builder._format_tile(self.data, lambda item: str(item.item()))
+
+    __repr__ = __str__
+
+    def __format__(self, spec):
+        if not spec:
+            return self.__str__()
+        return cutile_builder._format_tile(
+            self.data, lambda item: builtins.format(item.item(), spec)
+        )
 
 
 class Array:
@@ -796,6 +847,22 @@ class Builder:
             value.astype(target), dtype=ct.tfloat32 if dtype == ct.tfloat32 else None
         )
 
+    def insert(self, x, /, index, value):
+        if (
+            not isinstance(x, Tile)
+            or not isinstance(value, Tile)
+            or x.dtype != value.dtype
+        ):
+            raise TypeError("insert requires tiles with the same dtype")
+        shape = value.shape or (1,) * x.ndim
+        self.extract(x, index, shape)
+        indices = tuple(operator.index(i) for i in _normalize_shape(index))
+        result = x.data.copy()
+        result[
+            tuple(slice(i * s, (i + 1) * s) for i, s in zip(indices, shape))
+        ] = value.data.reshape(shape)
+        return Tile(result, x.dtype)
+
     def sum(self, x, /, axis=None, *, keepdims=False, **kwargs):
         value = _tile_value(x)
         dtype = np.dtype(np.int32) if value.dtype == np.dtype(np.bool_) else value.dtype
@@ -832,6 +899,12 @@ class Builder:
 
     def mod(self, x, y, /):
         return self._binary(x, y, np.remainder)
+
+    def divmod(self, x, y, /):
+        _, _, dtype = _binary_values(x, y)
+        if dtype.kind not in "iu":
+            raise NotImplementedError("divmod requires integer operands")
+        return self.floordiv(x, y), self.mod(x, y)
 
     def equal(self, x, y, /):
         return self._compare(x, y, np.equal)
@@ -978,9 +1051,6 @@ class Builder:
             **kwargs,
         )
 
-    def atomic_add(self, array, indices, update, /, *, check_bounds=True, **kwargs):
-        return self._atomic(array, indices, update, np.add, check_bounds=check_bounds)
-
     def _atomic(
         self, array, indices, update, operation, *, check_bounds=True, expected=None
     ):
@@ -1033,6 +1103,9 @@ class Builder:
         )
         return Tile(old)
 
+    def atomic_add(self, array, indices, update, /, *, check_bounds=True, **kwargs):
+        return self._atomic(array, indices, update, np.add, check_bounds=check_bounds)
+
     def atomic_max(self, array, indices, update, /, *, check_bounds=True, **kwargs):
         return self._atomic(array, indices, update, np.fmax, check_bounds=check_bounds)
 
@@ -1081,11 +1154,107 @@ class Builder:
                 "CPU simulation does not implement this rounding mode"
             )
 
-    def static_iter(self, iterable, /):
-        # Snapshot the iterable before unrolling, as the compiler does.
-        if isinstance(iterable, (Tile, Array)):
-            raise TypeError("static_iter requires a Python iterable")
-        return iter(tuple(iterable))
+    def abs(self, x, /):
+        value = _unary_value(x)
+        if value.dtype == np.dtype(np.bool_) or value.dtype.kind == "u":
+            return Tile(value)
+        if value.dtype.kind not in "if" and not _is_float(value.dtype):
+            raise TypeError("abs requires a numeric tile")
+        compute = value.astype(np.float32) if _is_low_precision(value.dtype) else value
+        return Tile(np.abs(compute).astype(value.dtype))
+
+    def negative(self, x, /):
+        value = _unary_value(x)
+        if value.dtype == np.dtype(np.bool_):
+            value = value.astype(np.int32)
+        if value.dtype.kind not in "iuf" and not _is_float(value.dtype):
+            raise TypeError("negative requires a numeric tile")
+        compute = value.astype(np.float32) if _is_low_precision(value.dtype) else value
+        return Tile(np.negative(compute).astype(value.dtype))
+
+    def bitwise_not(self, x, /):
+        value = _tile_value(x)
+        if value.dtype.kind not in "biu":
+            raise TypeError("bitwise_not requires an integer or boolean tile")
+        return Tile(np.bitwise_not(value))
+
+    def sqrt(self, x, /, *, rounding_mode=None, flush_to_zero=False):
+        self._check_cpu_math_options(rounding_mode, flush_to_zero)
+        return self._unary(x, np.sqrt)
+
+    def sin(self, x, /):
+        return self._unary(x, np.sin)
+
+    def cos(self, x, /):
+        return self._unary(x, np.cos)
+
+    def tan(self, x, /):
+        return self._unary(x, np.tan)
+
+    def tanh(self, x, /, *, rounding_mode=None):
+        self._check_cpu_math_options(
+            rounding_mode, rounding_modes=(ct.RoundingMode.FULL,)
+        )
+        value = _tile_value(x)
+        if (
+            rounding_mode is not None
+            and _is_float(value.dtype)
+            and value.dtype != np.float32
+        ):
+            raise TypeError("Explicit FULL tanh rounding requires float32")
+        return self._unary(x, np.tanh)
+
+    def sinh(self, x, /):
+        return self._unary(x, np.sinh)
+
+    def cosh(self, x, /):
+        return self._unary(x, np.cosh)
+
+    def log2(self, x, /):
+        return self._unary(x, np.log2)
+
+    def floor(self, x, /):
+        if not _is_float(_tile_value(x).dtype):
+            raise TypeError("floor requires a floating-point tile")
+        return self._unary(x, np.floor)
+
+    def ceil(self, x, /):
+        if not _is_float(_tile_value(x).dtype):
+            raise TypeError("ceil requires a floating-point tile")
+        return self._unary(x, np.ceil)
+
+    def isnan(self, x, /):
+        value = _tile_value(x)
+        if not _is_float(value.dtype):
+            # A Python scalar is loosely typed in the installed compiler.
+            if isinstance(x, (bool, int, float)):
+                return Tile(np.asarray(False, dtype=np.bool_))
+            raise TypeError("isnan requires a floating-point tile")
+        compute = value.astype(np.float32) if _is_low_precision(value.dtype) else value
+        return Tile(np.isnan(compute))
+
+    def pow(self, x, y, /):
+        if all(
+            isinstance(value, (bool, int, float)) and not isinstance(value, np.generic)
+            for value in (x, y)
+        ):
+            return builtins.pow(x, y)
+        lhs, rhs, dtype = _binary_values(x, y)
+        if not _is_float(dtype):
+            # 1.5.0 emits FPowF only for dynamic operands; there is no integer
+            # power lowering. Do not silently adopt NumPy's integer power.
+            raise NotImplementedError(
+                "Dynamic integer/bool pow has no cuTile 1.5.0 lowering"
+            )
+        return Tile(np.power(lhs, rhs).astype(dtype))
+
+    def atan2(self, x1, x2, /):
+        lhs, rhs, dtype = _binary_values(x1, x2)
+        if not _is_float(dtype):
+            raise NotImplementedError(
+                "Dynamic integer/bool atan2 has no cuTile 1.5.0 lowering"
+            )
+        return Tile(np.arctan2(lhs, rhs).astype(dtype))
 
     def cdiv(self, x, y, /):
         lhs, rhs, dtype = _binary_values(x, y)
@@ -1101,6 +1270,510 @@ class Builder:
                 "Integer division overflow has no defined CPU result"
             )
         return Tile(np.asarray(result, dtype=dtype))
+
+    @staticmethod
+    def _reduction_axes(axis, ndim):
+        if axis is None:
+            return tuple(range(ndim))
+        axes = axis if isinstance(axis, tuple) else (axis,)
+        if any(isinstance(a, (Tile, bool, np.bool_)) for a in axes):
+            raise TypeError("Reduction axes must be constant integers")
+        axes = tuple(_normalize_axis(a, ndim) for a in axes)
+        if len(set(axes)) != len(axes):
+            raise ValueError("Repeated reduction axis")
+        return axes
+
+    def min(self, x, /, axis=None, *, keepdims=False, flush_to_zero=False):
+        self._check_cpu_math_options(flush_to_zero=flush_to_zero)
+        if not isinstance(keepdims, bool):
+            raise TypeError("keepdims must be a constant bool")
+        value = _tile_value(x)
+        if value.dtype == np.dtype(np.bool_):
+            value = value.astype(np.int32)
+        if value.dtype.kind not in "iuf" and not _is_float(value.dtype):
+            raise TypeError("min requires a numeric tile")
+        dtype = value.dtype
+        compute = value.astype(np.float32) if _is_low_precision(dtype) else value
+        # cuTile MinF uses propagate_nan=False, unlike np.min.
+        result = np.fmin.reduce(
+            compute, axis=self._reduction_axes(axis, value.ndim), keepdims=keepdims
+        )
+        return Tile(np.asarray(result, dtype=dtype))
+
+    def prod(
+        self,
+        x,
+        /,
+        axis=None,
+        *,
+        keepdims=False,
+        rounding_mode=None,
+        flush_to_zero=False,
+    ):
+        self._check_cpu_math_options(rounding_mode, flush_to_zero)
+        if not isinstance(keepdims, bool):
+            raise TypeError("keepdims must be a constant bool")
+        value = _tile_value(x)
+        if value.dtype == np.dtype(np.bool_):
+            value = value.astype(np.int32)
+        axes = sorted(self._reduction_axes(axis, value.ndim), reverse=True)
+        result = Tile(value)
+        # Cast after each scalar multiply; do not use NumPy's int64 accumulator
+        # or accumulate an entire float16 reduction in float32.
+        for a in axes:
+            result = self.reduce(result, a, operator.mul, 1, keepdims=keepdims)
+        return result
+
+    def argmin(self, x, /, axis=None, *, keepdims=False):
+        return self._arg_reduce(x, axis, keepdims, maximum=False)
+
+    def cumprod(
+        self, x, /, axis=0, *, reverse=False, rounding_mode=None, flush_to_zero=False
+    ):
+        self._check_cpu_math_options(rounding_mode, flush_to_zero)
+        value = _tile_value(x)
+        if value.dtype == np.dtype(np.bool_):
+            value = value.astype(np.int32)
+        return self.scan(Tile(value), axis, operator.mul, 1, reverse=reverse)
+
+    def _fold(self, x, axis, func, identity, *, scan, reverse=False, keepdims=False):
+        """Sequential CPU reference for a pure associative scalar callback."""
+        if not isinstance(reverse, bool) or not isinstance(keepdims, bool):
+            raise TypeError("reverse and keepdims must be constant bools")
+        if isinstance(axis, (Tile, tuple, bool, np.bool_)) or axis is None:
+            raise TypeError("Custom reduce/scan accepts one constant integer axis")
+        tuple_mode = isinstance(x, tuple)
+        inputs = x if tuple_mode else (x,)
+        if not inputs or any(not isinstance(t, Tile) for t in inputs):
+            raise TypeError(
+                "Custom reduce/scan requires a Tile or nonempty tuple of Tiles"
+            )
+        ids = identity if tuple_mode else (identity,)
+        if not isinstance(ids, tuple) or len(ids) != len(inputs):
+            raise TypeError("Identity tuple must match the number of input tiles")
+        if any(not isinstance(i, (bool, int, float)) for i in ids):
+            raise TypeError("Identities must be constant Python scalar values")
+        # Unwrap cuTile's host-only guard before calling the reduction body.
+        while _is_tile_function(func):
+            func = func.__wrapped__
+        if not callable(func):
+            raise TypeError("func must be callable")
+        values = np.broadcast_arrays(*(_tile_value(t) for t in inputs))
+        shape = values[0].shape
+        a = _normalize_axis(axis, len(shape))
+        row_shape = shape[:a] + shape[a + 1 :]
+        output_shape = shape if scan else row_shape
+        outputs = [np.empty(output_shape, dtype=v.dtype) for v in values]
+        initial = tuple(Tile(i, t.dtype) for i, t in zip(ids, inputs))
+        positions = range(shape[a] - 1, -1, -1) if reverse else range(shape[a])
+        for row in np.ndindex(row_shape):
+            acc = initial
+            for position in positions:
+                key = row[:a] + (position,) + row[a:]
+                current = tuple(Tile(v[key]) for v in values)
+                # reverse=True is a prefix over the reversed sequence.
+                combined = func(*acc, *current)
+                results = combined if tuple_mode else (combined,)
+                if not isinstance(results, tuple) or len(results) != len(inputs):
+                    raise TypeError("Callback result structure must match its inputs")
+                checked = []
+                for result, template in zip(results, inputs):
+                    if _tile_value(result).shape != ():
+                        raise TypeError("Callback must return scalar Tiles")
+                    checked.append(Tile(_implicit_value(result, template.dtype)))
+                acc = tuple(checked)
+                if scan:
+                    for out, result in zip(outputs, acc):
+                        out[key] = result.data
+            if not scan:
+                for out, result in zip(outputs, acc):
+                    out[row] = result.data
+        if not scan and keepdims:
+            outputs = [np.expand_dims(out, a) for out in outputs]
+        tiles = tuple(Tile(out) for out in outputs)
+        return tiles if tuple_mode else tiles[0]
+
+    def reduce(self, x, /, axis, func, identity, *, keepdims=False):
+        return self._fold(x, axis, func, identity, scan=False, keepdims=keepdims)
+
+    def scan(self, x, /, axis, func, identity, *, reverse=False):
+        return self._fold(x, axis, func, identity, scan=True, reverse=reverse)
+
+    @staticmethod
+    def _byte_dtype(dtype):
+        if dtype == ct.bool_:
+            raise TypeError("Byte reinterpretation to/from bool is not supported")
+        if dtype in (ct.tfloat32, getattr(ct, "float4_e2m1fn", None)):
+            raise NotImplementedError(
+                "TF32/sub-byte byte reinterpretation is unsupported"
+            )
+        try:
+            storage = _numpy_dtype(dtype)
+        except (KeyError, TypeError) as exc:
+            raise NotImplementedError(f"No registered CPU storage for {dtype}") from exc
+        return storage
+
+    def bitcast(self, x, /, dtype):
+        value = _unary_value(x)
+        if value.dtype == np.dtype(np.bool_):
+            raise TypeError("bitcast from bool is not supported")
+        if isinstance(x, Tile) and x.dtype == ct.tfloat32:
+            raise NotImplementedError(
+                "Raw TF32 representation is not modeled by float32 storage"
+            )
+        target = self._byte_dtype(dtype)
+        if value.dtype.itemsize != target.itemsize:
+            raise TypeError("bitcast requires equal element bit widths")
+        # Flatten first: NumPy's contiguity and 0d view restrictions must not
+        # change the logical tile shape or reject a scalar bitcast.
+        return Tile(
+            np.array(value, copy=True, order="C")
+            .reshape(-1)
+            .view(target)
+            .reshape(value.shape)
+        )
+
+    def pack_to_bytes(self, x, /):
+        value = _unary_value(x)
+        if value.dtype == np.dtype(np.bool_):
+            raise TypeError("pack_to_bytes from bool is not supported")
+        if isinstance(x, Tile) and x.dtype == ct.tfloat32:
+            raise NotImplementedError(
+                "Raw TF32 representation is not modeled by float32 storage"
+            )
+        if value.dtype.hasobject or value.dtype.kind in "SUcMm":
+            raise TypeError("pack_to_bytes requires numeric tile storage")
+        if not np.little_endian:
+            raise NotImplementedError(
+                "Byte packing is implemented for little-endian hosts only"
+            )
+        # Current Tile cannot represent a logical 4-bit element. Do not
+        # accept an ml_dtypes float4 array as an unpacked byte-per-value tile.
+        if value.dtype.name == "float4_e2m1fn":
+            raise NotImplementedError("Sub-byte packing needs logical dtype metadata")
+        return Tile(np.array(value, copy=True, order="C").reshape(-1).view(np.uint8))
+
+    def unpack_from_bytes(self, x, /, dtype):
+        value = _tile_value(x)
+        if value.ndim != 1 or value.dtype != np.dtype(np.uint8):
+            raise TypeError("unpack_from_bytes requires a 1D uint8 tile")
+        target = self._byte_dtype(dtype)
+        if value.size % target.itemsize:
+            raise ValueError("Byte count must be divisible by the target element size")
+        if not np.little_endian:
+            raise NotImplementedError(
+                "Byte unpacking is implemented for little-endian hosts only"
+            )
+        return Tile(np.array(value, copy=True, order="C").view(target))
+
+    def astile(self, value, /, *, dtype):
+        def build(item):
+            if isinstance(item, tuple):
+                _validate_tile_shape((len(item),))
+                children = [build(child) for child in item]
+                if any(child.shape != children[0].shape for child in children):
+                    raise ValueError("astile requires uniform nested tuple shapes")
+                return np.stack(children)
+            if not isinstance(item, (Tile, bool, int, float, np.generic)):
+                raise TypeError("astile accepts a scalar or nested tuple of scalars")
+            scalar = _tile_value(item)
+            if scalar.shape != ():
+                raise TypeError("astile tuple leaves must be scalar values")
+            return self.astype(Tile(scalar), dtype).data
+
+        return Tile(build(value))
+
+    def assert_(self, cond, /, message=None):
+        if not isinstance(cond, Tile) or cond.data.dtype != np.dtype(np.bool_):
+            raise TypeError("assert_ requires a boolean Tile")
+        if message is not None and not isinstance(message, str):
+            raise TypeError("assert_ message must be a string or None")
+        if not np.all(cond.data):
+            raise AssertionError("" if message is None else message)
+
+    def static_assert(self, condition, message=None, /):
+        if isinstance(condition, (Tile, Array)):
+            raise TypeError("static_assert requires a constant condition")
+        if not condition:
+            raise AssertionError(message or "static assertion failed")
+
+    def static_eval(self, expr, /):
+        if isinstance(expr, (Tile, Array)):
+            raise TypeError("static_eval requires a constant expression")
+        return expr
+
+    def ensure_constant(self, value, /):
+        return self.static_eval(value)
+
+    def grid_dependency_control_wait(self):
+        raise NotImplementedError(
+            "Programmatic launch dependencies require GPU execution"
+        )
+
+    def grid_dependency_control_launch_dependents(self):
+        raise NotImplementedError(
+            "Programmatic launch dependencies require GPU execution"
+        )
+
+    def static_iter(self, iterable, /):
+        # Snapshot the iterable before unrolling, as the compiler does.
+        if isinstance(iterable, (Tile, Array)):
+            raise TypeError("static_iter requires a Python iterable")
+        return iter(tuple(iterable))
+
+    def assume_divisible_by(self, x, divisor):
+        value = _tile_value(x)
+        if value.shape != () or value.dtype.kind not in "iu":
+            raise TypeError("assume_divisible_by requires an integer scalar")
+        if not isinstance(divisor, int) or isinstance(divisor, bool) or divisor <= 0:
+            raise ValueError("divisor must be a positive constant integer")
+        if int(value) % divisor:
+            raise ValueError("assume_divisible_by claim is false")
+        return x
+
+    def num_blocks(self, axis):
+        if not isinstance(axis, int) or isinstance(axis, bool) or not 0 <= axis <= 2:
+            raise ValueError("num_blocks axis must be a constant integer in [0, 2]")
+        return Tile(
+            np.asarray((tuple(self.grid_dims) + (1, 1, 1))[axis], dtype=np.int32)
+        )
+
+    class _AdvancedSlice:
+        """CPU value for ct.Slice; retain start and length without executing a stub."""
+
+        def __init__(self, start, length):
+            value = _tile_value(start)
+            if value.shape != () or value.dtype.kind != "i":
+                raise TypeError("Slice start must be a signed integer scalar")
+            if not isinstance(length, int) or isinstance(length, bool):
+                raise TypeError("Slice length must be a constant integer")
+            _validate_tile_shape((length,))
+            self.start = int(value)
+            self.length = length
+
+    def Slice(self, start, length, /):
+        return self._AdvancedSlice(start, length)
+
+    def _advanced_index_keys(self, array, indices):
+        if (
+            array.ndim < 2
+            or not isinstance(indices, tuple)
+            or len(indices) != array.ndim
+        ):
+            raise TypeError(
+                "Advanced indexing requires rank >= 2 and one index per axis"
+            )
+        vectors = []
+        sparse = 0
+        sparse_vector = None
+        for item in indices:
+            if isinstance(item, self._AdvancedSlice):
+                vector = np.arange(item.length, dtype=np.int64) + item.start
+            elif (
+                isinstance(item, Tile)
+                and item.ndim == 1
+                and item.data.dtype.kind in "iu"
+            ):
+                sparse += 1
+                vector = item.data
+                sparse_vector = vector
+            else:
+                raise TypeError("Indices must be 1D integer Tiles or ct.Slice values")
+            vectors.append(vector)
+        if sparse != 1:
+            raise ValueError("Advanced indexing requires exactly one sparse index tile")
+        _validate_tile_shape(tuple(len(v) for v in vectors))
+        # Duplicate sparse indices would introduce unordered conflicting stores.
+        # Loads are still well-defined; the store method checks this flag.
+        repeated = np.unique(sparse_vector).size != sparse_vector.size
+        keys = []
+        for a, vector in enumerate(vectors):
+            shape = [1] * array.ndim
+            shape[a] = vector.size
+            keys.append(Tile(vector.reshape(shape)))
+        return tuple(keys), repeated
+
+    @staticmethod
+    def _check_memory_hints(latency, allow_tma):
+        if latency is not None and (
+            not isinstance(latency, int) or not 1 <= latency <= 10
+        ):
+            raise ValueError("latency must be None or an integer in [1, 10]")
+        if allow_tma is not None and not isinstance(allow_tma, bool):
+            raise TypeError("allow_tma must be None or a constant bool")
+        # Valid hints affect performance only, not CPU memory semantics.
+
+    def load_advanced_indexing(
+        self,
+        array,
+        indices,
+        /,
+        *,
+        padding_mode=ct.PaddingMode.UNDETERMINED,
+        latency=None,
+        allow_tma=None,
+    ):
+        self._check_memory_hints(latency, allow_tma)
+        keys, _ = self._advanced_index_keys(array, indices)
+        _, valid = _indexed_access(array, keys)
+        if not np.any(valid):
+            raise NotImplementedError(
+                "Entirely out-of-bounds advanced loads are undefined"
+            )
+        if padding_mode == ct.PaddingMode.UNDETERMINED:
+            if not np.all(valid):
+                raise NotImplementedError(
+                    "Cannot supply a defined value for undetermined padding"
+                )
+            padding = 0
+        else:
+            modes = {
+                ct.PaddingMode.ZERO: 0,
+                ct.PaddingMode.NEG_ZERO: -0.0,
+                ct.PaddingMode.NAN: np.nan,
+                ct.PaddingMode.POS_INF: np.inf,
+                ct.PaddingMode.NEG_INF: -np.inf,
+            }
+            if padding_mode not in modes:
+                raise ValueError("Unsupported padding mode")
+            if padding_mode != ct.PaddingMode.ZERO and not _is_float(array.data.dtype):
+                raise TypeError("Nonzero padding requires a floating-point array")
+            padding = modes[padding_mode]
+        return self.gather(array, keys, padding_value=padding, check_bounds=True)
+
+    def store_advanced_indexing(
+        self, array, indices, tile, /, *, latency=None, allow_tma=None
+    ):
+        self._check_memory_hints(latency, allow_tma)
+        keys, repeated = self._advanced_index_keys(array, indices)
+        _, valid = _indexed_access(array, keys)
+        if not np.any(valid):
+            raise NotImplementedError(
+                "Entirely out-of-bounds advanced stores are undefined"
+            )
+        if repeated:
+            raise NotImplementedError(
+                "Duplicate sparse store indices have unordered write semantics"
+            )
+        if not isinstance(tile, Tile) or tile.shape != valid.shape:
+            raise ValueError(
+                "Stored Tile shape must exactly match the index tile shape"
+            )
+        value = Tile(_implicit_value(tile, array.dtype))
+        return self.scatter(array, keys, value, check_bounds=True)
+
+    def printf(self, format, *args):
+        """Format tile values for CPU diagnostics."""
+        import re
+
+        if not isinstance(format, str):
+            raise TypeError("printf format must be a string")
+        if any(not isinstance(arg, Tile) for arg in args):
+            raise TypeError("printf arguments must be Tiles")
+        values = iter(args)
+
+        def render(match):
+            if match[0] == "%%":
+                return "%"
+            options, specifier = match.groups()
+            if specifier is None:
+                raise ValueError("Unsupported or invalid printf format")
+            if specifier in "aA":
+                raise NotImplementedError("Hexadecimal float formatting is unsupported")
+            try:
+                value = next(values).data
+            except StopIteration:
+                raise ValueError("Not enough printf arguments") from None
+            integer = value.dtype.kind in "biu"
+            if (integer and specifier not in "diuoxX") or (
+                not integer
+                and (not _is_float(value.dtype) or specifier not in "eEfFgG")
+            ):
+                raise TypeError("printf specifier does not match tile dtype")
+
+            def scalar_format(item):
+                number = int(item) if integer else float(item)
+                if integer and specifier in "uoxX":
+                    bits = 1 if value.dtype.kind == "b" else value.dtype.itemsize * 8
+                    number &= (1 << bits) - 1
+                return ("%" + options + specifier) % number
+
+            return self._format_tile(value, scalar_format)
+
+        # The Tile dtype supplies the width, so C length modifiers are skipped.
+        pattern = r"%%|%([ #+0-]*\d*(?:\.\d+)?)(?:hh|h|ll|l)?([diuoxXeEfFgGaA])|%"
+        result = re.sub(pattern, render, format)
+        if next(values, None) is not None:
+            raise ValueError("Too many printf arguments")
+        builtins.print(result, end="")
+
+    @staticmethod
+    def _format_tile(value, scalar_format):
+        if value.ndim == 0:
+            return scalar_format(value[()])
+        return (
+            "["
+            + ", ".join(Builder._format_tile(child, scalar_format) for child in value)
+            + "]"
+        )
+
+    def print(self, *args, sep=" ", end="\n"):
+        if not isinstance(sep, str) or not isinstance(end, str):
+            raise TypeError("print sep and end must be strings")
+
+        def render(value, nested=False):
+            if isinstance(value, Tile):
+                return self._format_tile(value.data, lambda item: str(item.item()))
+            if isinstance(value, tuple):
+                contents = ", ".join(render(item, True) for item in value)
+                return "(" + contents + ("," if len(value) == 1 else "") + ")"
+            if isinstance(value, str):
+                return repr(value) if nested else value
+            if isinstance(value, (bool, int, float, ct.DType)):
+                return str(value)
+            raise NotImplementedError(
+                "CPU print does not support this cuTile value type"
+            )
+
+        builtins.print(*(render(arg) for arg in args), sep=sep, end=end)
+
+    @staticmethod
+    def _scaled_operands(x, x_scale, y, y_scale):
+        from cuda.tile._datatype import _resolve_mma_scaled_supported_dtype
+
+        _resolve_mma_scaled_supported_dtype(
+            x.dtype, x_scale.dtype, y.dtype, y_scale.dtype, ct.float32
+        )
+        if x.dtype not in (ct.float8_e4m3fn, ct.float8_e5m2):
+            raise NotImplementedError("Sub-byte scaled matmul is unsupported")
+
+        def expand(value, scale, axis):
+            if value.ndim != scale.ndim or value.ndim not in (2, 3):
+                raise ValueError("Scaled matmul requires matching matrix ranks")
+            if any(
+                a != b
+                for i, (a, b) in enumerate(zip(value.shape, scale.shape))
+                if i != axis % value.ndim
+            ):
+                raise ValueError("Invalid scale shape")
+            size, remainder = divmod(value.shape[axis], scale.shape[axis])
+            if remainder or size != 32:
+                raise ValueError("FP8 scaling blocks must have 32 elements")
+            # Avoid overflowing one scaled operand before reciprocal scales cancel.
+            return value.data.astype(np.float64) * np.repeat(
+                scale.data.astype(np.float64), size, axis=axis
+            )
+
+        return expand(x, x_scale, -1), expand(y, y_scale, -2)
+
+    def mma_scaled(self, x, x_scale, y, y_scale, /, acc):
+        if acc.dtype != ct.float32:
+            raise TypeError("Scaled matmul requires a float32 accumulator")
+        lhs, rhs = self._scaled_operands(x, x_scale, y, y_scale)
+        result = np.matmul(lhs, rhs)
+        if result.shape != acc.shape:
+            raise ValueError("Invalid scaled matmul accumulator shape")
+        return Tile(np.asarray(result + acc.data, dtype=np.float32))
 
 
 cutile_builder = Builder()
@@ -1142,12 +1815,6 @@ def cutile_patch_lang(scope=None):
             setattr(ct, name, value)
         else:
             scope.set_attr(ct, name, value)
-
-
-def cutile_unpatch_lang(scope=None):
-    """Restore the language functions saved by a patch scope."""
-    if scope is not None:
-        scope.restore()
 
 
 @contextmanager
@@ -1281,11 +1948,19 @@ def _wrap_argument(arg, scalar_dtype=None):
             torch.float8_e4m3fn: torch.uint8,
             torch.float8_e5m2: torch.uint8,
         }
+        if hasattr(torch, "float8_e8m0fnu"):
+            storage[torch.float8_e8m0fnu] = torch.uint8
         if arg.dtype in storage:
             dtype = _numpy_dtype(arg.dtype)
             return Array(arg.view(storage[arg.dtype]).numpy().view(dtype))
         return Array(arg.numpy())
     raise TypeError(f"Unsupported cuTile argument: {type(arg).__name__}")
+
+
+def cutile_unpatch_lang(scope=None):
+    """Restore the language functions saved by a patch scope."""
+    if scope is not None:
+        scope.restore()
 
 
 class CuTileInterpretedFunction:

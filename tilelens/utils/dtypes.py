@@ -31,6 +31,7 @@ STORAGE_DTYPES: dict[DTypeLike, np.dtype | None] = {
     "float8_e4m3": np.dtype(ml_dtypes.float8_e4m3),
     "float8_e5m2": np.dtype(ml_dtypes.float8_e5m2),
     "float8_e4m3fn": np.dtype(ml_dtypes.float8_e4m3fn),
+    "float8_e8m0fnu": np.dtype(ml_dtypes.float8_e8m0fnu),
     "float4_e2m1fn": np.dtype(ml_dtypes.float4_e2m1fn),
 }
 STORAGE_DTYPES |= {dtype: dtype for dtype in STORAGE_DTYPES.values()}

@@ -115,7 +115,15 @@ def _cutile_indexed_adapter(
 def _cutile_dot_adapter(x: Any, y: Any, *_args: Any, **_kwargs: Any) -> AdapterResult:
     assert HAS_CUTILE
     # Copy read-only tiles before the visualizer converts them to Torch tensors.
+    if len(_args) == 3:
+        lhs_data, rhs_data = cutile_builder._scaled_operands(x, y, _args[0], _args[1])
+        return AdapterResult(Array(lhs_data), Array(rhs_data))
     lhs, rhs = Array(x.data), Array(y.data)
+    if lhs.data.dtype.kind in "iu":
+        lhs, rhs = (
+            Array(lhs.data.astype(np.float32)),
+            Array(rhs.data.astype(np.float32)),
+        )
     return AdapterResult(Array(lhs.numpy().copy()), Array(rhs.numpy().copy()))
 
 
@@ -141,6 +149,7 @@ if HAS_CUTILE:
             "store": Store,
             "matmul": Dot,
             "mma": Dot,
+            "mma_scaled": Dot,
             "sum": ReduceSum,
         }
     }
