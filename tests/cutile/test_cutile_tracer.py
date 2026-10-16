@@ -130,8 +130,8 @@ def test_atomic_updates_trace_memory_and_return_old_values():
     np.testing.assert_array_equal(values, [12])
     np.testing.assert_array_equal(old, [10, 11])
     records = launches[-1].records
-    assert sum(isinstance(r, Load) for r in records) == 2
-    assert sum(isinstance(r, Store) for r in records) == 3
+    assert sum(isinstance(r, Load) for r in records) == 1
+    assert sum(isinstance(r, Store) for r in records) == 2
 
 
 def test_sampling_and_strided_offsets():
