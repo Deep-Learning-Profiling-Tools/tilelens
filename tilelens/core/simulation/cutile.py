@@ -8,10 +8,11 @@ from functools import wraps
 import inspect
 import itertools
 import operator
+import sys
 import threading
 import types
 import warnings
-from typing import Annotated, Any, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, get_args, get_origin
 
 import numpy as np
 
@@ -23,6 +24,11 @@ except ModuleNotFoundError as exc:
     raise ModuleNotFoundError(
         "Install cuda-tile to use the cuTile interpreter."
     ) from exc
+
+try:
+    from cuda.tile._dispatch_mode import DispatchMode
+except ImportError:  # cuTile 1.0 tile-function wrappers have no dispatch hook.
+    DispatchMode = None
 
 from ..frontend.base import get_frontend
 
@@ -1051,9 +1057,34 @@ class Builder:
             **kwargs,
         )
 
+    # Array dtypes accepted by cuTile's atomic lowering.
+    _ATOMIC_INT_DTYPES = ("int32", "int64", "uint32", "uint64")
+    _ATOMIC_DTYPES = _ATOMIC_INT_DTYPES + ("float32", "float64")
+    _ATOMIC_ADD_DTYPES = _ATOMIC_DTYPES + ("float16", "bfloat16")
+
     def _atomic(
-        self, array, indices, update, operation, *, check_bounds=True, expected=None
+        self,
+        array,
+        indices,
+        update,
+        operation,
+        *,
+        check_bounds=True,
+        expected=None,
+        dtypes=_ATOMIC_DTYPES,
+        bitwise=False,
     ):
+        if array.dtype not in tuple(getattr(ct, name) for name in dtypes):
+            raise TypeError(f"Unsupported atomic array dtype: {array.dtype}")
+        if (
+            bitwise
+            and isinstance(update, (Tile, np.ndarray, np.generic))
+            and _promotion_type(update) != array.dtype
+        ):
+            raise TypeError(
+                "Bitwise atomic operations require the update dtype "
+                f"({_promotion_type(update)}) to match the array dtype ({array.dtype})"
+            )
         keys, valid = _indexed_access(array, indices, check_bounds=check_bounds)
         updates = np.broadcast_to(_implicit_value(update, array.dtype), valid.shape)
         previous = self.gather(array, indices, check_bounds=check_bounds)
@@ -1077,6 +1108,19 @@ class Builder:
         if comparisons is not None:
             old[~valid] = comparisons[~valid]
             comparisons = comparisons[valid]
+        if len(starts) - 1 == len(order):
+            # Distinct addresses do not interact, so apply the operation at once.
+            if operation == "exchange":
+                new_values = valid_updates
+            elif operation == "cas":
+                new_values = np.where(
+                    old_values == comparisons, valid_updates, old_values
+                )
+            else:
+                new_values = operation(
+                    old_values, valid_updates, dtype=array.data.dtype
+                )
+            starts = starts[:1]
         for start, stop in zip(starts[:-1], starts[1:]):
             group = order[start:stop]
             if not group.size:
@@ -1104,27 +1148,66 @@ class Builder:
         return Tile(old)
 
     def atomic_add(self, array, indices, update, /, *, check_bounds=True, **kwargs):
-        return self._atomic(array, indices, update, np.add, check_bounds=check_bounds)
+        return self._atomic(
+            array,
+            indices,
+            update,
+            np.add,
+            check_bounds=check_bounds,
+            dtypes=self._ATOMIC_ADD_DTYPES,
+        )
 
     def atomic_max(self, array, indices, update, /, *, check_bounds=True, **kwargs):
-        return self._atomic(array, indices, update, np.fmax, check_bounds=check_bounds)
+        return self._atomic(
+            array,
+            indices,
+            update,
+            np.fmax,
+            check_bounds=check_bounds,
+            dtypes=self._ATOMIC_INT_DTYPES,
+        )
 
     def atomic_min(self, array, indices, update, /, *, check_bounds=True, **kwargs):
-        return self._atomic(array, indices, update, np.fmin, check_bounds=check_bounds)
+        return self._atomic(
+            array,
+            indices,
+            update,
+            np.fmin,
+            check_bounds=check_bounds,
+            dtypes=self._ATOMIC_INT_DTYPES,
+        )
 
     def atomic_and(self, array, indices, update, /, *, check_bounds=True, **kwargs):
         return self._atomic(
-            array, indices, update, np.bitwise_and, check_bounds=check_bounds
+            array,
+            indices,
+            update,
+            np.bitwise_and,
+            check_bounds=check_bounds,
+            dtypes=self._ATOMIC_INT_DTYPES,
+            bitwise=True,
         )
 
     def atomic_or(self, array, indices, update, /, *, check_bounds=True, **kwargs):
         return self._atomic(
-            array, indices, update, np.bitwise_or, check_bounds=check_bounds
+            array,
+            indices,
+            update,
+            np.bitwise_or,
+            check_bounds=check_bounds,
+            dtypes=self._ATOMIC_INT_DTYPES,
+            bitwise=True,
         )
 
     def atomic_xor(self, array, indices, update, /, *, check_bounds=True, **kwargs):
         return self._atomic(
-            array, indices, update, np.bitwise_xor, check_bounds=check_bounds
+            array,
+            indices,
+            update,
+            np.bitwise_xor,
+            check_bounds=check_bounds,
+            dtypes=self._ATOMIC_INT_DTYPES,
+            bitwise=True,
         )
 
     def atomic_xchg(self, array, indices, update, /, *, check_bounds=True, **kwargs):
@@ -1817,6 +1900,15 @@ def cutile_patch_lang(scope=None):
             scope.set_attr(ct, name, value)
 
 
+def _code_names(code):
+    """Collect names referenced by a code object and its nested scopes."""
+    names = dict.fromkeys(code.co_names)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names.update(_code_names(const))
+    return names
+
+
 @contextmanager
 def _execution_scope(fn):
     """Patch referenced aliases and helper globals, then restore them."""
@@ -1864,7 +1956,8 @@ def _execution_scope(fn):
             original = getattr(builtins, name)
             if namespace.get(name, original) is original:
                 set_global(namespace, name, tile_minmax(original, operation))
-        for name in function.__code__.co_names:
+        names = _code_names(function.__code__)
+        for name in names:
             value = namespace.get(name)
             replacement = patched_value(value)
             if replacement is not value:
@@ -1875,7 +1968,7 @@ def _execution_scope(fn):
             elif isinstance(value, types.ModuleType) and not value.__name__.startswith(
                 ("cuda", "numpy", "tilelens")
             ):
-                for attribute in function.__code__.co_names:
+                for attribute in names:
                     helper = getattr(value, attribute, None)
                     replacement = patched_value(helper)
                     if replacement is not helper:
@@ -1893,6 +1986,16 @@ def _execution_scope(fn):
             patch_function(replacement)
 
     with scope:
+        if DispatchMode is not None:
+            # Like Triton's JITFunction.__call__, run tile functions reached
+            # through values the static scan cannot see, patching them on call.
+            class InterpreterMode(DispatchMode):
+                def call_tile_function_from_host(self, func, args, kwargs):
+                    function = inspect.unwrap(func)
+                    patch_function(function)
+                    return function(*args, **kwargs)
+
+            scope.enter_context(InterpreterMode().as_current())
         patch_function(fn)
         yield fn
 
@@ -1905,7 +2008,13 @@ def _parameter_annotations(fn):
         type(get_args(scalar_alias)[1]) if scalar_alias is not None else ()
     )
     result = {}
-    for name, annotation in get_type_hints(fn, include_extras=True).items():
+    for name, annotation in inspect.get_annotations(fn).items():
+        if isinstance(annotation, str):
+            try:
+                annotation = eval(annotation, fn.__globals__)
+            except Exception:
+                # Annotations that only resolve for type checkers carry no metadata.
+                continue
         if get_origin(annotation) is not Annotated:
             continue
         metadata = get_args(annotation)[1:]
@@ -1935,11 +2044,8 @@ def _wrap_argument(arg, scalar_dtype=None):
         return Array(arg)
     if isinstance(arg, (bool, int, float, np.generic)):
         return Tile(arg)
-    if arg is None or isinstance(arg, (str, tuple)):
-        return arg
-    import torch
-
-    if isinstance(arg, torch.Tensor):
+    torch = sys.modules.get("torch")
+    if torch is not None and isinstance(arg, torch.Tensor):
         if arg.device.type != "cpu":
             raise TypeError("cuTile interpretation requires CPU tensors")
         arg = arg.detach()
@@ -1954,7 +2060,8 @@ def _wrap_argument(arg, scalar_dtype=None):
             dtype = _numpy_dtype(arg.dtype)
             return Array(arg.view(storage[arg.dtype]).numpy().view(dtype))
         return Array(arg.numpy())
-    raise TypeError(f"Unsupported cuTile argument: {type(arg).__name__}")
+    # Like Triton's _implicit_cvt, leave other values (tuples, dtypes) unchanged.
+    return arg
 
 
 def cutile_unpatch_lang(scope=None):
@@ -1984,13 +2091,24 @@ class CuTileInterpretedFunction:
         grid_dims += (1,) * (3 - len(grid_dims))
         cutile_builder.set_grid_dim(*grid_dims)
 
-        bound = inspect.signature(self.fn).bind(*args, **kwargs)
+        signature = inspect.signature(self.fn)
+        bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         annotations = _parameter_annotations(self.fn)
         for name, arg in bound.arguments.items():
             is_constant, scalar_dtype = annotations.get(name, (False, None))
-            if not is_constant:
-                bound.arguments[name] = _wrap_argument(arg, scalar_dtype)
+            if is_constant:
+                continue
+            kind = signature.parameters[name].kind
+            if kind is inspect.Parameter.VAR_POSITIONAL:
+                arg = tuple(_wrap_argument(item, scalar_dtype) for item in arg)
+            elif kind is inspect.Parameter.VAR_KEYWORD:
+                arg = {
+                    key: _wrap_argument(item, scalar_dtype) for key, item in arg.items()
+                }
+            else:
+                arg = _wrap_argument(arg, scalar_dtype)
+            bound.arguments[name] = arg
         args, kwargs = bound.args, bound.kwargs
 
         if client_manager is not None:

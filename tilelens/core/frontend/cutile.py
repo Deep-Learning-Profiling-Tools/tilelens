@@ -115,7 +115,8 @@ def _cutile_indexed_adapter(
 def _cutile_dot_adapter(x: Any, y: Any, *_args: Any, **_kwargs: Any) -> AdapterResult:
     assert HAS_CUTILE
     # Copy read-only tiles before the visualizer converts them to Torch tensors.
-    if len(_args) == 3:
+    # mma takes (acc,); mma_scaled takes (x_scale, y, y_scale[, acc]) with acc= allowed.
+    if len(_args) >= 2:
         lhs_data, rhs_data = cutile_builder._scaled_operands(x, y, _args[0], _args[1])
         return AdapterResult(Array(lhs_data), Array(rhs_data))
     lhs, rhs = Array(x.data), Array(y.data)
