@@ -1,4 +1,4 @@
-from copy import deepcopy
+import copy
 from collections.abc import Callable
 from typing import Any
 from ..utils.traceback_utils import CODE_KEYS, get_code_key
@@ -83,25 +83,36 @@ class KernelTraceSupport:
         fn()
         return (1.0, 1.0, 1.0)
 
-    def _interpreter_runner(self, runner: Any, interpreted_fn: Any) -> Any:
-        if self._is_autotuner(runner):
-            runner.fn = interpreted_fn
-            # Kernel Cache: replace the benchmark with a dummy to skip performance testing.
-            runner._do_bench = self.dummy_benchmarker
-            return runner
-        if self._is_heuristics(runner):
-            runner.fn = interpreted_fn
-            return runner
-        return interpreted_fn
-
-    def _warmup_runner(self, runner: Any, jit_fn: Any | None) -> Any | None:
+    def _rebuild_runner(self, runner: Any, leaf: Any) -> Any:
+        """Rebuild ``runner``'s Autotuner/Heuristics chain from shallow copies
+        (a JITFunction holds an RLock, so no deepcopy), with ``leaf`` in place
+        of its kernel, so the user's chain is never mutated."""
         if not (self._is_autotuner(runner) or self._is_heuristics(runner)):
-            return jit_fn
-        if jit_fn is None:
-            return None
-        warmup_runner = deepcopy(runner)
-        warmup_runner.fn = jit_fn
-        return warmup_runner
+            return leaf
+        layer = copy.copy(runner)
+        layer.fn = self._rebuild_runner(runner.fn, leaf)
+        if self._is_autotuner(layer):
+            # Read by Autotuner.run (the interpreted chain), not by .warmup.
+            layer.cache = {}  # copy.copy shares the user's
+            # check_disk_cache walks .fn down to a JITFunction, which the
+            # interpreted chain lacks.
+            layer.cache_results = False
+            layer.do_bench = self.dummy_benchmarker
+        else:
+            layer.warmup = self._heuristics_warmup(layer)
+        return layer
+
+    @staticmethod
+    def _heuristics_warmup(layer: Any) -> Callable:
+        # KernelInterface.warmup would pass warmup= a second time and skip
+        # fn.warmup, where the clients vote: fill in the heuristics, then call
+        # fn.warmup.
+        def warmup(*args, **kwargs):
+            for name, heur in layer.values.items():
+                kwargs[name] = heur({**dict(zip(layer.arg_names, args)), **kwargs})
+            return layer.fn.warmup(*args, **kwargs)
+
+        return warmup
 
     def _copy_callable_attrs(
         self,
@@ -160,8 +171,10 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
             self.jit_fn, self.base_fn, self.interpreted_fn = unpack_kernel(runner.fn)
         else:
             self.jit_fn, self.base_fn, self.interpreted_fn = unpack_kernel(runner)
-        self.runner = self._interpreter_runner(runner, self.interpreted_fn)
-        self.warmup_runner = self._warmup_runner(runner, self.jit_fn)
+        self.runner = self._rebuild_runner(runner, self.interpreted_fn)
+        self.warmup_runner = (
+            None if self.jit_fn is None else self._rebuild_runner(runner, self.jit_fn)
+        )
 
         self.arg_names = runner.arg_names
 
@@ -361,7 +374,7 @@ class GluonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
         )
         self.fn = runner
         self.arg_names = runner.arg_names
-        self.runner = self._interpreter_runner(runner, self.interpreted_fn)
+        self.runner = self._rebuild_runner(runner, self.interpreted_fn)
 
         TraceInterface.__init__(self, client)
         self._copy_callable_attrs(runner, self.base_fn)

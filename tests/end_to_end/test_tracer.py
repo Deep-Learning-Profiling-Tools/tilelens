@@ -218,8 +218,8 @@ def test_kernel_cache_autotune_with_dummy_benchmarker():
     traced_kernel = tilelens.trace(client=Sanitizer())(autotune_add_kernel_cache_on)
 
     # Verify dummy benchmarker is installed
-    if hasattr(traced_kernel, "runner") and hasattr(traced_kernel.runner, "_do_bench"):
-        bench_fn = traced_kernel.runner._do_bench
+    if hasattr(traced_kernel, "runner") and hasattr(traced_kernel.runner, "do_bench"):
+        bench_fn = traced_kernel.runner.do_bench
         assert (
             bench_fn is not None and bench_fn.__name__ == "dummy_benchmarker"
         ), f"Expected dummy_benchmarker, got: {bench_fn}"
