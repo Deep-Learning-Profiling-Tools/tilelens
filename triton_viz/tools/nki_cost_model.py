@@ -1007,6 +1007,40 @@ class ComputeCalibration:
 
 
 @dataclass
+class InstructionLatencyCalibration:
+    """Consumer-visible latency of one compute instruction (opt-in).
+
+    Level-B (`ComputeCalibration`) was fitted on *independent* instruction streams and so measures
+    the initiation interval: how soon the engine can start the next instruction. A consumer that
+    reads the instruction's result must instead wait for its latency, which dependent-chain controls
+    measure separately (`microbench/inf2_nki/configs/structure_latency_v1.json`, mode
+    `dependent_chain`). The scheduler keeps the engine busy for the initiation interval and makes the
+    result visible after ``max(initiation interval, latency)``, so dependent chains serialize on
+    latency while independent streams keep their throughput. One linear law per
+    ``(engine, dtype, input_streams)``: ``latency = startup_ns + ns_per_free_elem * free``.
+    """
+
+    points: dict[tuple[str, str, int], tuple[float, float]]
+
+    @classmethod
+    def from_csv(cls, path: str | Path) -> "InstructionLatencyCalibration":
+        points: dict[tuple[str, str, int], tuple[float, float]] = {}
+        with Path(path).open(encoding="utf-8", newline="") as file:
+            for row in csv.DictReader(file):
+                points[(row["engine"], row["dtype"], int(row["input_stream_count"]))] = (
+                    float(row["startup_ns"]), float(row["ns_per_free_elem"]))
+        return cls(points)
+
+    def latency_ns(self, engine: str, dtype: str, input_streams: int, free_dim: int) -> float | None:
+        point = self.points.get((engine, dtype, int(input_streams)))
+        if point is None:
+            point = self.points.get((engine, dtype, 1))
+        if point is None:
+            return None
+        return max(0.0, point[0] + point[1] * max(1, int(free_dim)))
+
+
+@dataclass
 class StructuredControlCalibration:
     """Interpolated points keyed by reusable structural grammar families."""
 
@@ -1573,6 +1607,9 @@ class CostModel:
     # NkiCompute/binary/reduce events cost their lowered-instruction count times
     # the measured single-instruction cost instead of the hardcoded VectorE fit.
     compute_calibration: ComputeCalibration | None = None
+    # Opt-in consumer-visible instruction latency (dependent chains); None keeps the
+    # initiation-interval-only behaviour byte-identical.
+    instruction_latency: InstructionLatencyCalibration | None = None
     structured_control_lowering: StructuredControlCalibration | None = None
     whole_program_routing: WholeProgramRoutingCalibration | None = None
     strided_dma_calibration: StridedDmaCalibration | None = None
@@ -1731,6 +1768,17 @@ class CostModel:
                 self.hbm_bandwidth_bytes_per_ns,
             )
         return self.dma_startup_ns + nbytes / bandwidth
+
+    def result_ready_ns(self, event: dict[str, Any], engine: str, duration: float) -> float:
+        """Time from issue until the op's result is visible to a consumer."""
+        if self.instruction_latency is None or event.get("op") not in ("binary", "compute", "reduce_sum"):
+            return duration
+        free_dim = _free_dim(event)
+        if free_dim is None:
+            return duration
+        latency = self.instruction_latency.latency_ns(
+            engine, _compute_value_dtype(event), _input_stream_count(event), free_dim)
+        return duration if latency is None else max(duration, latency)
 
     def cost_ns(self, event: dict[str, Any]) -> float:
         """Return the estimated duration in ns for one trace event."""
@@ -2841,6 +2889,8 @@ def simulate(
 
         start = earliest
         end = start + duration
+        # Result visibility (>= engine release); equal to `end` unless instruction latency is modelled.
+        ready = start + model.result_ready_ns(event, engine, duration)
 
         for slot_index in slot_indices:
             slots[slot_index] = end
@@ -2858,7 +2908,7 @@ def simulate(
                 for entry in writers.get(key, ())
                 for remainder in _subtract_interval(entry, lo, hi)
             ]
-            writers[key].append((lo, hi, end, engine, version))
+            writers[key].append((lo, hi, ready, engine, version))
             readers[key] = [
                 remainder
                 for entry in readers.get(key, ())
@@ -2877,10 +2927,10 @@ def simulate(
             )
         )
         engine_busy[engine] = engine_busy.get(engine, 0.0) + duration
-        makespan = max(makespan, end)
+        makespan = max(makespan, ready)
         micro_event_id = event.get("micro_event_id")
         if micro_event_id is not None:
-            micro_event_end[str(micro_event_id)] = (end, engine)
+            micro_event_end[str(micro_event_id)] = (ready, engine)
 
     # Compose control-learned whole-program routing into the resource model.
     # The source DAG still determines ordering/overlap; calibrated aggregate
