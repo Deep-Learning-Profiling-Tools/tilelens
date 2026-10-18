@@ -29,6 +29,7 @@ from triton_viz.tools.nki_cost_model import (
     _input_stream_count,
     eliminate_redundant_hbm_loads,
     simulate,
+    InstructionLatencyCalibration,
 )
 
 FIELDS = [
@@ -148,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dma-write-surface-csv", type=Path, required=True)
     parser.add_argument("--dma-transpose-surface-csv", type=Path)
     parser.add_argument("--compute-calibration-csv", type=Path, required=True)
+    parser.add_argument("--instruction-latency-csv", type=Path, default=None,
+                        help="opt-in consumer-visible instruction latency (InstructionLatencyCalibration)")
     parser.add_argument("--structured-control-csv", type=Path, required=True)
     parser.add_argument("--whole-program-control-root", type=Path)
     parser.add_argument("--trace-filename", default="trace.jsonl")
@@ -257,6 +260,10 @@ def main(argv: list[str] | None = None) -> int:
                 onchip_transfer_calibration=(
                     OnChipTransferCalibration.from_csv(args.onchip_transfer_csv)
                     if args.onchip_transfer_csv else None
+                ),
+                instruction_latency=(
+                    InstructionLatencyCalibration.from_csv(args.instruction_latency_csv)
+                    if args.instruction_latency_csv else None
                 ),
                 global_completion_calibration=(
                     GlobalCompletionCalibration.from_csv(args.global_completion_csv)

@@ -704,6 +704,7 @@ def _evaluate_replays(
     *,
     model_name: str,
     dry_run: bool,
+    extra_args: list[str] | None = None,
 ) -> list[tuple[str, Path]]:
     outputs: list[tuple[str, Path]] = []
     for split_name, split in splits.items():
@@ -738,12 +739,14 @@ def _evaluate_replays(
                         / f"source_sequence_disjoint_{suffix}_v1"
                     ),
                 ]
+            if extra_args:
+                args[args.index("--output"):args.index("--output")] = list(extra_args)
             _run(args, dry_run)
             outputs.append((split_name, output))
     return outputs
 
 
-def evaluate(root: Path, dry_run: bool) -> None:
+def evaluate(root: Path, dry_run: bool, instruction_latency_csv: Path | None = None) -> None:
     replay_dir = root / "evaluation"
     replay_dir.mkdir(parents=True, exist_ok=True)
     if not dry_run:
@@ -794,6 +797,8 @@ def evaluate(root: Path, dry_run: bool) -> None:
         splits,
         model_name="surface",
         dry_run=dry_run,
+        extra_args=(["--instruction-latency-csv", str(instruction_latency_csv)]
+                    if instruction_latency_csv else None),
     )
     if dry_run:
         return
@@ -1117,6 +1122,8 @@ def main(argv=None) -> int:
         default=Path("/home/ubuntu/Tilebench/benchmarks/operators"),
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--instruction-latency-csv", type=Path, default=None,
+                        help="Evaluate only: opt into consumer-visible instruction latency (controls-only CSV).")
     parser.add_argument("--bf16-revisit-term", action="store_true",
                         help="Fit only: opt into the experimental BF16 Tensor geometry model.")
     args = parser.parse_args(argv)
@@ -1127,7 +1134,8 @@ def main(argv=None) -> int:
     elif args.stage == "fit":
         fit(args.root.resolve(), args.dry_run, bf16_revisit_term=args.bf16_revisit_term)
     else:
-        evaluate(args.root.resolve(), args.dry_run)
+        evaluate(args.root.resolve(), args.dry_run,
+                 args.instruction_latency_csv.resolve() if args.instruction_latency_csv else None)
     return 0
 
 
