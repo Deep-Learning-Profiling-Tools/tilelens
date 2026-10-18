@@ -1,0 +1,10 @@
+{
+  "suite": "inf2_nki_structure_latency_v1",
+  "description": "Level-B structure controls: dependent-chain (consumer-visible latency) vs independent-stream (initiation interval) VectorE/ScalarE instructions at p=128 over free sizes including the tiny statistics tiles agents use.",
+  "warmup": 10,
+  "iters": 50,
+  "benchmarks": [
+    {"name": "vector_add", "kind": "vector_add", "p": 128, "repeat": 16, "modes": ["dependent_chain", "independent_stream", "independent_two_input"], "matrix": {"dtype": ["float32"], "f": [1, 8, 32, 128, 512, 2048]}},
+    {"name": "scalar_exp", "kind": "scalar_exp", "p": 128, "repeat": 16, "modes": ["dependent_chain", "independent_stream"], "matrix": {"dtype": ["float32"], "f": [1, 8, 32, 128, 512, 2048]}}
+  ]
+}
