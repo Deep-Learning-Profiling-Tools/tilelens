@@ -806,6 +806,15 @@ class GlobalCompletionCalibration:
     # decides per calibration, but on the current production controls it is
     # inert and the model reduces to the imbalance form.
     completion_offset_ns_per_log2_partition: float = 0.0
+    # Opt-in structure-aware completion ("carried serialization").  The
+    # structure-free term above cannot distinguish rewrites that keep every
+    # engine's work but change how iterations overlap.  When enabled, the share
+    # ``c`` of HBM->SBUF load bytes whose destination buffer is reused across
+    # loads (hoisted allocations, hand-written ping-pong buffers, unrolled
+    # loops) serialises:  f_eff = f + (1 - f) * c.  Loop-local tiles (a fresh
+    # buffer per iteration, which the compiler multi-buffers) keep c = 0, so
+    # such programs are priced exactly as before.  No parameter is fitted.
+    carried_serialization: bool = False
 
     @classmethod
     def from_csv(cls, path: str | Path) -> "GlobalCompletionCalibration":
@@ -843,19 +852,42 @@ class GlobalCompletionCalibration:
         )
 
     def predict_ns(
-        self, engine_busy_ns: dict[str, float], partitions: int = 1
+        self,
+        engine_busy_ns: dict[str, float],
+        partitions: int = 1,
+        carried_fraction: float = 0.0,
     ) -> float:
         if not engine_busy_ns:
             return max(0.0, self.offset_ns(partitions))
         busy = list(engine_busy_ns.values())
         critical = max(busy)
+        fraction = self.effective_overlap_fraction(critical, sum(busy) - critical)
+        if self.carried_serialization:
+            carried = min(1.0, max(0.0, carried_fraction))
+            fraction = min(1.0, fraction + (1.0 - fraction) * carried)
         return max(
             0.0,
-            critical
-            + self.effective_overlap_fraction(critical, sum(busy) - critical)
-            * (sum(busy) - critical)
-            + self.offset_ns(partitions),
+            critical + fraction * (sum(busy) - critical) + self.offset_ns(partitions),
         )
+
+
+def carried_load_fraction(events: Iterable[dict[str, Any]]) -> float:
+    """Share of HBM->SBUF load bytes whose destination buffer receives more than one load."""
+    per: dict[Any, list[int]] = {}
+    for event in events:
+        if (
+            event.get("op") == "transfer"
+            and event.get("mem_src") == "hbm"
+            and event.get("mem_dst") == "sbuf"
+        ):
+            key = event.get("dst_storage") or event.get("dst_ptr")
+            row = per.setdefault(key, [0, 0])
+            row[0] += 1
+            row[1] += int(event.get("bytes") or 0)
+    total = sum(nbytes for _, nbytes in per.values())
+    if total <= 0:
+        return 0.0
+    return sum(nbytes for count, nbytes in per.values() if count >= 2) / total
 
 
 @dataclass
@@ -2935,9 +2967,15 @@ def simulate(
     completion_partitions = max(
         [int(event.get("partition_count") or 0) for event in source_events] + [1]
     )
+    calibration = model.global_completion_calibration
+    carried_fraction = (
+        carried_load_fraction(source_events)
+        if calibration is not None and calibration.carried_serialization
+        else 0.0
+    )
     global_completion_ns = (
         model.global_completion_calibration.predict_ns(
-            engine_busy, completion_partitions
+            engine_busy, completion_partitions, carried_fraction
         )
         if model.global_completion_calibration is not None
         else 0.0
@@ -2983,6 +3021,7 @@ def simulate(
                 )
             ),
             "global_completion_ns": global_completion_ns,
+            "carried_load_fraction": carried_fraction,
             "global_completion_activated": float(
                 global_completion_ns > makespan_only_ns
             ),
