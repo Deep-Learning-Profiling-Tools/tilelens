@@ -181,3 +181,19 @@ def test_dma_latency_log2_partition_law():
     full = load(0, 0, 100)
     assert base.result_ready_ns(one, "dma", 10.0) == 10.0
     assert abs(base.result_ready_ns(full, "dma", 10.0) - 1410.0) < 1e-9
+
+
+def test_surface_split_recovers_fixed_cost_and_bandwidth():
+    from triton_viz.tools.nki_cost_model import DmaCalibrationSurface
+    pts = {}
+    for p in (16, 128):
+        fixed, bw = (200.0, 100.0) if p == 16 else (600.0, 250.0)
+        for f in (256, 1024, 4096, 16384):
+            nbytes = p * f
+            pts[(p, f)] = nbytes / (fixed + nbytes / bw)        # aggregate GB/s = bytes / ns
+    surf = DmaCalibrationSurface(pts)
+    for p, (fixed, bw) in ((16, (200.0, 100.0)), (128, (600.0, 250.0))):
+        got = surf.split(p)
+        assert abs(got[0] - fixed) < 1e-6 and abs(got[1] - bw) < 1e-6
+    mid = surf.split(45)                                        # interpolated in log2(p)
+    assert 200.0 < mid[0] < 600.0 and 100.0 < mid[1] < 250.0

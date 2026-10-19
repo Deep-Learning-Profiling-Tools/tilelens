@@ -139,6 +139,45 @@ class DmaCalibrationSurface:
             )
         return cls(points)
 
+    def split(self, partitions: int) -> tuple[float, float] | None:
+        """(fixed_ns, asymptotic GB/s) of a transfer over ``partitions``: the surface's own points at that
+        partition count fitted as ``time = fixed + bytes / bandwidth``; between measured partition counts
+        both are interpolated in log2(partitions), outside they are clamped. None when < 3 points."""
+        cache = self.__dict__.setdefault("_split_cache", {})
+        if partitions in cache:
+            return cache[partitions]
+        fits = {}
+        for p in sorted({key[0] for key in self.points}):
+            xs = [p * f for (pp, f) in self.points if pp == p]
+            ys = [p * f / self.points[(pp, f)] for (pp, f) in self.points if pp == p]
+            if len(xs) < 3:
+                continue
+            n = len(xs)
+            mx, my = sum(xs) / n, sum(ys) / n
+            var = sum((x - mx) ** 2 for x in xs)
+            if var <= 0:
+                continue
+            slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var
+            if slope <= 0:
+                continue
+            fits[p] = (max(0.0, my - slope * mx), 1.0 / slope)
+        if not fits:
+            cache[partitions] = None
+            return None
+        ps = sorted(fits)
+        q = min(max(partitions, ps[0]), ps[-1])
+        lo = max(p for p in ps if p <= q)
+        hi = min(p for p in ps if p >= q)
+        if lo == hi:
+            result = fits[lo]
+        else:
+            w = (math.log2(q) - math.log2(lo)) / (math.log2(hi) - math.log2(lo))
+            fixed = fits[lo][0] + w * (fits[hi][0] - fits[lo][0])
+            inv = 1 / fits[lo][1] + w * (1 / fits[hi][1] - 1 / fits[lo][1])
+            result = (fixed, 1.0 / inv)
+        cache[partitions] = result
+        return result
+
     def lookup(self, partitions: int, free_bytes: int) -> Lookup:
         """Return bandwidth plus explicit exact/interpolated/OOD provenance."""
         exact = self.points.get((partitions, free_bytes))
@@ -1624,6 +1663,9 @@ class CostModel:
     dma_result_latency_ns: float | None = None
     # "constant" or "log2_partitions" (latency scales with log2 of the partitions a transfer spans).
     dma_result_latency_law: str = "constant"
+    # Opt-in: split each surface-priced transfer into bandwidth occupancy and a fixed result latency
+    # fitted from the surface's own points (DmaCalibrationSurface.split).
+    dma_split_fixed_cost: bool = False
     structured_control_lowering: StructuredControlCalibration | None = None
     whole_program_routing: WholeProgramRoutingCalibration | None = None
     strided_dma_calibration: StridedDmaCalibration | None = None
@@ -1764,6 +1806,11 @@ class CostModel:
         free_bytes = self._dma_lookup_free_bytes(event)
         surface = self._dma_surface(event)
         if partitions > 0 and free_bytes > 0 and surface is not None:
+            if self.dma_split_fixed_cost:
+                split = surface.split(partitions)
+                if split is not None:
+                    # queue occupancy is the bandwidth term; the fixed cost becomes result latency
+                    return nbytes / split[1]
             bandwidth = surface.lookup(partitions, free_bytes).bandwidth_gbps
             return nbytes / bandwidth
         if self.dma_bytes_per_ns is not None:
@@ -1791,13 +1838,19 @@ class CostModel:
         occupancy, while its data lands a fixed latency later, which only dependent consumers see.
         """
         if event.get("op") in ("transfer", "load", "store"):
-            latency = self.dma_result_latency_ns or 0.0
+            fixed = 0.0
+            if self.dma_split_fixed_cost:
+                surface = self._dma_surface(event)
+                parts = int(event.get("partition_count") or 0)
+                split = surface.split(parts) if surface is not None and parts > 0 else None
+                fixed = split[0] if split is not None else 0.0
+            latency = (self.dma_result_latency_ns or 0.0)
             if latency and self.dma_result_latency_law == "log2_partitions":
                 # Completion waits for every queue a transfer is spread over: 0 for one partition,
                 # the full latency for 128 partitions.
                 parts = max(1, min(128, int(event.get("partition_count") or 1)))
                 latency *= math.log2(parts) / 7.0
-            return duration + latency
+            return duration + fixed + latency
         if self.instruction_latency is None or event.get("op") not in ("binary", "compute", "reduce_sum"):
             return duration
         free_dim = _free_dim(event)
