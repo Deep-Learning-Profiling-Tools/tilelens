@@ -3060,7 +3060,9 @@ def simulate(
         else 0.0
     )
     final_ns = max(makespan_only_ns, global_completion_ns)
-    if model.structure_schedule is not None and model.structure_schedule.schedule_completion:
+    # Programs priced by a dedicated control-calibrated path (attention pipeline) keep that result.
+    if (model.structure_schedule is not None and model.structure_schedule.schedule_completion
+            and attention_pipeline_match not in {"exact", "interpolated"}):
         # Schedule-derived completion: the structure-aware schedule replaces the structure-free
         # non-overlap term; the controls-calibrated launch/drain offset (which no schedule contains)
         # is kept as the single global residual.
