@@ -1617,6 +1617,9 @@ class CostModel:
     # Opt-in consumer-visible instruction latency (dependent chains); None keeps the
     # initiation-interval-only behaviour byte-identical.
     instruction_latency: InstructionLatencyCalibration | None = None
+    # Opt-in structure-aware issue order (bounded renaming + dependency-ordered loads); see
+    # triton_viz.tools.nki_structure_schedule. Typed loosely to avoid an import cycle.
+    structure_schedule: Any = None
     structured_control_lowering: StructuredControlCalibration | None = None
     whole_program_routing: WholeProgramRoutingCalibration | None = None
     strided_dma_calibration: StridedDmaCalibration | None = None
@@ -2604,6 +2607,10 @@ def simulate(
         if strided_static_dma_ns > 0:
             structural_static_ns = max(structural_static_ns, strided_static_dma_ns)
     events = _expand_lowering_groups(source_events, model)
+    structure_depth = 0
+    if model.structure_schedule is not None:
+        from triton_viz.tools.nki_structure_schedule import apply_structure_schedule
+        events, structure_depth = apply_structure_schedule(events, model.structure_schedule)
     level_a_matches = Counter(
         match
         for _region, _engine, match in {
@@ -3044,7 +3051,10 @@ def simulate(
         else 0.0
     )
     final_ns = max(makespan_only_ns, global_completion_ns)
-    return SimulationResult(
+    if model.structure_schedule is not None and model.structure_schedule.schedule_completion:
+        # Schedule-derived completion: the structure-aware schedule replaces the structure-free term.
+        final_ns = makespan_only_ns
+    result = SimulationResult(
         predicted_latency_ns=final_ns,
         timeline=timeline,
         engine_busy_ns=engine_busy,
@@ -3171,6 +3181,9 @@ def simulate(
             "final": final_ns,
         },
     )
+    if model.structure_schedule is not None:
+        result.components_ns["structure_buffer_depth"] = float(structure_depth)
+    return result
 
 
 def simulate_jsonl(

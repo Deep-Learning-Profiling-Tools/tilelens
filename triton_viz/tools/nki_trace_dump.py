@@ -742,6 +742,19 @@ def record_to_event(
     return {**base, "op": "unknown", "payload": _jsonable(record)}
 
 
+def _source_site(record: Any) -> str | None:
+    """Program point of a record: innermost user frame as ``file:line`` (None when not captured)."""
+    frames = getattr(record, "call_path", None) or []
+    if not frames:
+        return None
+    frame = frames[-1]
+    filename = getattr(frame, "filename", None)
+    lineno = getattr(frame, "lineno", None)
+    if filename is None or lineno is None:
+        return None
+    return f"{Path(str(filename)).name}:{int(lineno)}"
+
+
 def records_to_events(records: Iterable[Any]) -> list[dict[str, Any]]:
     """Convert a launch's records into ordered performance trace events."""
     events: list[dict[str, Any]] = []
@@ -749,7 +762,11 @@ def records_to_events(records: Iterable[Any]) -> list[dict[str, Any]]:
     for sequence, record in enumerate(records):
         if isinstance(record, Grid):
             grid_idx = tuple(record.idx)
-        events.append(record_to_event(record, sequence, grid_idx))
+        event = record_to_event(record, sequence, grid_idx)
+        site = _source_site(record)
+        if site is not None:
+            event["source_site"] = site
+        events.append(event)
     _annotate_static_dma_groups(events)
     _annotate_fusion_signature(events)
     return events
