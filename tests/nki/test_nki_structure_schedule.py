@@ -128,3 +128,18 @@ def test_persistent_bytes_reduce_capacity():
     big = [dict(e) for e in fresh] + [dict(load(99, 0, 7, site="k.py:3"), free_bytes_per_partition=150 * 1024),
                                       dict(load(100, 1, 7, site="k.py:3"), free_bytes_per_partition=150 * 1024)]
     assert buffering_depth(big, StructureSchedule()) == (192 * 1024 - 150 * 1024) // (2 * F * 4)
+
+
+def test_dma_result_latency_delays_only_dependent_consumers():
+    from triton_viz.tools.nki_structure_schedule import StructureSchedule as _S  # noqa: F401
+    base = CostModel()
+    lat = replace(base, dma_result_latency_ns=1500.0)
+    chain = loop(1)                                                           # load -> compute -> store
+    a, b = simulate(chain, base), simulate(chain, lat)
+    ca = [t.start for t in a.timeline["vector"]][0]
+    cb = [t.start for t in b.timeline["vector"]][0]
+    assert abs((cb - ca) - 1500.0) < 1e-6                                     # compute waits for the data
+    stream = [load(i, i, 100 + i) for i in range(3)]                          # independent loads
+    sa, sb = simulate(stream, base), simulate(stream, lat)
+    assert [t.start for t in sa.timeline["dma"]] == [t.start for t in sb.timeline["dma"]]   # queue throughput unchanged
+    assert simulate(chain, base).predicted_latency_ns == simulate(chain, replace(base, dma_result_latency_ns=None)).predicted_latency_ns

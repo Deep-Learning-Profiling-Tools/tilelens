@@ -1620,6 +1620,8 @@ class CostModel:
     # Opt-in structure-aware issue order (bounded renaming + dependency-ordered loads); see
     # triton_viz.tools.nki_structure_schedule. Typed loosely to avoid an import cycle.
     structure_schedule: Any = None
+    # Opt-in fixed DMA result latency (ns) beyond bandwidth occupancy; None keeps the default model.
+    dma_result_latency_ns: float | None = None
     structured_control_lowering: StructuredControlCalibration | None = None
     whole_program_routing: WholeProgramRoutingCalibration | None = None
     strided_dma_calibration: StridedDmaCalibration | None = None
@@ -1780,7 +1782,14 @@ class CostModel:
         return self.dma_startup_ns + nbytes / bandwidth
 
     def result_ready_ns(self, event: dict[str, Any], engine: str, duration: float) -> float:
-        """Time from issue until the op's result is visible to a consumer."""
+        """Time from issue until the op's result is visible to a consumer.
+
+        Compute: ``max(duration, latency)`` under ``instruction_latency``. DMA: ``duration +
+        dma_result_latency_ns`` (opt-in): the queue is released after the transfer's bandwidth
+        occupancy, while its data lands a fixed latency later, which only dependent consumers see.
+        """
+        if event.get("op") in ("transfer", "load", "store"):
+            return duration + (self.dma_result_latency_ns or 0.0)
         if self.instruction_latency is None or event.get("op") not in ("binary", "compute", "reduce_sum"):
             return duration
         free_dim = _free_dim(event)
