@@ -62,3 +62,15 @@ def test_rewriting_one_buffer_waits_for_release_not_latency():
     read = simulate(waw + [vec(3, 9, 10)], model)
     starts = [t.start for t in read.timeline["vector"]]
     assert starts[3] - starts[2] >= 5000.0 - 1e-6
+
+
+def test_latency_is_not_extrapolated_beyond_the_control_range(tmp_path):
+    csv_path = tmp_path / "lat.csv"
+    csv_path.write_text("engine,dtype,input_stream_count,startup_ns,ns_per_free_elem,max_free_elem\n"
+                        "vector,float32,1,100,1,2048\n")
+    cal = InstructionLatencyCalibration.from_csv(csv_path)
+    assert cal.latency_ns("vector", "float32", 1, 2048) == pytest.approx(2148.0)
+    assert cal.latency_ns("vector", "float32", 1, 4096) is None
+    model = replace(CostModel(), instruction_latency=cal)
+    big = [vec(0, 1, 2, f=16384), vec(1, 2, 3, f=16384)]
+    assert simulate(big, model).predicted_latency_ns == simulate(big, CostModel()).predicted_latency_ns

@@ -1017,18 +1017,21 @@ class InstructionLatencyCalibration:
     `dependent_chain`). The scheduler keeps the engine busy for the initiation interval and makes the
     result visible after ``max(initiation interval, latency)``, so dependent chains serialize on
     latency while independent streams keep their throughput. One linear law per
-    ``(engine, dtype, input_streams)``: ``latency = startup_ns + ns_per_free_elem * free``.
+    ``(engine, dtype, input_streams)``: ``latency = startup_ns + ns_per_free_elem * free``. The law is
+    applied only within the free sizes the controls covered (optional CSV column ``max_free_elem``);
+    outside that range no latency is modelled and the result is visible at the calibrated duration.
     """
 
-    points: dict[tuple[str, str, int], tuple[float, float]]
+    points: dict[tuple[str, str, int], tuple[float, float, float]]
 
     @classmethod
     def from_csv(cls, path: str | Path) -> "InstructionLatencyCalibration":
-        points: dict[tuple[str, str, int], tuple[float, float]] = {}
+        points: dict[tuple[str, str, int], tuple[float, float, float]] = {}
         with Path(path).open(encoding="utf-8", newline="") as file:
             for row in csv.DictReader(file):
+                limit = float(row["max_free_elem"]) if row.get("max_free_elem") else math.inf
                 points[(row["engine"], row["dtype"], int(row["input_stream_count"]))] = (
-                    float(row["startup_ns"]), float(row["ns_per_free_elem"]))
+                    float(row["startup_ns"]), float(row["ns_per_free_elem"]), limit)
         return cls(points)
 
     def latency_ns(self, engine: str, dtype: str, input_streams: int, free_dim: int) -> float | None:
@@ -1037,7 +1040,11 @@ class InstructionLatencyCalibration:
             point = self.points.get((engine, dtype, 1))
         if point is None:
             return None
-        return max(0.0, point[0] + point[1] * max(1, int(free_dim)))
+        startup, slope, *limit = point
+        free = max(1, int(free_dim))
+        if limit and free > limit[0]:
+            return None
+        return max(0.0, startup + slope * free)
 
 
 @dataclass
