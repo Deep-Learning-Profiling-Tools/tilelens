@@ -746,7 +746,8 @@ def _evaluate_replays(
     return outputs
 
 
-def evaluate(root: Path, dry_run: bool, instruction_latency_csv: Path | None = None) -> None:
+def evaluate(root: Path, dry_run: bool, instruction_latency_csv: Path | None = None,
+             replay_args: list[str] | None = None) -> None:
     replay_dir = root / "evaluation"
     replay_dir.mkdir(parents=True, exist_ok=True)
     if not dry_run:
@@ -797,8 +798,8 @@ def evaluate(root: Path, dry_run: bool, instruction_latency_csv: Path | None = N
         splits,
         model_name="surface",
         dry_run=dry_run,
-        extra_args=(["--instruction-latency-csv", str(instruction_latency_csv)]
-                    if instruction_latency_csv else None),
+        extra_args=((["--instruction-latency-csv", str(instruction_latency_csv)] if instruction_latency_csv else [])
+                    + list(replay_args or [])) or None,
     )
     if dry_run:
         return
@@ -1124,6 +1125,9 @@ def main(argv=None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--instruction-latency-csv", type=Path, default=None,
                         help="Evaluate only: opt into consumer-visible instruction latency (controls-only CSV).")
+    parser.add_argument("--replay-arg", action="append", default=[],
+                        help="Evaluate only: extra argument passed to every replay (repeatable), e.g. "
+                             "--replay-arg=--structure-schedule=capacity+completion")
     parser.add_argument("--bf16-revisit-term", action="store_true",
                         help="Fit only: opt into the experimental BF16 Tensor geometry model.")
     args = parser.parse_args(argv)
@@ -1135,7 +1139,8 @@ def main(argv=None) -> int:
         fit(args.root.resolve(), args.dry_run, bf16_revisit_term=args.bf16_revisit_term)
     else:
         evaluate(args.root.resolve(), args.dry_run,
-                 args.instruction_latency_csv.resolve() if args.instruction_latency_csv else None)
+                 args.instruction_latency_csv.resolve() if args.instruction_latency_csv else None,
+                 args.replay_arg)
     return 0
 
 

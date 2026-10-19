@@ -142,6 +142,15 @@ FIELDS = [
 PAYLOAD_RESOLUTION_US = 0.010
 
 
+def _structure_schedule(spec: str | None):
+    if not spec:
+        return None
+    from triton_viz.tools.nki_structure_schedule import StructureSchedule
+    depth, _, extra = spec.partition("+")
+    return StructureSchedule(depth=None if depth == "capacity" else int(depth),
+                             schedule_completion=extra == "completion")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
@@ -151,6 +160,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compute-calibration-csv", type=Path, required=True)
     parser.add_argument("--instruction-latency-csv", type=Path, default=None,
                         help="opt-in consumer-visible instruction latency (InstructionLatencyCalibration)")
+    parser.add_argument("--structure-schedule", default=None,
+                        help="opt-in structure-aware issue order: 'capacity' or a depth, optionally '+completion'")
+    parser.add_argument("--dma-result-latency-ns", type=float, default=None,
+                        help="opt-in fixed DMA result latency beyond bandwidth occupancy")
     parser.add_argument("--structured-control-csv", type=Path, required=True)
     parser.add_argument("--whole-program-control-root", type=Path)
     parser.add_argument("--trace-filename", default="trace.jsonl")
@@ -265,6 +278,8 @@ def main(argv: list[str] | None = None) -> int:
                     InstructionLatencyCalibration.from_csv(args.instruction_latency_csv)
                     if args.instruction_latency_csv else None
                 ),
+                structure_schedule=_structure_schedule(args.structure_schedule),
+                dma_result_latency_ns=args.dma_result_latency_ns,
                 global_completion_calibration=(
                     GlobalCompletionCalibration.from_csv(args.global_completion_csv)
                     if args.global_completion_csv else None
