@@ -143,3 +143,12 @@ def test_dma_result_latency_delays_only_dependent_consumers():
     sa, sb = simulate(stream, base), simulate(stream, lat)
     assert [t.start for t in sa.timeline["dma"]] == [t.start for t in sb.timeline["dma"]]   # queue throughput unchanged
     assert simulate(chain, base).predicted_latency_ns == simulate(chain, replace(base, dma_result_latency_ns=None)).predicted_latency_ns
+
+
+def test_schedule_completion_keeps_the_calibrated_offset():
+    from triton_viz.tools.nki_cost_model import GlobalCompletionCalibration
+    cal = GlobalCompletionCalibration(overlap_fraction=0.33, completion_offset_ns=5000.0)
+    model = replace(CostModel(), global_completion_calibration=cal,
+                    structure_schedule=StructureSchedule(schedule_completion=True))
+    r = simulate(loop(4), model)
+    assert abs(r.predicted_latency_ns - (r.components_ns["makespan_only_ns"] + 5000.0)) < 1e-6

@@ -39,7 +39,7 @@ class StructureSchedule:
     depth: int | None = None                    # None: derived from SBUF capacity
     sbuf_partition_bytes: int = SBUF_PARTITION_BYTES
     hoist_loads: bool = True
-    schedule_completion: bool = False           # final latency = makespan (no global completion term)
+    schedule_completion: bool = False           # final latency = makespan + calibrated launch/drain offset
 
 
 def _site(event: dict[str, Any]) -> Any:
