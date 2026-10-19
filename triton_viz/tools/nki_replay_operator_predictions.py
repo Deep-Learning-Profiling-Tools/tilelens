@@ -143,12 +143,8 @@ PAYLOAD_RESOLUTION_US = 0.010
 
 
 def _structure_schedule(spec: str | None):
-    if not spec:
-        return None
-    from triton_viz.tools.nki_structure_schedule import StructureSchedule
-    depth, _, extra = spec.partition("+")
-    return StructureSchedule(depth=None if depth == "capacity" else int(depth),
-                             schedule_completion=extra == "completion")
+    from triton_viz.tools.nki_structure_schedule import parse_spec
+    return parse_spec(spec)
 
 
 def main(argv: list[str] | None = None) -> int:

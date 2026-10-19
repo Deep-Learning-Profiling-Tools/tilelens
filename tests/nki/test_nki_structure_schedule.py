@@ -152,3 +152,24 @@ def test_schedule_completion_keeps_the_calibrated_offset():
                     structure_schedule=StructureSchedule(schedule_completion=True))
     r = simulate(loop(4), model)
     assert abs(r.predicted_latency_ns - (r.components_ns["makespan_only_ns"] + 5000.0)) < 1e-6
+
+
+def test_residual_offset_and_global_floor():
+    from triton_viz.tools.nki_cost_model import GlobalCompletionCalibration
+    cal = GlobalCompletionCalibration(overlap_fraction=1.0, completion_offset_ns=50000.0)
+    events = loop(4)
+    plain = simulate(events, replace(CostModel(), global_completion_calibration=cal,
+                                     structure_schedule=StructureSchedule(schedule_completion=True, residual_offset_ns=800.0)))
+    assert abs(plain.predicted_latency_ns - (plain.components_ns["makespan_only_ns"] + 800.0)) < 1e-6
+    floored = simulate(events, replace(CostModel(), global_completion_calibration=cal,
+                                       structure_schedule=StructureSchedule(schedule_completion=True, residual_offset_ns=800.0,
+                                                                            global_floor=True)))
+    assert floored.predicted_latency_ns == floored.components_ns["global_completion_ns"]
+
+
+def test_parse_spec():
+    from triton_viz.tools.nki_structure_schedule import parse_spec
+    assert parse_spec(None) is None
+    s = parse_spec("capacity+completion+floor+offset=790")
+    assert s.depth is None and s.schedule_completion and s.global_floor and s.residual_offset_ns == 790.0
+    assert parse_spec("2").depth == 2 and not parse_spec("2").schedule_completion

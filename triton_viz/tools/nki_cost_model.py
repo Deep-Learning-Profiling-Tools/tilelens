@@ -3064,7 +3064,12 @@ def simulate(
         # Schedule-derived completion: the structure-aware schedule replaces the structure-free
         # non-overlap term; the controls-calibrated launch/drain offset (which no schedule contains)
         # is kept as the single global residual.
-        final_ns = makespan_only_ns + (calibration.offset_ns(completion_partitions) if calibration is not None else 0.0)
+        schedule = model.structure_schedule
+        offset = (schedule.residual_offset_ns if schedule.residual_offset_ns is not None
+                  else calibration.offset_ns(completion_partitions) if calibration is not None else 0.0)
+        final_ns = makespan_only_ns + offset
+        if schedule.global_floor:
+            final_ns = max(final_ns, global_completion_ns)
     result = SimulationResult(
         predicted_latency_ns=final_ns,
         timeline=timeline,

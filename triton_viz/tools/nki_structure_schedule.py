@@ -40,6 +40,8 @@ class StructureSchedule:
     sbuf_partition_bytes: int = SBUF_PARTITION_BYTES
     hoist_loads: bool = True
     schedule_completion: bool = False           # final latency = makespan + calibrated launch/drain offset
+    residual_offset_ns: float | None = None     # offset jointly calibrated with the DMA latency (None: the global one)
+    global_floor: bool = False                  # keep the structure-free global completion as a lower bound
 
 
 def _site(event: dict[str, Any]) -> Any:
@@ -185,3 +187,14 @@ def apply_structure_schedule(events: list[dict[str, Any]], config: StructureSche
     if config.hoist_loads:
         out = hoist_loads(out)
     return out, depth
+
+
+def parse_spec(spec: str | None) -> StructureSchedule | None:
+    """``depth|capacity[+completion][+floor][+offset=NS]`` -> StructureSchedule (None for an empty spec)."""
+    if not spec:
+        return None
+    head, *flags = spec.split("+")
+    offset = next((float(f.split("=", 1)[1]) for f in flags if f.startswith("offset=")), None)
+    return StructureSchedule(depth=None if head == "capacity" else int(head),
+                             schedule_completion="completion" in flags, global_floor="floor" in flags,
+                             residual_offset_ns=offset)
