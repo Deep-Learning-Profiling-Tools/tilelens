@@ -22,7 +22,7 @@ import csv
 import json
 import math
 import statistics
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -2594,6 +2594,36 @@ def _expand_lowering_groups(
     return expanded
 
 
+def _scale_to_routed_occupancy(events, routing_events, routing_dtype, model):
+    """Make the schedule consistent with control-routed occupancy (structure-schedule mode only).
+
+    Whole-program routing replaces Vector/Scalar/GpSimd busy time with control-learned occupancy after
+    scheduling, but the per-event durations on the timeline stay unrouted. When the schedule itself sets
+    the completion, each routed engine's event durations are scaled so that they sum to its routed busy.
+    """
+    value_dtypes = [str(v) for e in events for v in ([e.get("output_dtype")] + list(e.get("input_dtypes") or []))
+                    if v and str(v).lower() not in {"bool", "boolean"}]
+    dtype = ComputeCalibration._norm_dtype(
+        routing_dtype or (Counter(value_dtypes).most_common(1)[0][0] if value_dtypes else "float32"))
+    routed = model.whole_program_routing.predict_with_provenance(list(routing_events), dtype)
+    if routed is None or routed[0] is None:
+        return events
+    raw: dict[str, float] = defaultdict(float)
+    costs = []
+    for e in events:
+        engine = _canonical_engine(e.get("engine", ""), e.get("op") or "")
+        c = float(e.get("scheduler_duration_override_ns", model.cost_ns(e))) if engine in routed[0] else 0.0
+        costs.append((engine, c))
+        raw[engine] += c
+    out = []
+    for e, (engine, c) in zip(events, costs):
+        if engine in routed[0] and raw[engine] > 0 and c > 0:
+            e = dict(e)
+            e["scheduler_duration_override_ns"] = c * routed[0][engine] / raw[engine]
+        out.append(e)
+    return out
+
+
 def simulate(
     events: Iterable[dict[str, Any]],
     cost_model: CostModel | None = None,
@@ -2681,6 +2711,8 @@ def simulate(
     if model.structure_schedule is not None:
         from triton_viz.tools.nki_structure_schedule import apply_structure_schedule
         events, structure_depth = apply_structure_schedule(events, model.structure_schedule)
+        if model.whole_program_routing is not None:
+            events = _scale_to_routed_occupancy(events, routing_events, routing_dtype, model)
     level_a_matches = Counter(
         match
         for _region, _engine, match in {
