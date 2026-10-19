@@ -49,3 +49,16 @@ def test_latency_lookup_falls_back_to_one_stream():
     cal = InstructionLatencyCalibration({("vector", "float32", 1): (100.0, 1.0)})
     assert cal.latency_ns("vector", "float32", 2, 10) == pytest.approx(110.0)
     assert cal.latency_ns("scalar", "float32", 1, 10) is None
+
+
+def test_rewriting_one_buffer_waits_for_release_not_latency():
+    # Three ops overwrite the same output buffer from independent inputs (WAW only): ordering the writes
+    # needs engine release, not the result latency. A final reader of that buffer does wait for it.
+    model = replace(CostModel(), instruction_latency=LAT)
+    waw = [vec(0, 1, 9), vec(1, 2, 9), vec(2, 3, 9)]
+    base = simulate(waw, CostModel())
+    lat = simulate(waw, model)
+    assert [t.start for t in lat.timeline["vector"]] == [t.start for t in base.timeline["vector"]]
+    read = simulate(waw + [vec(3, 9, 10)], model)
+    starts = [t.start for t in read.timeline["vector"]]
+    assert starts[3] - starts[2] >= 5000.0 - 1e-6

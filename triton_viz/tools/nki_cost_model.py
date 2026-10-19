@@ -2042,19 +2042,22 @@ def _ranges_overlap(a_lo: float, a_hi: float, b_lo: float, b_hi: float) -> bool:
 
 
 def _subtract_interval(
-    entry: tuple[float, float, float, str, int | None],
+    entry: tuple,
     cut_lo: float,
     cut_hi: float,
-) -> list[tuple[float, float, float, str, int | None]]:
-    """Subtract ``[cut_lo, cut_hi)`` while preserving uncovered history."""
-    lo, hi, end, engine, version = entry
+) -> list[tuple]:
+    """Subtract ``[cut_lo, cut_hi)`` while preserving uncovered history.
+
+    Entries are ``(lo, hi, end, engine, version, *extra)``; extra fields are carried unchanged.
+    """
+    lo, hi, *rest = entry
     if not _ranges_overlap(lo, hi, cut_lo, cut_hi):
         return [entry]
     result = []
     if lo < cut_lo:
-        result.append((lo, min(hi, cut_lo), end, engine, version))
+        result.append((lo, min(hi, cut_lo), *rest))
     if cut_hi < hi:
-        result.append((max(lo, cut_hi), hi, end, engine, version))
+        result.append((max(lo, cut_hi), hi, *rest))
     return result
 
 
@@ -2764,7 +2767,7 @@ def simulate(
     # just base-pointer equality: disjoint tiles of one allocation run in
     # parallel, while overlapping ranges (even via different view pointers that
     # share a storage id) still serialize with the correct RAW/WAR/WAW edge.
-    writers: dict[int, list[tuple[float, float, float, str, int | None]]] = {}
+    writers: dict[int, list[tuple[float, float, float, str, int | None, float]]] = {}
     readers: dict[int, list[tuple[float, float, float, str, int | None]]] = {}
     timeline: dict[str, list[TimelineEntry]] = {}
     engine_busy: dict[str, float] = {}
@@ -2863,19 +2866,22 @@ def simulate(
                     ("micro", str(predecessor), str(event.get("micro_event_id"))),
                 )
 
-        # RAW: wait for prior writers whose range overlaps a buffer we read.
+        # RAW: wait for prior writers whose range overlaps a buffer we read; a
+        # reader needs the producer's result, i.e. its result-ready time.
         for key, version, _ptr, lo, hi in reads:
-            for w_lo, w_hi, w_end, w_eng, w_version in writers.get(key, ()):
+            for w_lo, w_hi, _w_end, w_eng, w_version, w_ready in writers.get(key, ()):
                 version_matches = (
                     version is None or w_version is None or version == w_version
                 )
                 if version_matches and _ranges_overlap(lo, hi, w_lo, w_hi):
-                    earliest = _dep(earliest, w_end, w_eng, engine)
+                    earliest = _dep(earliest, w_ready, w_eng, engine)
 
         # WAW + WAR: a write waits for prior overlapping writers and readers of
-        # that storage (buffer-reuse hazards across engines).
+        # that storage (buffer-reuse hazards across engines). Ordering two
+        # writes needs only the earlier one to have been issued and released by
+        # its engine, not its result latency.
         for key, _version, _ptr, lo, hi in writes:
-            for w_lo, w_hi, w_end, w_eng, _w_version in writers.get(key, ()):
+            for w_lo, w_hi, w_end, w_eng, _w_version, _w_ready in writers.get(key, ()):
                 if _ranges_overlap(lo, hi, w_lo, w_hi):
                     earliest = _dep(earliest, w_end, w_eng, engine)
             for r_lo, r_hi, r_end, r_eng, _r_version in readers.get(key, ()):
@@ -2908,7 +2914,7 @@ def simulate(
                 for entry in writers.get(key, ())
                 for remainder in _subtract_interval(entry, lo, hi)
             ]
-            writers[key].append((lo, hi, ready, engine, version))
+            writers[key].append((lo, hi, end, engine, version, ready))
             readers[key] = [
                 remainder
                 for entry in readers.get(key, ())
