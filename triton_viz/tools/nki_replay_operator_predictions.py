@@ -160,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="opt-in structure-aware issue order: 'capacity' or a depth, optionally '+completion'")
     parser.add_argument("--dma-result-latency-ns", type=float, default=None,
                         help="opt-in fixed DMA result latency beyond bandwidth occupancy")
+    parser.add_argument("--dma-result-latency-law", default="constant", choices=("constant", "log2_partitions"))
     parser.add_argument("--structured-control-csv", type=Path, required=True)
     parser.add_argument("--whole-program-control-root", type=Path)
     parser.add_argument("--trace-filename", default="trace.jsonl")
@@ -276,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 structure_schedule=_structure_schedule(args.structure_schedule),
                 dma_result_latency_ns=args.dma_result_latency_ns,
+                dma_result_latency_law=args.dma_result_latency_law,
                 global_completion_calibration=(
                     GlobalCompletionCalibration.from_csv(args.global_completion_csv)
                     if args.global_completion_csv else None

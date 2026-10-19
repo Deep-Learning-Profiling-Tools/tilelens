@@ -173,3 +173,11 @@ def test_parse_spec():
     s = parse_spec("capacity+completion+floor+offset=790")
     assert s.depth is None and s.schedule_completion and s.global_floor and s.residual_offset_ns == 790.0
     assert parse_spec("2").depth == 2 and not parse_spec("2").schedule_completion
+
+
+def test_dma_latency_log2_partition_law():
+    base = replace(CostModel(), dma_result_latency_ns=1400.0, dma_result_latency_law="log2_partitions")
+    one = dict(load(0, 0, 100), partition_count=1)
+    full = load(0, 0, 100)
+    assert base.result_ready_ns(one, "dma", 10.0) == 10.0
+    assert abs(base.result_ready_ns(full, "dma", 10.0) - 1410.0) < 1e-9

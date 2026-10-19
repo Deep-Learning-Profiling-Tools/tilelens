@@ -1622,6 +1622,8 @@ class CostModel:
     structure_schedule: Any = None
     # Opt-in fixed DMA result latency (ns) beyond bandwidth occupancy; None keeps the default model.
     dma_result_latency_ns: float | None = None
+    # "constant" or "log2_partitions" (latency scales with log2 of the partitions a transfer spans).
+    dma_result_latency_law: str = "constant"
     structured_control_lowering: StructuredControlCalibration | None = None
     whole_program_routing: WholeProgramRoutingCalibration | None = None
     strided_dma_calibration: StridedDmaCalibration | None = None
@@ -1789,7 +1791,13 @@ class CostModel:
         occupancy, while its data lands a fixed latency later, which only dependent consumers see.
         """
         if event.get("op") in ("transfer", "load", "store"):
-            return duration + (self.dma_result_latency_ns or 0.0)
+            latency = self.dma_result_latency_ns or 0.0
+            if latency and self.dma_result_latency_law == "log2_partitions":
+                # Completion waits for every queue a transfer is spread over: 0 for one partition,
+                # the full latency for 128 partitions.
+                parts = max(1, min(128, int(event.get("partition_count") or 1)))
+                latency *= math.log2(parts) / 7.0
+            return duration + latency
         if self.instruction_latency is None or event.get("op") not in ("binary", "compute", "reduce_sum"):
             return duration
         free_dim = _free_dim(event)
