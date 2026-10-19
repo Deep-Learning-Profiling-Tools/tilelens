@@ -2280,13 +2280,3 @@ def test_dma_copy_contiguous_hbm_block_into_2d_tile(patched_scope):
     nisa.dma_copy(dst=back, src=dst)
     assert np.array_equal(back.data, src.data)
 
-
-def test_activation_reduce_maximum(patched_scope):
-    """activation accumulates the row maximum when reduce_op is nl.maximum (compiles on device)."""
-    del patched_scope
-    values = np.arange(24, dtype=np.float32).reshape(4, 6) - 10.0
-    data = _nd(values)
-    dst = b2.NDArray(shape=(4, 6), dtype=nl.float32, buffer="sbuf")
-    reduce_res = b2.NDArray(shape=(4, 1), dtype=nl.float32, buffer="sbuf")
-    nisa.activation(dst, nl.copy, data, bias=0.0, scale=1.0, reduce_op=nl.maximum, reduce_res=reduce_res)
-    assert np.array_equal(reduce_res.data, values.max(axis=1, keepdims=True))

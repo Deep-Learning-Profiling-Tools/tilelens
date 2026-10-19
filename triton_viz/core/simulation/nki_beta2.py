@@ -1200,8 +1200,8 @@ def activation(
         f"data partition dim > 128, received {data_par}",
     )
     _require(
-        reduce_op is None or reduce_op.name in ("add", "maximum"),
-        f"activation reduce_op must be None, nl.add or nl.maximum, received {reduce_op}",
+        reduce_op is None or reduce_op.name == "add",
+        f"activation reduce_op must be None or nl.add, received {reduce_op}",
     )
     scale_value = _activation_operand(scale, data_value.shape, "scale")
     bias_value = _activation_operand(bias, data_value.shape, "bias")
@@ -1220,10 +1220,11 @@ def activation(
             reduce_res.shape == (data_par, 1),
             f"reduce_res must have shape (P, 1), expected {(data_par, 1)}, received {reduce_res.shape}",
         )
-        rows = np.asarray(output_value, dtype=np.float32).reshape(data_par, -1)
-        # nl.maximum compiles on device for activation accumulation (verified on agent kernels).
-        reduced = (np.max(rows, axis=1, keepdims=True) if reduce_op.name == "maximum"
-                   else np.sum(rows, axis=1, keepdims=True))
+        reduced = np.sum(
+            np.asarray(output_value, dtype=np.float32).reshape(data_par, -1),
+            axis=1,
+            keepdims=True,
+        )
         _store(reduce_res, reduced)
     return tagged
 
