@@ -2865,6 +2865,7 @@ def simulate(
     if tensor_startup_ns > 0:
         engine_busy[ENGINE_TENSOR] = tensor_startup_ns
     makespan = tensor_startup_ns
+    makespan_dynamic = tensor_startup_ns
     cross_engine_edges = 0
     cross_engine_edge_keys: set[tuple[Any, ...]] = set()
     micro_event_end: dict[str, tuple[float, str]] = {}
@@ -3018,6 +3019,8 @@ def simulate(
         )
         engine_busy[engine] = engine_busy.get(engine, 0.0) + duration
         makespan = max(makespan, ready)
+        if engine != ENGINE_STATIC_DMA:
+            makespan_dynamic = max(makespan_dynamic, ready)
         micro_event_id = event.get("micro_event_id")
         if micro_event_id is not None:
             micro_event_end[str(micro_event_id)] = (ready, engine)
@@ -3130,7 +3133,9 @@ def simulate(
         schedule = model.structure_schedule
         offset = (schedule.residual_offset_ns if schedule.residual_offset_ns is not None
                   else calibration.offset_ns(completion_partitions) if calibration is not None else 0.0)
-        final_ns = makespan_only_ns + offset
+        # The compiler's static DMA packet train runs during launch: it overlaps the launch/drain offset
+        # rather than adding to it.
+        final_ns = max(makespan_dynamic + max(0.0, model.kernel_overhead_ns) + offset, structural_static_ns)
         if schedule.global_floor:
             final_ns = max(final_ns, global_completion_ns)
     result = SimulationResult(
