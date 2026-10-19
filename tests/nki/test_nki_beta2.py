@@ -2267,3 +2267,26 @@ def test_interpreted_function_public_grid_edge_cases(patched_scope):
 
     with pytest.raises(ValueError, match="1D SPMD"):
         fn.run(src, np.zeros_like(src), grid=(1,), client_manager=_RankMismatch())
+
+
+def test_dma_copy_contiguous_hbm_block_into_2d_tile(patched_scope):
+    """An HBM row block reshaped into a 2-D SBUF tile (two rows per partition) copies in row-major order."""
+    del patched_scope
+    src = _nd(np.arange(8 * 4, dtype=np.float32).reshape(8, 4), buffer="hbm")
+    dst = _nd(np.zeros((4, 8), dtype=np.float32))
+    nisa.dma_copy(dst=dst, src=src)
+    assert np.array_equal(dst.data, np.arange(32, dtype=np.float32).reshape(4, 8))
+    back = _nd(np.zeros((8, 4), dtype=np.float32), buffer="hbm")
+    nisa.dma_copy(dst=back, src=dst)
+    assert np.array_equal(back.data, src.data)
+
+
+def test_activation_reduce_maximum(patched_scope):
+    """activation accumulates the row maximum when reduce_op is nl.maximum (compiles on device)."""
+    del patched_scope
+    values = np.arange(24, dtype=np.float32).reshape(4, 6) - 10.0
+    data = _nd(values)
+    dst = b2.NDArray(shape=(4, 6), dtype=nl.float32, buffer="sbuf")
+    reduce_res = b2.NDArray(shape=(4, 1), dtype=nl.float32, buffer="sbuf")
+    nisa.activation(dst, nl.copy, data, bias=0.0, scale=1.0, reduce_op=nl.maximum, reduce_res=reduce_res)
+    assert np.array_equal(reduce_res.data, values.max(axis=1, keepdims=True))

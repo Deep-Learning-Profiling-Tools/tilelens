@@ -810,6 +810,22 @@ class SubOp:
         return f"SubOp({self.name})"
 
 
+def _contiguous_block_copy(dst: NDArray, src: NDArray) -> bool:
+    """A reshaping DMA the compiler accepts: one side is a contiguous HBM block, the other a 2-D SBUF
+    tile, with equal element counts; data moves in row-major (partition-major) order. Verified on
+    device for agent kernels (e.g. an HBM (256, 128) block into a (128, 256) tile). Other reshapes,
+    such as splitting a tile's free dimension, stay rejected."""
+    if int(np.prod(dst.shape)) != int(np.prod(src.shape)):
+        return False
+    pairs = ((src, dst), (dst, src))
+    for hbm, sbuf in pairs:
+        if _buffer_name(hbm) == "hbm" and _buffer_name(sbuf) == "sbuf" and len(sbuf.shape) == 2:
+            data = getattr(hbm, "data", None)
+            if data is not None and getattr(data, "flags", None) is not None and data.flags["C_CONTIGUOUS"]:
+                return True
+    return False
+
+
 def dma_copy(
     dst: NDArray,
     src: NDArray,
@@ -837,7 +853,7 @@ def dma_copy(
     )
     src_value = _array(src)
     _require(
-        dst.shape == src.shape,
+        dst.shape == src.shape or _contiguous_block_copy(dst, src),
         f"{_ERR_AP_MISMATCH}: dst shape {dst.shape}, src shape {src.shape}",
     )
     if dst_rmw_op is None:
@@ -1184,8 +1200,8 @@ def activation(
         f"data partition dim > 128, received {data_par}",
     )
     _require(
-        reduce_op is None or reduce_op.name == "add",
-        f"activation reduce_op must be None or nl.add, received {reduce_op}",
+        reduce_op is None or reduce_op.name in ("add", "maximum"),
+        f"activation reduce_op must be None, nl.add or nl.maximum, received {reduce_op}",
     )
     scale_value = _activation_operand(scale, data_value.shape, "scale")
     bias_value = _activation_operand(bias, data_value.shape, "bias")
@@ -1204,11 +1220,10 @@ def activation(
             reduce_res.shape == (data_par, 1),
             f"reduce_res must have shape (P, 1), expected {(data_par, 1)}, received {reduce_res.shape}",
         )
-        reduced = np.sum(
-            np.asarray(output_value, dtype=np.float32).reshape(data_par, -1),
-            axis=1,
-            keepdims=True,
-        )
+        rows = np.asarray(output_value, dtype=np.float32).reshape(data_par, -1)
+        # nl.maximum compiles on device for activation accumulation (verified on agent kernels).
+        reduced = (np.max(rows, axis=1, keepdims=True) if reduce_op.name == "maximum"
+                   else np.sum(rows, axis=1, keepdims=True))
         _store(reduce_res, reduced)
     return tagged
 
