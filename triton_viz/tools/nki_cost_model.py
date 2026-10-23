@@ -1731,6 +1731,11 @@ class CostModel:
     # fixed cost behind the previous transfer's stream and occupies only bytes / asymptotic bandwidth;
     # a transfer that starts on an idle queue pays the fixed cost as occupancy.
     dma_pipelined_fixed_cost: bool = False
+    # Opt-in multi-queue DMA: ``dma_queues`` independent FIFO queues; a transfer starting with n transfers in
+    # flight (itself included) streams at min(single-transfer surface bandwidth, dma_aggregate_gbps / n) and
+    # pays the surface's fixed cost only when it starts alone. 0 keeps the resource-slot model.
+    dma_queues: int = 0
+    dma_aggregate_gbps: float = 300.0
     structured_control_lowering: StructuredControlCalibration | None = None
     whole_program_routing: WholeProgramRoutingCalibration | None = None
     strided_dma_calibration: StridedDmaCalibration | None = None
@@ -3086,9 +3091,17 @@ def simulate(
         # Earliest start from engine availability. For a multi-slot engine the
         # op takes the slot that frees earliest, letting independent transfers
         # overlap; a single-slot engine keeps strict program order.
-        slots = _slots_for(engine)
+        multiqueue = (model.dma_queues > 0 and engine == ENGINE_DMA and op in ("transfer", "load", "store")
+                      and "scheduler_duration_override_ns" not in event)
+        if multiqueue:
+            slots = engine_slots.setdefault("dma_mq", [0.0] * int(model.dma_queues))
+        else:
+            slots = _slots_for(engine)
         queue_free = min(slots) if slots else 0.0
-        if engine == ENGINE_DMA and dma_resource_count:
+        if multiqueue:
+            slot_indices = [min(range(len(slots)), key=lambda i: slots[i])]
+            earliest = slots[slot_indices[0]]
+        elif engine == ENGINE_DMA and dma_resource_count:
             partitions = max(1, int(event.get("partition_count") or 1))
             demand = min(dma_resource_count, partitions)
             slot_indices = sorted(range(len(slots)), key=lambda i: slots[i])[:demand]
@@ -3139,9 +3152,19 @@ def simulate(
             earliest = max(earliest, prior_transfer_end + (sync_ns if sync_ns else 0.0))
 
         start = earliest
+        share = 1.0
+        if multiqueue:
+            parts = model.dma_split_parts(event)
+            if parts is not None:
+                fixed, stream = parts                    # stream = bytes / single-transfer asymptotic bandwidth
+                in_flight = 1 + sum(1 for i, t in enumerate(slots) if i != slot_indices[0] and t > start)
+                nbytes = float(event.get("bytes") or 0)
+                aggregate = model.dma_aggregate_gbps     # bytes per ns
+                duration = max(stream, nbytes * in_flight / aggregate) + (fixed if in_flight == 1 else 0.0)
+                share = 1.0 / in_flight
         pipelined = None
-        if (model.dma_pipelined_fixed_cost and engine == ENGINE_DMA and op in ("transfer", "load", "store")
-                and "scheduler_duration_override_ns" not in event):
+        if (model.dma_pipelined_fixed_cost and not multiqueue and engine == ENGINE_DMA
+                and op in ("transfer", "load", "store") and "scheduler_duration_override_ns" not in event):
             pipelined = model.dma_split_parts(event)
         if pipelined is not None:
             fixed, stream = pipelined
@@ -3187,7 +3210,7 @@ def simulate(
                 end=end,
             )
         )
-        engine_busy[engine] = engine_busy.get(engine, 0.0) + duration
+        engine_busy[engine] = engine_busy.get(engine, 0.0) + duration * share
         makespan = max(makespan, ready)
         if engine != ENGINE_STATIC_DMA:
             makespan_dynamic = max(makespan_dynamic, ready)
