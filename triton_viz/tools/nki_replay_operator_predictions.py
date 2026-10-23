@@ -30,6 +30,7 @@ from triton_viz.tools.nki_cost_model import (
     eliminate_redundant_hbm_loads,
     simulate,
     InstructionLatencyCalibration,
+    TensorInstructionLaw,
 )
 
 FIELDS = [
@@ -164,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dma-split-fixed-cost", action="store_true",
                         help="opt-in: surface-priced transfers occupy bytes/asymptotic bandwidth; the fitted "
                              "fixed cost becomes result latency")
+    parser.add_argument("--tensor-instruction-law-csv", type=Path, default=None,
+                        help="opt-in TensorE per-instruction geometry law (TensorInstructionLaw)")
     parser.add_argument("--structured-control-csv", type=Path, required=True)
     parser.add_argument("--whole-program-control-root", type=Path)
     parser.add_argument("--trace-filename", default="trace.jsonl")
@@ -282,6 +285,10 @@ def main(argv: list[str] | None = None) -> int:
                 dma_result_latency_ns=args.dma_result_latency_ns,
                 dma_result_latency_law=args.dma_result_latency_law,
                 dma_split_fixed_cost=args.dma_split_fixed_cost,
+                tensor_instruction_law=(
+                    TensorInstructionLaw.from_csv(args.tensor_instruction_law_csv)
+                    if args.tensor_instruction_law_csv else None
+                ),
                 global_completion_calibration=(
                     GlobalCompletionCalibration.from_csv(args.global_completion_csv)
                     if args.global_completion_csv else None
