@@ -763,6 +763,12 @@ def records_to_events(records: Iterable[Any]) -> list[dict[str, Any]]:
         if isinstance(record, Grid):
             grid_idx = tuple(record.idx)
         event = record_to_event(record, sequence, grid_idx)
+        if getattr(record, "input_runs", None) is not None:
+            def _lists(runs):
+                return [None if r is None or r[1] is None else {"storage": r[0], "runs": [list(x) for x in r[1]]}
+                        for r in runs]
+            event["input_range_lists"] = _lists(record.input_runs)
+            event["output_range_lists"] = _lists(record.output_runs)
         site = _source_site(record)
         if site is not None:
             event["source_site"] = site

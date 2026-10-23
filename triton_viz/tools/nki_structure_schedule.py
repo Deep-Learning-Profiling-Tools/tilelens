@@ -19,6 +19,11 @@ This pass rewrites the event list before scheduling with two general rules, and 
    manual ping-pong). It keeps its identity, and its bytes are subtracted from the capacity.
 2. **Dependency-ordered loads.** Each HBM->on-chip load moves before preceding events that neither
    write its source range nor read or write its destination range. Loads keep their FIFO order.
+3. **Consumer-ordered loads** (opt-in, ``need_order``). Within a run of consecutive loads, loads are
+   issued in the order of their first consumer (the first later event that reads the destination),
+   as the compiler's list scheduler issues the transfer the next instruction waits for first. Loads
+   with overlapping destinations keep their relative order. A matmul that needs one slice of a
+   packed transfer then waits for the whole transfer, while separate slices arrive in need order.
 
 ``depth`` is a fixed integer, or ``None`` to derive it from SBUF capacity:
 ``floor(sbuf_partition_bytes / live bytes per partition of one iteration)``, where an iteration's live
@@ -42,6 +47,8 @@ class StructureSchedule:
     schedule_completion: bool = False           # final latency = makespan + calibrated launch/drain offset
     residual_offset_ns: float | None = None     # offset jointly calibrated with the DMA latency (None: the global one)
     global_floor: bool = False                  # keep the structure-free global completion as a lower bound
+    need_order: bool = False                    # issue each run of loads in the order of first consumer
+    exact_ranges: bool = False                  # compute operands use exact byte runs (CostModel.exact_tile_ranges)
 
 
 def _site(event: dict[str, Any]) -> Any:
@@ -136,11 +143,33 @@ def rename(events: list[dict[str, Any]], depth: int) -> list[dict[str, Any]]:
         if e.get("output_storage") is not None and int(e["output_storage"]) in physical:
             e["output_storage"] = physical[int(e["output_storage"])]
             e["output_version"] = None
+        for key in ("input_range_lists", "output_range_lists"):
+            if e.get(key):
+                e[key] = [None if not o else {**o, "storage": physical.get(int(o["storage"]), o["storage"])}
+                          for o in e[key]]
         out.append(e)
     return out
 
 
+_EXACT = False
+
+
 def _accesses(event: dict[str, Any], kind: str) -> list[tuple[Any, list]]:
+    if _EXACT and event.get("op") != "transfer":
+        lists = event.get("input_range_lists" if kind == "read" else "output_range_lists")
+        if lists:
+            plain = _plain_accesses(event, kind)
+            out: list[tuple[Any, list]] = []
+            for i, operand in enumerate(lists):
+                if operand and operand.get("runs"):
+                    out.extend((operand["storage"], list(r)) for r in operand["runs"])
+                elif i < len(plain):
+                    out.append(plain[i])
+            return out
+    return _plain_accesses(event, kind)
+
+
+def _plain_accesses(event: dict[str, Any], kind: str) -> list[tuple[Any, list]]:
     if event.get("op") == "transfer":
         storage = event.get("src_storage" if kind == "read" else "dst_storage")
         ranges = event.get("src_ranges" if kind == "read" else "dst_ranges") or \
@@ -180,21 +209,64 @@ def hoist_loads(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def need_order(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reorder each run of consecutive loads by the position of its first consumer (stable)."""
+    need = []
+    for i, e in enumerate(events):
+        if not _is_load(e):
+            need.append(None)
+            continue
+        writes = _accesses(e, "write")
+        need.append(next((j for j in range(i + 1, len(events))
+                          if not _is_load(events[j]) and _overlap(writes, _accesses(events[j], "read"))), len(events)))
+    out: list[dict[str, Any]] = []
+    i = 0
+    while i < len(events):
+        if not _is_load(events[i]):
+            out.append(events[i])
+            i += 1
+            continue
+        j = i
+        while j < len(events) and _is_load(events[j]):
+            j += 1
+        run = list(range(i, j))
+        placed: list[int] = []
+        for k in sorted(run, key=lambda k: (need[k], k)):
+            # a load may not pass an earlier load whose destination it overlaps
+            blockers = [b for b in run if b < k and b not in placed and
+                        _overlap(_accesses(events[k], "write"), _accesses(events[b], "write"))]
+            for b in sorted(blockers):
+                placed.append(b)
+            if k not in placed:
+                placed.append(k)
+        seen = set()
+        for k in placed:
+            if k not in seen:
+                seen.add(k)
+                out.append(events[k])
+        i = j
+    return out
+
+
 def apply_structure_schedule(events: list[dict[str, Any]], config: StructureSchedule) -> tuple[list[dict[str, Any]], int]:
     """Return the rewritten event list and the buffering depth used."""
+    global _EXACT
+    _EXACT = config.exact_ranges
     depth = buffering_depth(events, config)
     out = rename(events, depth)
     if config.hoist_loads:
         out = hoist_loads(out)
+    if config.need_order:
+        out = need_order(out)
     return out, depth
 
 
 def parse_spec(spec: str | None) -> StructureSchedule | None:
-    """``depth|capacity[+completion][+floor][+offset=NS]`` -> StructureSchedule (None for an empty spec)."""
+    """``depth|capacity[+completion][+floor][+need][+offset=NS]`` -> StructureSchedule (None for an empty spec)."""
     if not spec:
         return None
     head, *flags = spec.split("+")
     offset = next((float(f.split("=", 1)[1]) for f in flags if f.startswith("offset=")), None)
     return StructureSchedule(depth=None if head == "capacity" else int(head),
                              schedule_completion="completion" in flags, global_floor="floor" in flags,
-                             residual_offset_ns=offset)
+                             need_order="need" in flags, residual_offset_ns=offset)

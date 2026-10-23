@@ -1734,6 +1734,9 @@ class CostModel:
     tensor_dot_count_calibration: TensorDotCountCalibration | None = None
     # Opt-in per-instruction TensorE law (geometry, not FLOPs); None keeps the FLOP surfaces.
     tensor_instruction_law: TensorInstructionLaw | None = None
+    # Opt-in: compute operands' hazards use their exact byte runs (a slice t[:, j, :] touches one run per
+    # partition) instead of the bounding interval, so a consumer waits only for the transfer it reads.
+    exact_tile_ranges: bool = False
     attention_pipeline_calibration: AttentionPipelineCalibration | None = None
     dma_elapsed_calibration: DmaElapsedCalibration | None = None
     onchip_transfer_calibration: OnChipTransferCalibration | None = None
@@ -2177,6 +2180,21 @@ def _write_accesses(
     if out is not None:
         accesses.append((int(out), None, int(out), 0.0, _RANGE_INF))
     return accesses
+
+
+def _exact_runs(accesses: list[tuple], runs: list | None) -> list[tuple]:
+    """Replace each operand's (storage, bounding interval) with its root allocation and exact byte runs."""
+    if not runs or len(runs) != len(accesses):
+        return accesses
+    out = []
+    for access, operand in zip(accesses, runs):
+        if not operand or not operand.get("runs"):
+            out.append(access)
+            continue
+        _key, version, ptr, _lo, _hi = access
+        key = int(operand["storage"])
+        out.extend((key, version, ptr, float(lo), float(hi)) for lo, hi in operand["runs"])
+    return out
 
 
 def _ranges_overlap(a_lo: float, a_hi: float, b_lo: float, b_hi: float) -> bool:
@@ -2773,7 +2791,9 @@ def simulate(
     structure_depth = 0
     if model.structure_schedule is not None:
         from triton_viz.tools.nki_structure_schedule import apply_structure_schedule
-        events, structure_depth = apply_structure_schedule(events, model.structure_schedule)
+        import dataclasses as _dc
+        events, structure_depth = apply_structure_schedule(
+            events, _dc.replace(model.structure_schedule, exact_ranges=model.exact_tile_ranges))
         if model.whole_program_routing is not None:
             events = _scale_to_routed_occupancy(events, routing_events, routing_dtype, model)
     level_a_matches = Counter(
@@ -3044,6 +3064,9 @@ def simulate(
 
         reads = _read_accesses(event)
         writes = _write_accesses(event)
+        if model.exact_tile_ranges and event.get("op") not in ("transfer", "load", "store"):
+            reads = _exact_runs(reads, event.get("input_range_lists"))
+            writes = _exact_runs(writes, event.get("output_range_lists"))
 
         # Earliest start from engine availability. For a multi-slot engine the
         # op takes the slot that frees earliest, letting independent transfers

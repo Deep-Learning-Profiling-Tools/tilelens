@@ -60,6 +60,40 @@ def ds(start: int, size: int) -> slice:
     return slice(int(start), int(start) + int(size))
 
 
+
+def array_byte_runs(a: np.ndarray, origin: int, max_runs: int = 512):
+    """Exact merged half-open byte runs of view ``a`` that starts ``origin`` bytes into its root.
+
+    A bounding interval treats a strided slice such as ``t[:, j, :]`` of a partition-major tile as
+    covering every other slice; its exact footprint is one run per partition. Returns None when the
+    view has more than ``max_runs`` runs or a negative stride (callers keep the bounding interval).
+    """
+    if not a.size:
+        return ()
+    item = int(a.dtype.itemsize)
+    dims = [(int(n), int(st)) for n, st in zip(a.shape, a.strides) if int(n) > 1]
+    if any(st < 0 for _, st in dims):
+        return None
+    run = item
+    while dims and dims[-1][1] == run:
+        run *= dims[-1][0]
+        dims.pop()
+    count = 1
+    for n, _ in dims:
+        count *= n
+    if count > max_runs:
+        return None
+    offsets = np.zeros(1, dtype=np.int64)
+    for n, st in dims:
+        offsets = (offsets[:, None] + np.arange(n, dtype=np.int64)[None, :] * st).reshape(-1)
+    runs: list[list[int]] = []
+    for start in np.sort(origin + offsets).tolist():
+        if runs and start <= runs[-1][1]:
+            runs[-1][1] = max(runs[-1][1], start + run)
+        else:
+            runs.append([start, start + run])
+    return tuple((lo, hi) for lo, hi in runs)
+
 class MGridResult:
     """Small compatibility object exposing ``.p`` and ``.x`` index arrays."""
 
@@ -145,6 +179,12 @@ class NDArray:
             low += min(0, extent)
             high += max(0, extent)
         return (low, high + int(self.data.dtype.itemsize))
+
+    def byte_runs(self, max_runs: int = 512):
+        """Exact merged byte runs of this view relative to its root allocation (see ``array_byte_runs``)."""
+        if self.data is None or not self.data.size:
+            return ()
+        return array_byte_runs(self.data, int(self.data.ctypes.data) - self.storage_id(), max_runs)
 
     def _view_or_copy(self, value, name):
         state = self._storage_state if np.shares_memory(value, self.data) else None

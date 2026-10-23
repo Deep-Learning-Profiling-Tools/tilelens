@@ -124,6 +124,31 @@ class Tracer(Client):
         def _version(value):
             return int(value.tensor_version()) if hasattr(value, "tensor_version") else 0
 
+        def _runs(value):
+            """(root allocation id, exact byte runs) of an operand view, or None.
+
+            The beta2 NDArray has no storage identity: its recorded storage is the view's own
+            pointer and its range (0, nbytes). The root of the NumPy base chain gives the
+            allocation that DMA transfers are keyed by.
+            """
+            if hasattr(value, "byte_runs") and hasattr(value, "storage_id"):
+                return (int(value.storage_id()), value.byte_runs())
+            data = getattr(value, "data", None)
+            if not isinstance(data, np.ndarray):
+                return None
+            from triton_viz.core.simulation.nki import array_byte_runs
+            root = data
+            while isinstance(getattr(root, "base", None), np.ndarray):
+                root = root.base
+            origin = int(data.ctypes.data) - int(root.ctypes.data)
+            return (int(root.ctypes.data), array_byte_runs(data, origin))
+
+        def _attach_runs(rec, inputs, outputs):
+            # Exact byte runs of each operand view, parallel to input_ranges / output ranges
+            # (used only by CostModel.exact_tile_ranges).
+            rec.input_runs = tuple(_runs(value) for value in inputs)
+            rec.output_runs = tuple(_runs(value) for value in outputs)
+
         @self.lock_fn
         def post_load_callback(ret, ptr, mask, keys):
             if not self.sample:
@@ -290,6 +315,7 @@ class Tracer(Client):
             )
             rec.call_path = extract_user_frames(num_frames=1)
             ret._trace_record = rec
+            _attach_runs(rec, (input,), (ret,))
             self.records.append(rec)
 
         @self.lock_fn
@@ -337,6 +363,7 @@ class Tracer(Client):
             )
             rec.call_path = extract_user_frames(num_frames=1)
             ret._trace_record = rec
+            _attach_runs(rec, (input, other), (ret,))
             self.records.append(rec)
 
         @self.lock_fn
@@ -385,6 +412,7 @@ class Tracer(Client):
             )
             rec.call_path = extract_user_frames(num_frames=1)
             ret._trace_record = rec
+            _attach_runs(rec, [v for v in (input, other) if hasattr(v, "data_ptr")], [dst] if hasattr(dst, "data_ptr") else [])
             self.records.append(rec)
 
         @self.lock_fn
@@ -425,6 +453,7 @@ class Tracer(Client):
             )
             rec.call_path = extract_user_frames(num_frames=1)
             ret._trace_record = rec
+            _attach_runs(rec, inputs, (ret,))
             self.records.append(rec)
 
         @self.lock_fn
@@ -448,6 +477,7 @@ class Tracer(Client):
             )
             rec.call_path = extract_user_frames(num_frames=1)
             ret._trace_record = rec
+            _attach_runs(rec, (data,), (ret,))
             self.records.append(rec)
 
         callbacks = {
