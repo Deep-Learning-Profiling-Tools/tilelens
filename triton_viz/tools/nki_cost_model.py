@@ -2847,6 +2847,14 @@ def simulate(
         if model.tensor_instruction_law is not None
         else []
     )
+    if (
+        model.attention_pipeline_calibration is not None
+        and len(law_dot_events) == 2
+        and int(law_dot_events[0].get("attention_pipeline_value_width") or 0) > 0
+    ):
+        # The law replaces the FLOP surface only: the two-Dot attention pipeline keeps the surface
+        # calibrated on its own controls.
+        law_dot_events = []
     law_costs = [
         model.tensor_instruction_law.instruction_ns(_tensor_dtype(event), *_dot_geometry(event))
         if _dot_geometry(event) is not None

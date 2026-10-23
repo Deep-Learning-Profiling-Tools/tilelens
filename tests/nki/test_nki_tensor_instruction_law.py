@@ -63,3 +63,17 @@ def test_a_partial_row_stationary_exposes_the_weight_load():
     assert law.instruction_ns("float32", 128, 32, 512) == pytest.approx(100 + 512 + 200)
     assert law.instruction_ns("float32", 128, 128, 512) == pytest.approx(100 + 512)
     assert law.instruction_ns("float32", 128, 160, 512) == pytest.approx(2 * (100 + 512) + 200)   # 128 + 32
+
+
+def test_attention_pipeline_surface_keeps_precedence():
+    class Surface:
+        def predict_ns(self, dtype, width):
+            return 3000.0, "exact"
+
+    from triton_viz.tools.nki_cost_model import TensorCalibrationSurface
+    flops = TensorCalibrationSurface({"float32": (1000.0, 0.0)}, {"float32": (1.0, 1e12)}, {})
+    events = [dict(dot(0, 128, 64, 128, 10), attention_pipeline_value_width=64),
+              dict(dot(1, 128, 128, 64, 11), attention_pipeline_value_width=64)]
+    base = CostModel(tensor_startup_ns=0.0, tensor_calibration=flops, attention_pipeline_calibration=Surface())
+    law = replace(base, tensor_instruction_law=LAW)
+    assert tensor_busy(events, law) == pytest.approx(tensor_busy(events, base))
