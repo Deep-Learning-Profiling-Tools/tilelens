@@ -1727,6 +1727,10 @@ class CostModel:
     # Opt-in: split each surface-priced transfer into bandwidth occupancy and a fixed result latency
     # fitted from the surface's own points (DmaCalibrationSurface.split).
     dma_split_fixed_cost: bool = False
+    # Opt-in pipelined DMA queue: a transfer that starts while its queue is still busy hides the surface's
+    # fixed cost behind the previous transfer's stream and occupies only bytes / asymptotic bandwidth;
+    # a transfer that starts on an idle queue pays the fixed cost as occupancy.
+    dma_pipelined_fixed_cost: bool = False
     structured_control_lowering: StructuredControlCalibration | None = None
     whole_program_routing: WholeProgramRoutingCalibration | None = None
     strided_dma_calibration: StridedDmaCalibration | None = None
@@ -1895,6 +1899,17 @@ class CostModel:
                 self.hbm_bandwidth_bytes_per_ns,
             )
         return self.dma_startup_ns + nbytes / bandwidth
+
+    def dma_split_parts(self, event: dict[str, Any]) -> tuple[float, float] | None:
+        """(fixed_ns, bandwidth occupancy ns) of a surface-priced transfer, or None."""
+        partitions = int(event.get("partition_count") or 0)
+        surface = self._dma_surface(event)
+        if partitions <= 0 or surface is None or self._dma_lookup_free_bytes(event) <= 0:
+            return None
+        split = surface.split(partitions)
+        if split is None:
+            return None
+        return split[0], int(event.get("bytes") or 0) / split[1]
 
     def result_ready_ns(self, event: dict[str, Any], engine: str, duration: float) -> float:
         """Time from issue until the op's result is visible to a consumer.
@@ -3072,6 +3087,7 @@ def simulate(
         # op takes the slot that frees earliest, letting independent transfers
         # overlap; a single-slot engine keeps strict program order.
         slots = _slots_for(engine)
+        queue_free = min(slots) if slots else 0.0
         if engine == ENGINE_DMA and dma_resource_count:
             partitions = max(1, int(event.get("partition_count") or 1))
             demand = min(dma_resource_count, partitions)
@@ -3123,9 +3139,19 @@ def simulate(
             earliest = max(earliest, prior_transfer_end + (sync_ns if sync_ns else 0.0))
 
         start = earliest
+        pipelined = None
+        if (model.dma_pipelined_fixed_cost and engine == ENGINE_DMA and op in ("transfer", "load", "store")
+                and "scheduler_duration_override_ns" not in event):
+            pipelined = model.dma_split_parts(event)
+        if pipelined is not None:
+            fixed, stream = pipelined
+            # an idle queue pays the fixed cost; a busy one hides it behind the previous stream
+            busy = queue_free > 0.0 and start <= queue_free + 1.0
+            duration = stream + (0.0 if busy else fixed)
         end = start + duration
         # Result visibility (>= engine release); equal to `end` unless instruction latency is modelled.
-        ready = start + model.result_ready_ns(event, engine, duration)
+        ready = (end + (model.dma_result_latency_ns or 0.0) if pipelined is not None
+                 else start + model.result_ready_ns(event, engine, duration))
 
         for slot_index in slot_indices:
             slots[slot_index] = end

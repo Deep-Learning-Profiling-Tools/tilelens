@@ -68,3 +68,24 @@ def test_renaming_remaps_exact_lists():
     out = rename(events, 2)
     assert out[1]["input_range_lists"][0]["storage"] == out[0]["dst_storage"]
     assert StructureSchedule().need_order is False and StructureSchedule().exact_ranges is False
+
+
+def test_pipelined_queue_hides_fixed_cost_only_when_busy():
+    from types import SimpleNamespace
+
+    class Surface:
+        def split(self, partitions):
+            return 1000.0, 1.0                      # 1 us fixed, 1 byte/ns
+
+        def lookup(self, partitions, free_bytes):
+            return SimpleNamespace(bandwidth_gbps=0.5, match="exact", log_distance=0.0,
+                                   lookup_partitions=partitions, lookup_free_bytes=free_bytes)
+
+    model = replace(CostModel(), dma_pipelined_fixed_cost=True)
+    model._dma_surface = lambda event: Surface()     # noqa: E731 - test double
+    model._dma_lookup_free_bytes = lambda event: 4   # noqa: E731
+    back_to_back = [dict(load(0, 5, 0, 1000), bytes=1000), dict(load(1, 6, 0, 1000), bytes=1000)]
+    tl = simulate(back_to_back, model).timeline["dma"]
+    assert tl[0].end - tl[0].start == pytest.approx(2000.0)   # idle queue: fixed + stream
+    assert tl[1].end - tl[1].start == pytest.approx(1000.0)   # busy queue: stream only
+    assert CostModel().dma_pipelined_fixed_cost is False
