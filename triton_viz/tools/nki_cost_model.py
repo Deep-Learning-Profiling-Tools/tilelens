@@ -1087,6 +1087,56 @@ class InstructionLatencyCalibration:
 
 
 @dataclass
+class TensorInstructionLaw:
+    """TensorE time per matmul instruction from its geometry (opt-in).
+
+    The PE array is 128 x 128. A matmul instruction loads the stationary operand (K x M, LDWEIGHTS)
+    and streams the moving operand's N columns through the array (MATMUL), so its time depends on M
+    and N and not on the contraction depth K. The FLOP-priced surfaces (``TensorCalibrationSurface``)
+    were fitted on full 128 x 128 x 512 tiles and charge an instruction 2*M*K*N, which makes a K = 32
+    instruction four times too cheap. Controls ``bench/controls_pe`` (same product, only K, M, N
+    varied) measure the steady-state issue interval per instruction; one linear law per dtype:
+    ``interval = base_ns + ns_per_n * N + ns_per_m * M``, plus a once-per-kernel ``startup_ns``.
+    Shapes beyond one instruction (M, K > 128 or N > 512) are tiled into instructions.
+    """
+
+    points: dict[str, tuple[float, float, float, float]]
+
+    MAX_M, MAX_K, MAX_N = 128, 128, 512
+
+    @classmethod
+    def from_csv(cls, path: str | Path) -> "TensorInstructionLaw":
+        points: dict[str, tuple[float, float, float, float]] = {}
+        with Path(path).open(encoding="utf-8", newline="") as file:
+            for row in csv.DictReader(file):
+                points[TensorCalibrationSurface._normalize_dtype(row["dtype"])] = (
+                    float(row["startup_ns"]), float(row["base_ns"]), float(row["ns_per_n"]),
+                    float(row["ns_per_m"]))
+        return cls(points)
+
+    def _point(self, dtype: str) -> tuple[float, float, float, float] | None:
+        return self.points.get(TensorCalibrationSurface._normalize_dtype(dtype)) or self.points.get("float32")
+
+    def startup_ns(self, dtype: str) -> float:
+        point = self._point(dtype)
+        return point[0] if point else 0.0
+
+    def instruction_ns(self, dtype: str, m: int, k: int, n: int) -> float | None:
+        point = self._point(dtype)
+        if point is None or m <= 0 or k <= 0 or n <= 0:
+            return None
+        _startup, base, per_n, per_m = point
+        total = 0.0
+        k_tiles = math.ceil(k / self.MAX_K)
+        for m0 in range(0, m, self.MAX_M):
+            mt = min(self.MAX_M, m - m0)
+            for n0 in range(0, n, self.MAX_N):
+                nt = min(self.MAX_N, n - n0)
+                total += k_tiles * (base + per_n * nt + per_m * mt)
+        return total
+
+
+@dataclass
 class StructuredControlCalibration:
     """Interpolated points keyed by reusable structural grammar families."""
 
@@ -1499,6 +1549,14 @@ def _compute_value_dtype(event: dict[str, Any]) -> str:
     return Counter(value_dtypes).most_common(1)[0][0] if value_dtypes else output
 
 
+def _dot_geometry(event: dict[str, Any]) -> tuple[int, int, int] | None:
+    """(M, K, N) of a normalized Dot event: input (M, K) @ other (K, N)."""
+    a, b = event.get("input_shape") or (), event.get("other_shape") or ()
+    if len(a) != 2 or len(b) != 2 or int(a[1]) != int(b[0]):
+        return None
+    return int(a[0]), int(a[1]), int(b[1])
+
+
 def _tensor_dtype(event: dict[str, Any]) -> str:
     """Return the TensorE operand dtype, ignoring bool predicates/accumulators."""
     input_dtypes = [
@@ -1671,6 +1729,8 @@ class CostModel:
     strided_dma_calibration: StridedDmaCalibration | None = None
     tensor_calibration: TensorCalibrationSurface | None = None
     tensor_dot_count_calibration: TensorDotCountCalibration | None = None
+    # Opt-in per-instruction TensorE law (geometry, not FLOPs); None keeps the FLOP surfaces.
+    tensor_instruction_law: TensorInstructionLaw | None = None
     attention_pipeline_calibration: AttentionPipelineCalibration | None = None
     dma_elapsed_calibration: DmaElapsedCalibration | None = None
     onchip_transfer_calibration: OnChipTransferCalibration | None = None
@@ -2779,7 +2839,25 @@ def simulate(
         micro_dag_unsupported_engine_events += len(
             event.get("micro_dag_unsupported_engines") or ()
         )
-    if model.tensor_calibration is not None:
+    law_dot_events = (
+        [event for event in tensor_events if event.get("op") == "dot"]
+        if model.tensor_instruction_law is not None
+        else []
+    )
+    law_costs = [
+        model.tensor_instruction_law.instruction_ns(_tensor_dtype(event), *_dot_geometry(event))
+        if _dot_geometry(event) is not None
+        else None
+        for event in law_dot_events
+    ]
+    if law_dot_events and all(cost is not None for cost in law_costs):
+        # Opt-in TensorE instruction law: each Dot is charged its geometry's issue interval.
+        dtype = Counter(_tensor_dtype(event) for event in law_dot_events).most_common(1)[0][0]
+        tensor_startup_ns = max(0.0, model.tensor_instruction_law.startup_ns(dtype))
+        for event, cost in zip(law_dot_events, law_costs):
+            event["scheduler_duration_override_ns"] = cost
+            event["tensor_instruction_law"] = True
+    elif model.tensor_calibration is not None:
         calibrated_dot_events = [
             event for event in tensor_events if event.get("op") == "dot"
         ]
