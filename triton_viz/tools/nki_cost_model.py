@@ -1096,25 +1096,27 @@ class TensorInstructionLaw:
     were fitted on full 128 x 128 x 512 tiles and charge an instruction 2*M*K*N, which makes a K = 32
     instruction four times too cheap. Controls ``bench/controls_pe`` (same product, only K, M, N
     varied) measure the steady-state issue interval per instruction; one linear law per dtype:
-    ``interval = base_ns + ns_per_n * N + ns_per_m * M``, plus a once-per-kernel ``startup_ns``.
-    Shapes beyond one instruction (M, K > 128 or N > 512) are tiled into instructions.
+    ``interval = base_ns + ns_per_n * N + ns_per_m * M + [K < 128] * reload_ns``, plus a once-per-kernel
+    ``startup_ns``. A full-row stationary's weight load is hidden behind the previous instruction's
+    stream; a partial-row one (K < 128) is exposed. Shapes beyond one instruction (M, K > 128 or
+    N > 512) are tiled into instructions.
     """
 
-    points: dict[str, tuple[float, float, float, float]]
+    points: dict[str, tuple[float, ...]]
 
     MAX_M, MAX_K, MAX_N = 128, 128, 512
 
     @classmethod
     def from_csv(cls, path: str | Path) -> "TensorInstructionLaw":
-        points: dict[str, tuple[float, float, float, float]] = {}
+        points: dict[str, tuple[float, ...]] = {}
         with Path(path).open(encoding="utf-8", newline="") as file:
             for row in csv.DictReader(file):
                 points[TensorCalibrationSurface._normalize_dtype(row["dtype"])] = (
                     float(row["startup_ns"]), float(row["base_ns"]), float(row["ns_per_n"]),
-                    float(row["ns_per_m"]))
+                    float(row["ns_per_m"]), float(row.get("reload_ns") or 0.0))
         return cls(points)
 
-    def _point(self, dtype: str) -> tuple[float, float, float, float] | None:
+    def _point(self, dtype: str) -> tuple[float, ...] | None:
         return self.points.get(TensorCalibrationSurface._normalize_dtype(dtype)) or self.points.get("float32")
 
     def startup_ns(self, dtype: str) -> float:
@@ -1125,14 +1127,15 @@ class TensorInstructionLaw:
         point = self._point(dtype)
         if point is None or m <= 0 or k <= 0 or n <= 0:
             return None
-        _startup, base, per_n, per_m = point
+        base, per_n, per_m = point[1], point[2], point[3]
+        reload_ns = point[4] if len(point) > 4 else 0.0
         total = 0.0
-        k_tiles = math.ceil(k / self.MAX_K)
-        for m0 in range(0, m, self.MAX_M):
-            mt = min(self.MAX_M, m - m0)
-            for n0 in range(0, n, self.MAX_N):
-                nt = min(self.MAX_N, n - n0)
-                total += k_tiles * (base + per_n * nt + per_m * mt)
+        for k0 in range(0, k, self.MAX_K):
+            exposed = reload_ns if min(self.MAX_K, k - k0) < self.MAX_K else 0.0
+            for m0 in range(0, m, self.MAX_M):
+                mt = min(self.MAX_M, m - m0)
+                for n0 in range(0, n, self.MAX_N):
+                    total += base + per_n * min(self.MAX_N, n - n0) + per_m * mt + exposed
         return total
 
 
