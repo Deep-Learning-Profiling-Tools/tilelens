@@ -31,6 +31,8 @@ POINTWISE_OPS = frozenset({'add', 'subtract', 'multiply', 'divide', 'maximum', '
 def masked_free_dim(event):
     """Return a supported rectangular pointwise extent, otherwise keep declared pricing."""
     geometry = event.get('compute_mask_geometry', {})
+    if not isinstance(geometry, dict):
+        return None
     if (event.get('op') != 'compute' or event.get('api_op') not in POINTWISE_OPS
             or not event.get('compute_mask_provided') or geometry.get('status') != 'known'
             or geometry.get('rectangular') is not True):

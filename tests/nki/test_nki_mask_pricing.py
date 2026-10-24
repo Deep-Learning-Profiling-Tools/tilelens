@@ -30,3 +30,8 @@ def test_sparse_reduction_missing_mask_and_inconsistent_geometry_preserve_declar
     for change in [dict(rectangular=False),dict(active_elements=191),dict(bounds=[[0,1],[0,20000]])]:
         e=event();e['compute_mask_geometry'].update(change)
         assert masked_free_dim(e) is None
+
+
+def test_unknown_geometry_descriptor_preserves_declared_pricing():
+    for geometry in (None, [], 'unknown'):
+        assert masked_free_dim({**event(),'compute_mask_geometry':geometry}) is None
