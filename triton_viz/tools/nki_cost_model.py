@@ -938,15 +938,22 @@ class ComputeCalibration:
     ``startup_ns + F * ns_per_free_elem`` (partition-parallel: cost tracks the
     free axis, not total elements). Keyed by ``(engine, dtype, input_streams)``
     so one-input vs two-input and FP32 vs BF16 can differ. This is the cost of a
-    *single* lowered instruction; how many instructions a source ``nl.*`` op
+    *single* lowered instruction. An optional CSV ``issue_floor_ns`` column
+    supplies one shared minimum issue interval per engine/dtype, giving
+    ``max(issue_floor, startup + F * ns_per_free_elem)``. Missing floors preserve
+    the legacy affine path exactly. How many instructions a source ``nl.*`` op
     expands into is supplied separately by the Level-A expansion table.
     """
 
     points: dict
+    # Optional enqueue/resource floor shared by all stream counts of an engine
+    # and dtype. Empty for every legacy CSV and direct constructor.
+    issue_floors_ns: dict = field(default_factory=dict)
 
     @classmethod
     def from_csv(cls, path):
         points = {}
+        floors = {}
         with Path(path).open(encoding="utf-8", newline="") as file:
             for row in csv.DictReader(file):
                 try:
@@ -960,10 +967,19 @@ class ComputeCalibration:
                     continue
                 if value[0] < 0 or value[1] < 0:
                     continue
+                raw_floor = row.get("issue_floor_ns")
+                if raw_floor is not None and str(raw_floor).strip():
+                    floor = float(raw_floor)
+                    if not math.isfinite(floor) or floor < 0 or not all(math.isfinite(v) for v in value):
+                        raise ValueError(f"Invalid compute issue floor/calibration for {key}")
+                    floor_key = (key[0], cls._norm_dtype(key[1]))
+                    if floor_key in floors and floors[floor_key] != floor:
+                        raise ValueError(f"Conflicting engine/dtype issue floors for {floor_key}")
+                    floors[floor_key] = floor
                 points[key] = value
         if not points:
             raise ValueError(f"No compute calibration rows in {path}")
-        return cls(points)
+        return cls(points, floors)
 
     @staticmethod
     def _norm_dtype(dtype):
@@ -1011,7 +1027,14 @@ class ComputeCalibration:
                 hit = self.points.get(key)
             if hit is not None:
                 startup, per_elem = hit
-                return startup + max(0, int(free_dim)) * per_elem, match
+                duration = startup + max(0, int(free_dim)) * per_elem
+                calibrated_dtype = key[2] if match == "derived_streams" else key[1]
+                floor = self.issue_floors_ns.get((engine, calibrated_dtype))
+                if floor is None:
+                    return duration, match
+                if not math.isfinite(floor) or floor < 0 or not math.isfinite(duration):
+                    raise ValueError("Invalid compute issue floor or affine duration")
+                return max(floor, duration), match
         return None, "missing"
 
     def _derived_two_input(self, engine, dtype):

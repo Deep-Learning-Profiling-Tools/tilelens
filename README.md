@@ -154,7 +154,14 @@ The main artifacts under the selected root are:
   shared issue path. The resulting `descriptors * ns_per_descriptor` is a floor
   on DMA engine busy time and never lowers a bandwidth estimate.
 - `calibration/compute.csv` (Level-B per-instruction VectorE/ScalarE cost),
-  `structured_compute.csv` (Level-A expansion keyed by reusable structural
+  with optional `issue_floor_ns` for experimental calibration files: one shared
+  engine/dtype initiation floor, `max(floor, startup + F * slope)`. Conflicting
+  per-stream floors are rejected. Missing/blank columns preserve the affine
+  path. This sets issue cost, not consumer latency (modelled separately).
+  No shipped calibration enables the floor; operator-family validation is
+  pending and this feature is not a promoted cost model.
+
+- `calibration/structured_compute.csv` (Level-A expansion keyed by reusable structural
   grammar), `static_dma.csv`, and `strided_dma.csv`.
 - `calibration/onchip_transfer_frozen_v1.csv`: measured PSUM/SBUF on-chip copy
   latency `startup + ns_per_free_elem * free`, keyed by `(engine, dtype)` with
