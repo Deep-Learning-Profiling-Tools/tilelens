@@ -37,7 +37,9 @@ import heapq
 from dataclasses import dataclass
 from typing import Any
 
-SBUF_PARTITION_BYTES = 192 * 1024
+# Gen2 exposes 192 KiB physically, with 16 KiB reserved per partition.
+# Match NKI SDK _SBUF_FMAX_BYTES["gen2"]: source allocations use 176 KiB.
+SBUF_PARTITION_BYTES = 176 * 1024
 
 
 @dataclass(frozen=True)

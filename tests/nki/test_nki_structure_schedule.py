@@ -96,7 +96,7 @@ def test_load_never_passes_a_store_to_the_same_hbm_range():
 
 def test_capacity_derived_depth_and_signature_fallback():
     events = loop(4)
-    assert buffering_depth(events, StructureSchedule()) == (192 * 1024) // (2 * F * 4)
+    assert buffering_depth(events, StructureSchedule()) == (176 * 1024) // (2 * F * 4)
     no_sites = [{k: v for k, v in e.items() if k != "source_site"} for e in events]
     assert dma_order(no_sites, StructureSchedule(depth=2)) == dma_order(events, StructureSchedule(depth=2))
 
@@ -127,7 +127,7 @@ def test_persistent_bytes_reduce_capacity():
     fresh = loop(4)
     big = [dict(e) for e in fresh] + [dict(load(99, 0, 7, site="k.py:3"), free_bytes_per_partition=150 * 1024),
                                       dict(load(100, 1, 7, site="k.py:3"), free_bytes_per_partition=150 * 1024)]
-    assert buffering_depth(big, StructureSchedule()) == (192 * 1024 - 150 * 1024) // (2 * F * 4)
+    assert buffering_depth(big, StructureSchedule()) == (176 * 1024 - 150 * 1024) // (2 * F * 4)
 
 
 def test_dma_result_latency_delays_only_dependent_consumers():
@@ -197,3 +197,11 @@ def test_surface_split_recovers_fixed_cost_and_bandwidth():
         assert abs(got[0] - fixed) < 1e-6 and abs(got[1] - bw) < 1e-6
     mid = surf.split(45)                                        # interpolated in log2(p)
     assert 200.0 < mid[0] < 600.0 and 100.0 < mid[1] < 250.0
+
+
+def test_capacity_excludes_reserved_sbuf_space():
+    event = dict(load(0, 0, 100), free_bytes_per_partition=64 * 1024)
+    # Three buffers fit physical capacity, but not the SDK's usable allocation
+    # space. Explicit capacity overrides remain available for other devices.
+    assert buffering_depth([event], StructureSchedule()) == 2
+    assert buffering_depth([event], StructureSchedule(sbuf_partition_bytes=192 * 1024)) == 3
