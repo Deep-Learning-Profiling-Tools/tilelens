@@ -3341,8 +3341,10 @@ def simulate(
     )
     final_ns = max(makespan_only_ns, global_completion_ns)
     # Programs priced by a dedicated control-calibrated path (attention pipeline) keep that result.
-    if (model.structure_schedule is not None and model.structure_schedule.schedule_completion
-            and attention_pipeline_match not in {"exact", "interpolated"}):
+    schedule_completion_active = (model.structure_schedule is not None
+                                  and model.structure_schedule.schedule_completion
+                                  and attention_pipeline_match not in {"exact", "interpolated"})
+    if schedule_completion_active:
         # Schedule-derived completion: the structure-aware schedule replaces the structure-free
         # non-overlap term; the controls-calibrated launch/drain offset (which no schedule contains)
         # is kept as the single global residual.
@@ -3483,6 +3485,16 @@ def simulate(
     )
     if model.structure_schedule is not None:
         result.components_ns["structure_buffer_depth"] = float(structure_depth)
+    if schedule_completion_active:
+        # Expose the exact envelope used for controls-only residual calibration.
+        # These opt-in fields avoid treating a launch-overlapped static floor as
+        # payload to which another launch offset should be added.
+        result.components_ns.update(
+            schedule_payload_ns=makespan_dynamic + max(0.0, model.kernel_overhead_ns),
+            schedule_residual_ns=offset,
+            schedule_static_floor_ns=structural_static_ns,
+            schedule_global_floor_ns=global_completion_ns if schedule.global_floor else 0.0,
+        )
     return result
 
 

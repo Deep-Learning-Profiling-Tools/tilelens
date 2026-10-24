@@ -205,3 +205,15 @@ def test_capacity_excludes_reserved_sbuf_space():
     # space. Explicit capacity overrides remain available for other devices.
     assert buffering_depth([event], StructureSchedule()) == 2
     assert buffering_depth([event], StructureSchedule(sbuf_partition_bytes=192 * 1024)) == 3
+
+
+def test_completion_components_support_residual_recalibration_without_changing_payload():
+    base = replace(CostModel(), structure_schedule=StructureSchedule(schedule_completion=True, residual_offset_ns=0))
+    first = simulate(loop(4), base)
+    shifted = simulate(loop(4), replace(base, structure_schedule=replace(base.structure_schedule, residual_offset_ns=5000)))
+    for result in (first, shifted):
+        c = result.components_ns
+        assert result.predicted_latency_ns == max(c['schedule_payload_ns'] + c['schedule_residual_ns'],
+                                                  c['schedule_static_floor_ns'], c['schedule_global_floor_ns'])
+    assert first.components_ns['schedule_payload_ns'] == shifted.components_ns['schedule_payload_ns']
+    assert 'schedule_payload_ns' not in simulate(loop(4), CostModel()).components_ns

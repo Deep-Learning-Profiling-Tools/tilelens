@@ -425,3 +425,10 @@ If you find this repo useful for your research, please cite our paper:
 }
 ```
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+When schedule-derived completion is enabled, `components_ns` also exposes
+`schedule_payload_ns`, `schedule_residual_ns`, `schedule_static_floor_ns`, and
+`schedule_global_floor_ns`. Final latency is the maximum of payload plus residual
+and the two floors. Controls-only residual fitting can therefore retain the
+static-DMA envelope instead of adding an offset to a floor that already overlaps
+launch. These fields are absent from default reports.
