@@ -1740,6 +1740,7 @@ class CostModel:
     # Opt-in consumer-visible instruction latency (dependent chains); None keeps the
     # initiation-interval-only behaviour byte-identical.
     instruction_latency: InstructionLatencyCalibration | None = None
+    active_compute_masks: bool = False  # opt-in rectangular pointwise source-mask geometry
     # Opt-in structure-aware issue order (bounded renaming + dependency-ordered loads); see
     # triton_viz.tools.nki_structure_schedule. Typed loosely to avoid an import cycle.
     structure_schedule: Any = None
@@ -1939,6 +1940,14 @@ class CostModel:
             return None
         return split[0], int(event.get("bytes") or 0) / split[1]
 
+    def compute_free_dim(self, event):
+        if self.active_compute_masks:
+            from triton_viz.core.compute_mask import masked_free_dim
+            active = masked_free_dim(event)
+            if active is not None:
+                return active
+        return _free_dim(event)
+
     def result_ready_ns(self, event: dict[str, Any], engine: str, duration: float) -> float:
         """Time from issue until the op's result is visible to a consumer.
 
@@ -1962,7 +1971,7 @@ class CostModel:
             return duration + fixed + latency
         if self.instruction_latency is None or event.get("op") not in ("binary", "compute", "reduce_sum"):
             return duration
-        free_dim = _free_dim(event)
+        free_dim = self.compute_free_dim(event)
         if free_dim is None:
             return duration
         latency = self.instruction_latency.latency_ns(
@@ -1997,7 +2006,7 @@ class CostModel:
             # do not feed them through the independently fitted Dot surface.
             return (event.get("flops") or 0) / self.tensor_flops_per_ns
         if op in ("binary", "compute", "reduce_sum"):
-            free_dim = _free_dim(event)
+            free_dim = self.compute_free_dim(event)
             # Level-B calibrated path: cost one lowered instruction from the
             # measured per-instruction surface, times the Level-A expansion
             # factor (how many hardware instructions this source op lowers to on

@@ -440,3 +440,12 @@ unsupported broadcasts have distinct statuses. This opt-in metadata preserves
 declared shapes and does not alter pricing. Sparse masks retain their exact
 active count and are never described as a filled bounding box. Default traces
 retain the previous fields.
+
+`CostModel(active_compute_masks=True)` opts into rectangular pointwise mask
+extents for per-instruction issue cost and consumer latency. It requires captured
+source mask geometry, matching input/output/domain shapes and consistent dense
+bounds/counts. Unsupported operations (including reductions), sparse/empty masks,
+missing metadata and inconsistent descriptors retain declared-geometry pricing.
+Allocation sizes, dependencies and source shapes are unchanged. This experimental
+path has source/compiler predicate validation; decision and promotion gates remain
+separate.
