@@ -50,9 +50,11 @@ class Tracer(Client):
         self,
         callpath: bool = True,
         grid_idx: tuple[int] | int | None = None,
+        compute_masks: bool = False,
     ):
         super().__init__()  # Initialize parent class
         self.callpath = callpath
+        self.compute_masks = compute_masks
         self.grid_idx = _convert_grid_idx(grid_idx)
         self.records: list = []
         self.tensors: list = []
@@ -430,6 +432,19 @@ class Tracer(Client):
             output_shape = tuple(ret.shape) if hasattr(ret, "shape") else ()
             input_dtypes = tuple(str(x.dtype) for x in inputs if hasattr(x, "dtype"))
             output_dtype = str(ret.dtype) if hasattr(ret, "dtype") else ""
+            compute_attrs = {
+                "compute_mask_provided": bool(getattr(ret, "_nki_compute_mask_provided", False))
+            }
+            mask = getattr(ret, "_nki_compute_mask", None)
+            if self.compute_masks and mask is not None:
+                from ...core.compute_mask import compute_mask_geometry
+                try:
+                    domain = np.broadcast_shapes(*input_shapes) if input_shapes else output_shape
+                except ValueError:
+                    compute_attrs["compute_mask_geometry"] = {"status": "unsupported_input_domain"}
+                else:
+                    value = mask.data if hasattr(mask, "data_ptr") else mask
+                    compute_attrs["compute_mask_geometry"] = compute_mask_geometry(value, domain)
             rec = NkiCompute(
                 api_op=str(ret._nki_api),
                 engine=str(getattr(ret, "_nki_engine", "vector")),
@@ -439,11 +454,7 @@ class Tracer(Client):
                 output_shapes=(output_shape,) if output_shape else (),
                 input_dtypes=input_dtypes,
                 output_dtype=output_dtype,
-                attrs={
-                    "compute_mask_provided": bool(
-                        getattr(ret, "_nki_compute_mask_provided", False)
-                    )
-                },
+                attrs=compute_attrs,
                 input_storages=tuple(_storage(x) for x in inputs),
                 input_ranges=tuple(_range(x) for x in inputs),
                 input_versions=tuple(_version(x) for x in inputs),

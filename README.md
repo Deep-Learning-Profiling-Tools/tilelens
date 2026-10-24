@@ -432,3 +432,11 @@ When schedule-derived completion is enabled, `components_ns` also exposes
 and the two floors. Controls-only residual fitting can therefore retain the
 static-DMA envelope instead of adding an offset to a floor that already overlaps
 launch. These fields are absent from default reports.
+
+`Tracer(compute_masks=True)` captures compact explicit compute-mask geometry for
+legacy `nl.*` NKI operations: execution-domain shape, active element count,
+coordinate bounds and whether activity fills that rectangle. Empty masks and
+unsupported broadcasts have distinct statuses. This opt-in metadata preserves
+declared shapes and does not alter pricing. Sparse masks retain their exact
+active count and are never described as a filled bounding box. Default traces
+retain the previous fields.

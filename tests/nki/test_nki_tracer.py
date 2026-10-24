@@ -451,3 +451,24 @@ def test_nki_trace_save_load_roundtrip(tmp_path: Path):
     record_types = [type(r) for r in records]
 
     assert record_types == [Grid, Load, Store] * div_ceil(n_elements, 4)
+
+
+def test_opt_in_compute_mask_geometry_preserves_declared_tile_shape():
+    def run(capture):
+        triton_viz.clear()
+        @triton_viz.trace(client=Tracer(compute_masks=capture), frontend="nki")
+        def kernel(x_ptr, out_ptr):
+            offs = nl.arange(8)
+            mask = offs < 6
+            value = nl.load(x_ptr[offs], mask=mask)
+            result = nl.maximum(value, 0.0, mask=mask)
+            nl.store(out_ptr[offs], result, mask=mask)
+        kernel[(1,)](NDArray(value=np.arange(8, dtype=np.float32)), NDArray(value=np.zeros(8, dtype=np.float32)))
+        return next(e for e in records_to_events(launches[-1].records) if e.get('op')=='compute')
+    default, captured = run(False), run(True)
+    geometry = captured.pop('compute_mask_geometry')
+    # Runtime storage addresses differ between runs; shape/mask facts do not.
+    assert captured['input_shape'] == default['input_shape'] == [8]
+    assert captured['output_shape'] == default['output_shape'] == [8]
+    assert 'compute_mask_geometry' not in default
+    assert geometry == dict(status='known',shape=[8],active_elements=6,bounds=[[0,6]],rectangular=True)

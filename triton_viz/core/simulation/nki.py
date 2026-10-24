@@ -476,13 +476,14 @@ class Builder:
 
     @staticmethod
     def _tag(
-        nd: "NDArray", api: str, engine: str, inputs, *, compute_mask_provided=False
+        nd: "NDArray", api: str, engine: str, inputs, *, compute_mask_provided=False, compute_mask=None
     ) -> "NDArray":
         """Annotate a result NDArray so the tracer can emit an NkiCompute event."""
         nd._nki_api = api
         nd._nki_engine = engine
         nd._nki_inputs = tuple(i for i in inputs if isinstance(i, NDArray))
-        nd._nki_compute_mask_provided = bool(compute_mask_provided)
+        nd._nki_compute_mask_provided = bool(compute_mask_provided or compute_mask is not None)
+        nd._nki_compute_mask = compute_mask
         return nd
 
     def _unary_op(self, x: NDArray, np_func, op_name, **kwargs):
@@ -490,7 +491,7 @@ class Builder:
         nd = NDArray(value=np_func(x.data), name=f"{x.name}_{op_name}", **kwargs)
         return self._tag(
             nd, op_name, "scalar", (x,),
-            compute_mask_provided=kwargs.get("mask") is not None,
+            compute_mask=kwargs.get("mask"),
         )
 
     # Elementwise operator implementations
@@ -633,7 +634,7 @@ class Builder:
             )
             return self._tag(
                 nd, "multiply", "vector", (x, y),
-                compute_mask_provided=kwargs.get("mask") is not None,
+                compute_mask=kwargs.get("mask"),
             )
         elif np.isscalar(y):
             nd = NDArray(
@@ -643,7 +644,7 @@ class Builder:
             )
             return self._tag(
                 nd, "multiply", "vector", (x,),
-                compute_mask_provided=kwargs.get("mask") is not None,
+                compute_mask=kwargs.get("mask"),
             )
         else:
             raise TypeError(f"Unsupported type for multiply: {type(y)}")
@@ -667,7 +668,7 @@ class Builder:
         nd = NDArray(value=result, name=f"{xn}_{op_name}_{yn}")
         return self._tag(
             nd, op_name, "vector", (x, y),
-            compute_mask_provided=mask is not None,
+            compute_mask=mask,
         )
 
     def add(self, x, y, *, dtype=None, mask=None, **kwargs):
@@ -750,7 +751,7 @@ class Builder:
         inputs = (x, mask) if isinstance(mask, NDArray) else (x,)
         return self._tag(
             nd, op_name, "vector", inputs,
-            compute_mask_provided=mask is not None,
+            compute_mask=mask,
         )
 
     def max(self, x: NDArray, *, axis=None, keepdims=False, dtype=None, mask=None, **kwargs):

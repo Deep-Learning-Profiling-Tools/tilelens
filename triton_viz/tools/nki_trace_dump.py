@@ -633,6 +633,8 @@ def record_to_event(
             "compute_mask_provided": bool(
                 record.attrs.get("compute_mask_provided", False)
             ),
+            **({"compute_mask_geometry": record.attrs["compute_mask_geometry"]}
+               if "compute_mask_geometry" in record.attrs else {}),
         }
 
     if isinstance(record, TensorTranspose):
