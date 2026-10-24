@@ -33,6 +33,7 @@ bytes are the per-partition bytes of one buffer per on-chip site. No parameter i
 from __future__ import annotations
 
 from collections import defaultdict
+import heapq
 from dataclasses import dataclass
 from typing import Any
 
@@ -230,20 +231,30 @@ def need_order(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         while j < len(events) and _is_load(events[j]):
             j += 1
         run = list(range(i, j))
-        placed: list[int] = []
-        for k in sorted(run, key=lambda k: (need[k], k)):
-            # a load may not pass an earlier load whose destination it overlaps
-            blockers = [b for b in run if b < k and b not in placed and
-                        _overlap(_accesses(events[k], "write"), _accesses(events[b], "write"))]
-            for b in sorted(blockers):
-                placed.append(b)
-            if k not in placed:
-                placed.append(k)
-        seen = set()
-        for k in placed:
-            if k not in seen:
-                seen.add(k)
-                out.append(events[k])
+        # Original-order WAW edges form a DAG. A direct-blocker insertion
+        # can move a blocker past its own predecessor, so schedule only ready
+        # loads. Propagate consumer priority backward through these edges.
+        writes = {k: _accesses(events[k], "write") for k in run}
+        successors: dict[int, list[int]] = {k: [] for k in run}
+        indegree = {k: 0 for k in run}
+        for offset, earlier in enumerate(run):
+            for later in run[offset + 1:]:
+                if _overlap(writes[earlier], writes[later]):
+                    successors[earlier].append(later)
+                    indegree[later] += 1
+        priority = {k: need[k] for k in run}
+        for k in reversed(run):
+            for later in successors[k]:
+                priority[k] = min(priority[k], priority[later])
+        ready = [(priority[k], k) for k in run if indegree[k] == 0]
+        heapq.heapify(ready)
+        while ready:
+            _, k = heapq.heappop(ready)
+            out.append(events[k])
+            for later in successors[k]:
+                indegree[later] -= 1
+                if indegree[later] == 0:
+                    heapq.heappush(ready, (priority[later], later))
         i = j
     return out
 

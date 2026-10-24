@@ -111,3 +111,34 @@ def test_multiqueue_dma_shares_bandwidth_and_hides_fixed_cost_when_concurrent():
     assert tl[1].start == pytest.approx(0.0)                  # second queue starts at once
     assert tl[1].end - tl[1].start == pytest.approx(2000.0)   # concurrent: bytes * 2 / aggregate, no fixed
     assert CostModel().dma_queues == 0
+
+
+def test_need_order_preserves_transitive_overlapping_writes():
+    # A overlaps B, B overlaps C, A does not overlap C. C is needed first,
+    # but placing only its direct blocker B would illegally pass B over A.
+    a, b, c = load(0, 5, 0, 2), load(1, 5, 1, 3), load(2, 5, 2, 4)
+    consumer = dict(op="compute", seq=3, input_storages=[5], input_ranges=[[3, 4]])
+    out = need_order([a, b, c, consumer])
+    assert [e["seq"] for e in out] == [0, 1, 2, 3]
+
+
+def test_need_order_preserves_loaded_values_for_partial_aliases():
+    from itertools import product
+
+    intervals = [(lo, hi) for lo in range(3) for hi in range(lo + 1, 4)]
+    for ranges in product(intervals, repeat=3):
+        loads = [load(i, 5, lo, hi) for i, (lo, hi) in enumerate(ranges)]
+        for byte in range(3):
+            consumer = dict(op="compute", seq=3, input_storages=[5], input_ranges=[[byte, byte + 1]])
+            reordered = need_order([*loads, consumer])
+
+            def loaded_values(events):
+                values = [None] * 3
+                for event in events:
+                    if event["op"] == "transfer":
+                        lo, hi = event["dst_range"]
+                        values[lo:hi] = [event["seq"]] * (hi - lo)
+                return values
+
+            assert loaded_values(reordered) == loaded_values(loads)
+            assert len(reordered) == 4 and reordered[-1] is consumer
