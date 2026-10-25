@@ -1981,6 +1981,8 @@ class CostModel:
     def cost_ns(self, event: dict[str, Any]) -> float:
         """Return the estimated duration in ns for one trace event."""
         op = event.get("op")
+        if op == "memory_fill":
+            raise ValueError("Unpriced memory initializer: independent fill calibration required")
         engine = _canonical_engine(event.get("engine", ""), op or "")
         if op == "dot":
             flops = event.get("flops") or 0

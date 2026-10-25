@@ -99,6 +99,7 @@ if HAS_NKI_BETA2:
             "tensor_tensor": BinaryOp,
             "tensor_reduce": ReduceSum,
             "tensor_scalar": NkiCompute,
+            "memset": NkiCompute,
             "activation": NkiCompute,
             "reciprocal": NkiCompute,
         },

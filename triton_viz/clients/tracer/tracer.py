@@ -275,6 +275,9 @@ class Tracer(Client):
                 dst_partition_axis=getattr(dst, "partition_axis", None),
                 dma_pattern=str(dma_pattern),
             )
+            if src.element_size() != dst.element_size():
+                rec.src_bytes = int(np.prod(src.shape)) * src.element_size()
+                rec.dst_bytes = int(np.prod(dst.shape)) * dst.element_size()
             rec.call_path = extract_user_frames(num_frames=1)
             self.records.append(rec)
 
@@ -435,6 +438,26 @@ class Tracer(Client):
             compute_attrs = {
                 "compute_mask_provided": bool(getattr(ret, "_nki_compute_mask_provided", False))
             }
+            if ret._nki_api == "memset" and getattr(ret, "_nki_memory_initializer", False):
+                memory = getattr(ret, "buffer", "unknown")
+                allocation = ret
+                while getattr(allocation, "_parent", None) is not None:
+                    allocation = allocation._parent
+                output_axis = getattr(ret, "partition_axis", None)
+                allocation_axis = getattr(allocation, "partition_axis", None)
+                if output_axis is None and len(ret.shape) == 2:
+                    output_axis = 0
+                if allocation_axis is None and len(allocation.shape) == 2:
+                    allocation_axis = 0
+                compute_attrs.update(
+                    allocation_storage=_storage(allocation),
+                    allocation_shape=list(allocation.shape),
+                    allocation_partition_axis=allocation_axis,
+                    memory_initializer=True,
+                    output_memory=str(getattr(memory, "buffer", memory)),
+                    output_partition_axis=output_axis,
+                    fill_value=ret._nki_fill_value,
+                )
             mask = getattr(ret, "_nki_compute_mask", None)
             if self.compute_masks and mask is not None:
                 from ...core.compute_mask import compute_mask_geometry

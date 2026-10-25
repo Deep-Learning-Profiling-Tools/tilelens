@@ -460,6 +460,8 @@ def record_to_event(
         return {**base, "op": "grid", "grid_idx": _jsonable(record.idx)}
 
     if isinstance(record, Transfer):
+        src_bytes = int(getattr(record, "src_bytes", record.bytes))
+        dst_bytes = int(getattr(record, "dst_bytes", record.bytes))
         src_shape = _shape(record.src_offsets.shape)
         dst_shape = _shape(record.dst_offsets.shape)
         if record.mem_dst.lower() == "sbuf":
@@ -492,12 +494,14 @@ def record_to_event(
             "dma_pattern": dma_pattern,
             "src_storage": int(record.src_ptr),
             "dst_storage": int(record.dst_ptr),
-            "src_range": _byte_span(record.src_offsets, int(record.bytes)),
-            "src_ranges": _byte_ranges(record.src_offsets, int(record.bytes)),
-            "dst_range": _byte_span(record.dst_offsets, int(record.bytes)),
-            "dst_ranges": _byte_ranges(record.dst_offsets, int(record.bytes)),
+            "src_range": _byte_span(record.src_offsets, src_bytes),
+            "src_ranges": _byte_ranges(record.src_offsets, src_bytes),
+            "dst_range": _byte_span(record.dst_offsets, dst_bytes),
+            "dst_ranges": _byte_ranges(record.dst_offsets, dst_bytes),
             **_dma_geometry(shape, int(record.bytes), partition_axis),
         }
+        if src_bytes != dst_bytes:
+            event.update(src_bytes=src_bytes, dst_bytes=dst_bytes)
         # Access geometry on the HBM side of the transfer. The legacy Load/
         # Store events always carry ``_offset_geometry``; beta2 Transfer
         # records carry concrete source/destination byte offsets instead, so
@@ -513,7 +517,7 @@ def record_to_event(
             offsets = np.asarray([])
         if offsets.size:
             masks = np.ones(offsets.shape, dtype=bool)
-            geometry = _offset_geometry(offsets, masks, int(record.bytes))
+            geometry = _offset_geometry(offsets, masks, src_bytes if "hbm" in mem_src else dst_bytes)
             event.update(geometry)
         event["dma_pattern"] = dma_pattern
         return event
@@ -595,6 +599,30 @@ def record_to_event(
             "output_version": record.output_version,
             "input_dtypes": [str(value) for value in record.input_dtypes],
             "output_dtype": record.output_dtype,
+        }
+
+    if isinstance(record, NkiCompute) and record.attrs.get("memory_initializer"):
+        shape = list(record.output_shapes[0]) if record.output_shapes else []
+        return {
+            **base,
+            "op": "memory_fill",
+            "api_op": record.api_op,
+            "engine": record.engine,
+            "input_storages": [],
+            "input_ptrs": [],
+            "output_ptr": int(record.output_ptrs[0]) if record.output_ptrs else None,
+            "output_storage": int(record.output_storages[0]) if record.output_storages else None,
+            "output_range": list(record.output_ranges[0]) if record.output_ranges else None,
+            "output_version": int(record.output_versions[0]) if record.output_versions else None,
+            "output_shape": shape,
+            "output_dtype": record.output_dtype,
+            "output_memory": record.attrs["output_memory"],
+            "output_partition_axis": record.attrs["output_partition_axis"],
+            "allocation_storage": record.attrs["allocation_storage"],
+            "allocation_shape": record.attrs["allocation_shape"],
+            "allocation_partition_axis": record.attrs["allocation_partition_axis"],
+            "fill_value": record.attrs["fill_value"],
+            "timing_status": "unpriced_initializer",
         }
 
     if isinstance(record, NkiCompute):

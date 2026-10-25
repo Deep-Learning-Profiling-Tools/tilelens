@@ -744,9 +744,12 @@ def ds(start: int | NDArray, size: int | NDArray) -> slice:
 
 
 class TileSize:
-    """Minimal tile size constants used by beta2 example kernels."""
+    """Minimal Gen2 tile geometry used by beta2 example kernels."""
 
     pmax = 128
+    psum_bank_fmax = 512
+    psum_bank_fmax_bytes = 2048
+    psum_num_banks = 8  # Gen2; no reserved PE-transpose bank.
     gemm_stationary_fmax = 128
     gemm_moving_fmax = 512
 
@@ -1059,6 +1062,30 @@ def tensor_reduce(
     return result
 
 
+def memset(dst: NDArray, value: ScalarLike, engine: Any = nisa.engine.unknown,
+           name: str | None = None) -> NDArray:
+    """Fill on-chip storage and retain its write identity for lifetime analysis.
+
+    This records an initializer, not a calibrated arithmetic instruction. The
+    cost model must reject its timing until an independent fill law is supplied.
+    """
+    _require(isinstance(dst, NDArray), "memset dst must be an NDArray")
+    _require(_buffer_name(dst) in ("sbuf", "psum"), "memset requires on-chip dst")
+    _require(np.isscalar(value), "memset value must be a scalar constant")
+    engines = {nisa.engine.vector: "vector", nisa.engine.gpsimd: "gpsimd",
+               nisa.engine.unknown: "unknown"}
+    _require(engine in engines, f"unsupported memset engine: {engine}")
+    tagged = _store(dst, np.full(dst.shape, value))
+    tagged._nki_api = "memset"
+    tagged._nki_engine = engines[engine]
+    tagged._nki_inputs = ()
+    tagged._nki_compute_mask_provided = False
+    tagged._nki_compute_mask = None
+    tagged._nki_memory_initializer = True
+    tagged._nki_fill_value = value.item() if isinstance(value, np.generic) else value
+    return tagged
+
+
 def tensor_scalar(
     dst: NDArray,
     data: NDArray,
@@ -1329,6 +1356,7 @@ def nki_patch_lang(scope: Any = None) -> None:
     set_attr(nisa, "tensor_tensor", tensor_tensor)
     set_attr(nisa, "tensor_reduce", tensor_reduce)
     set_attr(nisa, "tensor_scalar", tensor_scalar)
+    set_attr(nisa, "memset", memset)
 
 
 def nki_unpatch_lang(scope: Any = None) -> None:
