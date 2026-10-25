@@ -1314,6 +1314,19 @@ def nki_patch_lang(scope: Any = None) -> None:
     set_attr(nisa, "tensor_reduce", tensor_reduce)
     set_attr(nisa, "tensor_scalar", tensor_scalar)
 
+    from triton_viz.core.simulation.nki_isa_contracts import (
+        checked_operation,
+        checks_enabled,
+    )
+
+    if checks_enabled():
+        for operation in (
+            "nc_matmul", "nc_transpose", "activation", "exponential", "reciprocal",
+            "dma_copy", "dma_transpose", "tensor_copy", "tensor_tensor",
+            "tensor_reduce", "tensor_scalar",
+        ):
+            set_attr(nisa, operation, checked_operation(operation, getattr(nisa, operation)))
+
 
 def nki_unpatch_lang(scope: Any = None) -> None:
     """Restore beta2 language patches when the scope supports it.
