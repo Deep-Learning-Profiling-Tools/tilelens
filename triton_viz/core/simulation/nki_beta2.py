@@ -107,8 +107,9 @@ def _mark_defined(value: Any) -> None:
 def _store(dst: NDArray, value: TensorOrScalar) -> NDArray:
     """Write a computed value into a destination tensor."""
     # A later write must not retain a prior operation's companion outputs.
-    if hasattr(dst, "_nki_extra_outputs"):
-        del dst._nki_extra_outputs
+    for attr in ("_nki_extra_outputs", "_nki_scalar_state"):
+        if hasattr(dst, attr):
+            delattr(dst, attr)
     dst.data[...] = _cast_value(value, dst.dtype)
     _mark_defined(dst)
     return dst
@@ -1204,7 +1205,7 @@ def activation(
         scale: Optional scalar or per-partition scale operand.
         reduce_op: Optional reduction operator token. Only ``nl.add`` is legal.
         reduce_res: Optional destination tensor for a companion reduction result.
-        reduce_cmd: Unused beta2 reduction command token kept for API parity.
+        reduce_cmd: Controls persistent Scalar reduction registers.
         name: Optional kernel op name retained for API parity.
     """
     _require(isinstance(op, SubOp), f"Unsupported op: {op}")
@@ -1245,19 +1246,47 @@ def activation(
     tagged._nki_inputs = tuple(
         item for item in (data, bias, scale) if isinstance(item, NDArray)
     )
-    if reduce_res is not None and reduce_op is not None:
-        _require(
-            reduce_res.shape == (data_par, 1),
-            f"reduce_res must have shape (P, 1), expected {(data_par, 1)}, received {reduce_res.shape}",
-        )
+    command = getattr(reduce_cmd, "name", None)
+    _require(command in ("idle", "reset", "reduce", "reset_reduce"),
+             f"Unsupported activation reduce_cmd: {reduce_cmd}")
+    _require(reduce_op is not None or command in ("idle", "reset"),
+             "activation reduce/reset_reduce requires reduce_op")
+    writes_state = reduce_op is not None or command == "reset"
+    reads_state = command == "reduce" or (reduce_res is not None and not writes_state)
+    registers = nki_builder.scalar_reduce_regs[:data_par]
+    valid = nki_builder.scalar_reduce_valid[:data_par]
+    if command == "reset":
+        registers[:] = 0.0
+        valid[:] = True
+    elif reduce_op is not None:
         reduced = np.sum(
             np.asarray(output_value, dtype=np.float32).reshape(data_par, -1),
-            axis=1,
-            keepdims=True,
+            axis=1, keepdims=True,
         )
-        _store(reduce_res, reduced)
+        if command == "reduce":
+            _require(bool(np.all(valid)), "Scalar reduction registers are uninitialized in this program")
+            registers[:] = registers + reduced
+        else:
+            # NC-v2 control probes show reducing idle replaces the registers,
+            # just like reset_reduce; it does not preserve an earlier sum.
+            registers[:] = reduced
+        valid[:] = True
+    if writes_state or reads_state:
+        access = {"name": "scalar.reduce_regs", "start": 0, "end": data_par}
+        tagged._nki_scalar_state = {
+            "command": command,
+            "reads": [dict(access)] if reads_state else [],
+            "writes": [dict(access)] if writes_state else [],
+            "readout": reduce_res is not None,
+            "physical_result_phase_modelled": False,
+        }
+    if reduce_res is not None:
+        _require(reduce_res.shape == (data_par, 1),
+                 f"reduce_res must have shape (P, 1), expected {(data_par, 1)}, received {reduce_res.shape}")
+        _require(bool(np.all(valid)), "Scalar reduction registers are uninitialized in this program")
+        _store(reduce_res, registers.copy())
         tagged._nki_extra_outputs = (reduce_res,)
-        tagged._nki_reduction_op = str(reduce_op.name)
+        tagged._nki_reduction_op = None if reduce_op is None else str(reduce_op.name)
     return tagged
 
 
@@ -1274,6 +1303,12 @@ class Builder:
         self.grid_idx = [0] * len(self.grid_dims)
         self.nc_version = nisa.nc_version.gen2
         self.fn = None
+        self.reset_scalar_state()
+
+    def reset_scalar_state(self) -> None:
+        """Start a logical program with unknown Scalar register contents."""
+        self.scalar_reduce_regs = np.empty((128, 1), dtype=np.float32)
+        self.scalar_reduce_valid = np.zeros((128,), dtype=bool)
 
     def set_grid_dim(self, *grid_dims: int) -> None:
         """Update the active launch grid dimensions.
@@ -1297,6 +1332,7 @@ class Builder:
             z: Grid index for axis 2.
         """
         self.grid_idx = [x]
+        self.reset_scalar_state()
 
 
 nki_builder = Builder()
@@ -1428,6 +1464,7 @@ class NKIBeta2InterpretedFunction:
                     f"{len(grid_idx)}, expected {len(nki_builder.grid_dims)}"
                 )
             nki_builder.grid_idx = [int(idx) for idx in grid_idx]
+            nki_builder.reset_scalar_state()
             if client_manager is not None:
                 client_manager.grid_idx_callback(
                     tuple(int(idx) for idx in grid_idx) + (0,) * (3 - len(grid_idx))
