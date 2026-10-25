@@ -51,10 +51,12 @@ class Tracer(Client):
         callpath: bool = True,
         grid_idx: tuple[int] | int | None = None,
         compute_masks: bool = False,
+        allocation_metadata: bool = False,
     ):
         super().__init__()  # Initialize parent class
         self.callpath = callpath
         self.compute_masks = compute_masks
+        self.allocation_metadata = allocation_metadata
         self.grid_idx = _convert_grid_idx(grid_idx)
         self.records: list = []
         self.tensors: list = []
@@ -145,11 +147,34 @@ class Tracer(Client):
             origin = int(data.ctypes.data) - int(root.ctypes.data)
             return (int(root.ctypes.data), array_byte_runs(data, origin))
 
+        def _allocation(value):
+            if not hasattr(value, "data_ptr") or not hasattr(value, "shape"):
+                return None
+            root = value
+            while getattr(root, "_parent", None) is not None:
+                root = root._parent
+            memory = getattr(root, "buffer", "unknown")
+            memory = str(getattr(memory, "buffer", memory))
+            axis = getattr(root, "partition_axis", None)
+            if axis is None and memory in ("sbuf", "psum") and len(root.shape) == 2:
+                axis = 0
+            return {
+                "storage": _storage(root),
+                "view_storage": _storage(value),
+                "shape": list(root.shape),
+                "partition_axis": axis,
+                "dtype": str(getattr(root, "dtype", "unknown")),
+                "memory": memory,
+            }
+
         def _attach_runs(rec, inputs, outputs):
             # Exact byte runs of each operand view, parallel to input_ranges / output ranges
             # (used only by CostModel.exact_tile_ranges).
             rec.input_runs = tuple(_runs(value) for value in inputs)
             rec.output_runs = tuple(_runs(value) for value in outputs)
+            if self.allocation_metadata:
+                rec.input_allocations = tuple(_allocation(value) for value in inputs)
+                rec.output_allocations = tuple(_allocation(value) for value in outputs)
 
         @self.lock_fn
         def post_load_callback(ret, ptr, mask, keys):
@@ -275,6 +300,8 @@ class Tracer(Client):
                 dst_partition_axis=getattr(dst, "partition_axis", None),
                 dma_pattern=str(dma_pattern),
             )
+            if self.allocation_metadata:
+                _attach_runs(rec, (src,), (dst,))
             if src.element_size() != dst.element_size():
                 rec.src_bytes = int(np.prod(src.shape)) * src.element_size()
                 rec.dst_bytes = int(np.prod(dst.shape)) * dst.element_size()

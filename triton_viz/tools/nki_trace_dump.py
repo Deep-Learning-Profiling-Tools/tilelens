@@ -799,6 +799,9 @@ def records_to_events(records: Iterable[Any]) -> list[dict[str, Any]]:
                         for r in runs]
             event["input_range_lists"] = _lists(record.input_runs)
             event["output_range_lists"] = _lists(record.output_runs)
+        if getattr(record, "input_allocations", None) is not None:
+            event["input_allocations"] = list(record.input_allocations)
+            event["output_allocations"] = list(record.output_allocations)
         site = _source_site(record)
         if site is not None:
             event["source_site"] = site

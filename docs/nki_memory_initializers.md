@@ -40,3 +40,16 @@ Focused tests are in `tests/nki/test_nki_beta2_memory_fill.py`:
 ```
 python -m pytest -q -m nki tests/nki/test_nki_beta2_memory_fill.py
 ```
+
+## Opt-in metadata for all producer and consumer operands
+
+`Tracer(allocation_metadata=True)` attaches root descriptors to compute,
+Dot, Tensor-transpose and transfer operands. Exported `input_allocations` and
+`output_allocations` contain the root storage identity, view storage identity,
+declared root shape, partition axis, dtype and memory space. Transfer views retain
+the allocation extent rather than substituting the view shape. This allows PSUM
+producers other than `memset` to participate in allocation analysis.
+
+The option defaults to false, preserving the prior trace schema. These descriptors
+identify source allocations; they do not describe compiler physical addresses,
+packing, inserted buffers or instruction scheduling.
