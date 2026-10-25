@@ -107,7 +107,7 @@ def _mark_defined(value: Any) -> None:
 def _store(dst: NDArray, value: TensorOrScalar) -> NDArray:
     """Write a computed value into a destination tensor."""
     # A later write must not retain a prior operation's companion outputs.
-    for attr in ("_nki_extra_outputs", "_nki_scalar_state"):
+    for attr in ("_nki_extra_outputs", "_nki_scalar_state", "_nki_hardware_engine"):
         if hasattr(dst, attr):
             delattr(dst, attr)
     dst.data[...] = _cast_value(value, dst.dtype)
@@ -686,6 +686,8 @@ def reciprocal(dst: NDArray, data: NDArray, name: str | None = None) -> NDArray:
     result = _store(dst, np.reciprocal(_array(data, dtype=np.float32)))
     result._nki_api = "reciprocal"
     result._nki_engine = "scalar"
+    # Convenience reciprocal uses Vector; activation(reciprocal) uses Scalar.
+    result._nki_hardware_engine = "vector"
     result._nki_inputs = (data,)
     return result
 
@@ -1177,6 +1179,9 @@ def tensor_scalar(
         else f"{op0.name}_{op1.name}"
     )
     tagged._nki_engine = "vector"
+    requested = getattr(engine, "name", None)
+    if requested in ("scalar", "vector", "gpsimd"):
+        tagged._nki_hardware_engine = requested
     tagged._nki_inputs = tuple(
         item for item in (data, operand0, operand1)
         if isinstance(item, NDArray)

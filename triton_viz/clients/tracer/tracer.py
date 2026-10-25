@@ -54,6 +54,7 @@ class Tracer(Client):
         allocation_metadata: bool = False,
         multi_output_metadata: bool = False,
         scalar_state_metadata: bool = False,
+        hardware_engine_metadata: bool = False,
     ):
         super().__init__()  # Initialize parent class
         self.callpath = callpath
@@ -61,6 +62,7 @@ class Tracer(Client):
         self.allocation_metadata = allocation_metadata
         self.multi_output_metadata = multi_output_metadata or scalar_state_metadata
         self.scalar_state_metadata = scalar_state_metadata
+        self.hardware_engine_metadata = hardware_engine_metadata
         self.grid_idx = _convert_grid_idx(grid_idx)
         self.records: list = []
         self.tensors: list = []
@@ -511,7 +513,8 @@ class Tracer(Client):
                     compute_attrs["compute_mask_geometry"] = compute_mask_geometry(value, domain)
             rec = NkiCompute(
                 api_op=str(ret._nki_api),
-                engine=str(getattr(ret, "_nki_engine", "vector")),
+                engine=str(getattr(ret, "_nki_hardware_engine", getattr(ret, "_nki_engine", "vector"))
+                           if self.hardware_engine_metadata else getattr(ret, "_nki_engine", "vector")),
                 input_ptrs=input_ptrs,
                 output_ptrs=output_ptrs,
                 input_shapes=input_shapes,
