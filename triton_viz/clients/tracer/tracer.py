@@ -55,6 +55,7 @@ class Tracer(Client):
         multi_output_metadata: bool = False,
         scalar_state_metadata: bool = False,
         hardware_engine_metadata: bool = False,
+        sdk_setup_metadata: bool = False,
     ):
         super().__init__()  # Initialize parent class
         self.callpath = callpath
@@ -63,6 +64,7 @@ class Tracer(Client):
         self.multi_output_metadata = multi_output_metadata or scalar_state_metadata
         self.scalar_state_metadata = scalar_state_metadata
         self.hardware_engine_metadata = hardware_engine_metadata
+        self.sdk_setup_metadata = sdk_setup_metadata
         self.grid_idx = _convert_grid_idx(grid_idx)
         self.records: list = []
         self.tensors: list = []
@@ -473,6 +475,8 @@ class Tracer(Client):
             compute_attrs = {
                 "compute_mask_provided": bool(getattr(ret, "_nki_compute_mask_provided", False))
             }
+            if self.sdk_setup_metadata and hasattr(ret, "_nki_sdk_setup"):
+                compute_attrs["sdk_setup"] = ret._nki_sdk_setup
             if self.scalar_state_metadata and hasattr(ret, "_nki_scalar_state"):
                 compute_attrs["scalar_state"] = ret._nki_scalar_state
             if len(outputs) > 1:

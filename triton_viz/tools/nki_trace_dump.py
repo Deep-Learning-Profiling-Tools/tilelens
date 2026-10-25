@@ -668,6 +668,8 @@ def record_to_event(
                 "output_roles": record.attrs["output_roles"],
                 "reduction_op": record.attrs.get("reduction_op"),
             } if len(record.output_ptrs) > 1 else {}),
+            **({"sdk_setup": record.attrs["sdk_setup"]}
+               if "sdk_setup" in record.attrs else {}),
             **({"scalar_state": record.attrs["scalar_state"]}
                if "scalar_state" in record.attrs else {}),
             "compute_mask_provided": bool(

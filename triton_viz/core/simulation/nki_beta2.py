@@ -107,7 +107,7 @@ def _mark_defined(value: Any) -> None:
 def _store(dst: NDArray, value: TensorOrScalar) -> NDArray:
     """Write a computed value into a destination tensor."""
     # A later write must not retain a prior operation's companion outputs.
-    for attr in ("_nki_extra_outputs", "_nki_scalar_state", "_nki_hardware_engine"):
+    for attr in ("_nki_extra_outputs", "_nki_scalar_state", "_nki_hardware_engine", "_nki_sdk_setup"):
         if hasattr(dst, attr):
             delattr(dst, attr)
     dst.data[...] = _cast_value(value, dst.dtype)
@@ -1292,6 +1292,26 @@ def activation(
         _store(reduce_res, registers.copy())
         tagged._nki_extra_outputs = (reduce_res,)
         tagged._nki_reduction_op = None if reduce_op is None else str(reduce_op.name)
+    target_nc2 = _nc_version_value(nki_builder.nc_version) == _nc_version_value(nisa.nc_version.gen2)
+    materializations = []
+    if target_nc2 and op.name not in ("copy", "reciprocal"):
+        for role, value in (("bias", 0.0 if bias is None else bias),
+                            ("scale", 1.0 if scale is None else scale)):
+            # Mirror the native SDK wrapper's scalar-constant test. Tensor
+            # operands already exist in the semantic trace and need no setup.
+            if isinstance(value, (int, float)):
+                bits = int(np.asarray(value, dtype=np.float32).view(np.uint32).item())
+                materializations.append({
+                    "input_role": role, "opcode": "MEMSET", "engine": "vector",
+                    "memory": "sbuf", "dtype": "float32", "shape": [data_par, 1],
+                    "value_bits_fp32": bits,
+                })
+    tagged._nki_sdk_setup = {
+        "api": "nisa.activation", "rule": "nc2_activation_constant_vectors_v1",
+        "supported": target_nc2 and scale is not None,
+        "materializations": materializations,
+        "compiler_lowering_complete": False,
+    }
     return tagged
 
 
