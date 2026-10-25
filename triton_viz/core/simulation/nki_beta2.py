@@ -322,6 +322,21 @@ class NDArray:
 
     def __getitem__(self, keys: Any) -> NDArray:
         """Implement slicing operations for NDArray."""
+        from triton_viz.core.simulation.nki_isa_contracts import (
+            checks_enabled,
+            partition_preserving_view,
+        )
+
+        if checks_enabled():
+            axis = self.partition_axis
+            if self.buffer in ("sbuf", "psum") and axis is None:
+                axis = 0
+            sliced, axis = partition_preserving_view(self.data, keys, axis)
+            return NDArray(
+                value=sliced, buffer=self.buffer, origin="access",
+                parent_ndim=self._parent_ndim, defined=self._defined,
+                parent=self, partition_axis=axis,
+            )
         if not isinstance(keys, tuple):
             keys = (keys,)
         expanded_keys = list(keys) + [slice(None)] * (self.data.ndim - len(keys))
@@ -487,7 +502,12 @@ def ndarray(
         )
     concrete_shape, partition_axis = _normalize_shape(shape)
     tensor = buffer.view(dtype, concrete_shape, origin="tensor")
-    tensor.partition_axis = partition_axis
+    from triton_viz.core.simulation.nki_isa_contracts import checks_enabled
+
+    tensor.partition_axis = (
+        0 if checks_enabled() and partition_axis is None and buffer.buffer in ("sbuf", "psum")
+        else partition_axis
+    )
     return tensor
 
 
@@ -836,10 +856,17 @@ def dma_copy(
         f"src buffer {_buffer_name(src)} and dst buffer {_buffer_name(dst)}",
     )
     src_value = _array(src)
+    from triton_viz.core.simulation.nki_isa_contracts import checks_enabled
+
+    # The installed SDK validates equal element counts for direct DMA, allowing
+    # rank/layout changes. Preserve the historical shape restriction by default.
+    compatible = dst.data.size == src.data.size if checks_enabled() else dst.shape == src.shape
     _require(
-        dst.shape == src.shape,
+        compatible,
         f"{_ERR_AP_MISMATCH}: dst shape {dst.shape}, src shape {src.shape}",
     )
+    if checks_enabled():
+        src_value = src_value.reshape(dst.shape)
     if dst_rmw_op is None:
         return _store(dst, src_value.reshape(dst.shape))
     _require(
