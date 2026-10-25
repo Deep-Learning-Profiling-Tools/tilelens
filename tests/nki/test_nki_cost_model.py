@@ -1110,3 +1110,17 @@ def test_dma_contiguity_aware_lookup_uses_contiguous_runs():
     # Without range information the lookup is unchanged.
     no_ranges = {**full_rows, "src_ranges": None}
     assert aware.cost_ns(no_ranges) == pytest.approx(default.cost_ns(full_rows))
+
+
+def test_dma_readiness_delay_does_not_apply_to_onchip_vector_copies():
+    model = CostModel(dma_result_latency_ns=750.0)
+    event = {"op": "transfer", "mem_src": "psum", "mem_dst": "sbuf"}
+    assert model.result_ready_ns(event, "vector", 100.0) == 100.0
+    assert model.result_ready_ns(event, "dma", 100.0) == 850.0
+
+
+def test_dma_readiness_partition_law_is_also_engine_scoped():
+    model = CostModel(dma_result_latency_ns=3000.0, dma_result_latency_law="log2_partitions")
+    event = {"op": "transfer", "partition_count": 128}
+    assert model.result_ready_ns(event, "vector", 100.0) == 100.0
+    assert model.result_ready_ns(event, "dma", 100.0) == 3100.0

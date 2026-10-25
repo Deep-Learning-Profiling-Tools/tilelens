@@ -1954,8 +1954,15 @@ class CostModel:
         Compute: ``max(duration, latency)`` under ``instruction_latency``. DMA: ``duration +
         dma_result_latency_ns`` (opt-in): the queue is released after the transfer's bandwidth
         occupancy, while its data lands a fixed latency later, which only dependent consumers see.
+        On-chip transfers retain duration as an uncalibrated consumer-handoff baseline; DMA
+        visibility parameters apply only to DMA-engine transfers.
         """
         if event.get("op") in ("transfer", "load", "store"):
+            if engine != ENGINE_DMA:
+                # DMA result visibility does not describe Vector/GpSimd
+                # on-chip copies. Their consumer handoff needs separate
+                # calibration; issue completion is the existing baseline.
+                return duration
             fixed = 0.0
             if self.dma_split_fixed_cost:
                 surface = self._dma_surface(event)
