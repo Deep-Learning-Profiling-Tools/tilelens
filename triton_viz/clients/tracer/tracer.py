@@ -52,11 +52,13 @@ class Tracer(Client):
         grid_idx: tuple[int] | int | None = None,
         compute_masks: bool = False,
         allocation_metadata: bool = False,
+        multi_output_metadata: bool = False,
     ):
         super().__init__()  # Initialize parent class
         self.callpath = callpath
         self.compute_masks = compute_masks
         self.allocation_metadata = allocation_metadata
+        self.multi_output_metadata = multi_output_metadata
         self.grid_idx = _convert_grid_idx(grid_idx)
         self.records: list = []
         self.tensors: list = []
@@ -457,14 +459,22 @@ class Tracer(Client):
                 return
             inputs = getattr(ret, "_nki_inputs", ())
             input_ptrs = tuple(int(x.data_ptr()) for x in inputs if hasattr(x, "data_ptr"))
-            output_ptr = int(ret.data_ptr()) if hasattr(ret, "data_ptr") else None
+            outputs = (ret,) + (tuple(getattr(ret, "_nki_extra_outputs", ())) if self.multi_output_metadata else ())
+            output_ptrs = tuple(int(x.data_ptr()) for x in outputs if hasattr(x, "data_ptr"))
             input_shapes = tuple(tuple(x.shape) for x in inputs if hasattr(x, "shape"))
             output_shape = tuple(ret.shape) if hasattr(ret, "shape") else ()
+            output_shapes = tuple(tuple(x.shape) for x in outputs if hasattr(x, "shape"))
             input_dtypes = tuple(str(x.dtype) for x in inputs if hasattr(x, "dtype"))
             output_dtype = str(ret.dtype) if hasattr(ret, "dtype") else ""
             compute_attrs = {
                 "compute_mask_provided": bool(getattr(ret, "_nki_compute_mask_provided", False))
             }
+            if len(outputs) > 1:
+                compute_attrs.update(
+                    output_dtypes=[str(x.dtype) for x in outputs],
+                    output_roles=["primary"] + ["reduction"] * (len(outputs) - 1),
+                    reduction_op=getattr(ret, "_nki_reduction_op", None),
+                )
             if ret._nki_api == "memset" and getattr(ret, "_nki_memory_initializer", False):
                 memory = getattr(ret, "buffer", "unknown")
                 allocation = ret
@@ -499,22 +509,23 @@ class Tracer(Client):
                 api_op=str(ret._nki_api),
                 engine=str(getattr(ret, "_nki_engine", "vector")),
                 input_ptrs=input_ptrs,
-                output_ptrs=(output_ptr,) if output_ptr is not None else (),
+                output_ptrs=output_ptrs,
                 input_shapes=input_shapes,
-                output_shapes=(output_shape,) if output_shape else (),
+                output_shapes=output_shapes,
                 input_dtypes=input_dtypes,
                 output_dtype=output_dtype,
                 attrs=compute_attrs,
                 input_storages=tuple(_storage(x) for x in inputs),
                 input_ranges=tuple(_range(x) for x in inputs),
                 input_versions=tuple(_version(x) for x in inputs),
-                output_storages=(_storage(ret),),
-                output_ranges=(_range(ret),),
-                output_versions=(_version(ret),),
+                output_storages=tuple(_storage(x) for x in outputs),
+                output_ranges=tuple(_range(x) for x in outputs),
+                output_versions=tuple(_version(x) for x in outputs),
             )
             rec.call_path = extract_user_frames(num_frames=1)
-            ret._trace_record = rec
-            _attach_runs(rec, inputs, (ret,))
+            for output in outputs:
+                output._trace_record = rec
+            _attach_runs(rec, inputs, outputs)
             self.records.append(rec)
 
         @self.lock_fn

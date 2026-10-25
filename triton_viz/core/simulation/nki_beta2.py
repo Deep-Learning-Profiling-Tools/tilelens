@@ -106,6 +106,9 @@ def _mark_defined(value: Any) -> None:
 
 def _store(dst: NDArray, value: TensorOrScalar) -> NDArray:
     """Write a computed value into a destination tensor."""
+    # A later write must not retain a prior operation's companion outputs.
+    if hasattr(dst, "_nki_extra_outputs"):
+        del dst._nki_extra_outputs
     dst.data[...] = _cast_value(value, dst.dtype)
     _mark_defined(dst)
     return dst
@@ -1253,6 +1256,8 @@ def activation(
             keepdims=True,
         )
         _store(reduce_res, reduced)
+        tagged._nki_extra_outputs = (reduce_res,)
+        tagged._nki_reduction_op = str(reduce_op.name)
     return tagged
 
 

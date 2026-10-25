@@ -658,6 +658,16 @@ def record_to_event(
             ),
             "input_dtypes": list(record.input_dtypes),
             "output_dtype": record.output_dtype,
+            **({
+                "output_ptrs": [int(x) for x in record.output_ptrs],
+                "output_shapes": [list(x) for x in record.output_shapes],
+                "output_storages": [int(x) for x in record.output_storages],
+                "output_ranges": [list(x) for x in record.output_ranges],
+                "output_versions": [int(x) for x in record.output_versions],
+                "output_dtypes": record.attrs["output_dtypes"],
+                "output_roles": record.attrs["output_roles"],
+                "reduction_op": record.attrs.get("reduction_op"),
+            } if len(record.output_ptrs) > 1 else {}),
             "compute_mask_provided": bool(
                 record.attrs.get("compute_mask_provided", False)
             ),
