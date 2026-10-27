@@ -7,6 +7,7 @@ from tilelens.core.data import (
     Transfer,
 )
 from tilelens.clients.sanitizer.data import OutOfBoundsRecordBruteForce
+from tilelens.utils.dtypes import STORAGE_DTYPES
 import numpy as np
 import sys
 import torch
@@ -106,27 +107,11 @@ def extract_load_coords(record, global_tensor: Tensor) -> list[tuple[float, ...]
 def _dtype_element_size(dtype) -> int:
     """Best-effort dtype element size in bytes."""
     if isinstance(dtype, str):
-        dtype_sizes = {
-            "torch.float32": 4,
-            "float32": 4,
-            "torch.float64": 8,
-            "float64": 8,
-            "torch.int32": 4,
-            "int32": 4,
-            "torch.int64": 8,
-            "int64": 8,
-            "torch.float16": 2,
-            "float16": 2,
-            "torch.bfloat16": 2,
-            "bfloat16": 2,
-            "torch.int8": 1,
-            "int8": 1,
-            "torch.uint8": 1,
-            "uint8": 1,
-            "torch.bool": 1,
-            "bool": 1,
-        }
-        return max(1, int(dtype_sizes.get(dtype, 4)))
+        name = dtype.removeprefix("torch.")
+        if name in ("bool", "bool_"):
+            return 1
+        storage = STORAGE_DTYPES.get(name)
+        return storage.itemsize if storage is not None else 4
     try:
         return max(1, int(dtype.element_ty.primitive_bitwidth // 8))
     except Exception:
@@ -199,31 +184,7 @@ def _record_masks(record, offsets=None) -> np.ndarray:
 def delinearized(
     shape: tuple[int, int, int], x: np.ndarray, dtype, mask
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # Handle dtype as string by extracting element size
-    if isinstance(dtype, str):
-        # Common dtype sizes in bytes
-        dtype_sizes = {
-            "torch.float32": 4,
-            "float32": 4,
-            "torch.float64": 8,
-            "float64": 8,
-            "torch.int32": 4,
-            "int32": 4,
-            "torch.int64": 8,
-            "int64": 8,
-            "torch.float16": 2,
-            "float16": 2,
-            "torch.bfloat16": 2,
-            "bfloat16": 2,
-            "torch.int8": 1,
-            "int8": 1,
-            "torch.uint8": 1,
-            "uint8": 1,
-        }
-        element_size = dtype_sizes.get(dtype, 4)  # Default to 4 bytes
-    else:
-        element_size = dtype.element_ty.primitive_bitwidth // 8
-
+    element_size = _dtype_element_size(dtype)
     x = x.copy() // element_size
     mask = np.asarray(mask, dtype=np.int64, order="C")
     z = ((x // (shape[1] * shape[2])) * mask - (1 - mask)).ravel()
