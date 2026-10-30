@@ -226,6 +226,21 @@ def test_cf_blocks_align():
     labels = [m.blocks[b].label for b in func.regions[0]]
     assert labels[0] is None and "^bb5" in labels and len(labels) == 6
     assert all(op.loc is not None for op in _ops(m, "cf.br") + _ops(m, "cf.cond_br"))
+    # a branch's successors are its target blocks, read from the text
+    by_label = {m.blocks[b].label: b for b in func.regions[0][1:]}
+    succ = [op.attrs["successors"] for op in _ops(m, "cf.br") + _ops(m, "cf.cond_br")]
+    assert succ == [
+        (by_label["^bb5"],),
+        (by_label["^bb1"], by_label["^bb2"]),
+        (by_label["^bb3"], by_label["^bb4"]),
+        (by_label["^bb1"], by_label["^bb5"]),
+    ]
+    same = W._walk(_text("crafted_same_dest.ttir"))
+    first = _ops(same, "cf.cond_br")[0]
+    assert first.attrs["successors"] == (first.block + 1,) * 2  # ^bb1(%a), ^bb1(%b)
+    bad = _text("crafted_same_dest.ttir").replace("^bb2(%y, %x : i32, i32)", "^bb2")
+    with pytest.raises(W.MisalignedModule, match="0 operands for its arguments"):
+        W._walk(_text("crafted_same_dest.ttir"), scan_text=bad)
 
 
 def test_parser_invented_locs_are_absent():
