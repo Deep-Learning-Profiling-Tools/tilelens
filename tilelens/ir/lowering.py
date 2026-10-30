@@ -3,13 +3,14 @@
 Mechanism only: the operator semantics live here,
 every leaf's meaning comes from the client. A client's :class:`TermLeaves`
 says what a scalar argument, a program id, the grid, a lane, a loop's
-iteration, an atomic observation and an unmodeled value are, and a client
-that cannot model a leaf raises its own exception from it, which propagates
-unchanged. The lowering itself raises only on a malformed graph, a bug and
-never a limit of the model: ``TypeError`` or ``ValueError`` for a term or op
-outside the algebra, or for a ``LoopVar`` (or an ``IterArgOffset`` whose
-IterArgInfo names no loop) in a graph without a loop, and ``IndexError`` for
-an ``arg_id`` outside ``iter_args``.
+iteration, an atomic observation, a loaded value and an unmodeled value
+are, and a client that cannot model a leaf raises its own exception from
+it, which propagates unchanged. The lowering itself raises only on a
+malformed graph, a bug and never a limit of the model: ``TypeError`` or
+``ValueError`` for a term or op outside the algebra, or for a ``LoopVar``
+whose loop the graph does not have (or an ``IterArgOffset`` whose
+IterArgInfo names no loop in a graph without a loop), and ``IndexError``
+for an ``arg_id`` outside ``iter_args``.
 
 Operator semantics, the reader's integer model (see ``ttir_reader``):
 
@@ -23,8 +24,9 @@ Operator semantics, the reader's integer model (see ``ttir_reader``):
 * an i1 value is a Bool in a boolean position (a mask or path, a Select's
   condition, ``and`` / ``or`` / negation) and 0/1 in an integer one, and a
   Select whose arms differ in sort is an Int;
-* ``LoopVar`` is ``lower + k * step`` and ``IterArgOffset`` is ``offset0 +
-  k * delta``, with ``k`` the client's iteration of that loop.
+* ``LoopVar`` is ``lower + k * step`` of its loop (``graph.loop_info``) and
+  ``IterArgOffset`` is ``offset0 + k * delta``, with ``k`` the client's
+  iteration of that loop.
 
 Z3 context: the lowering never creates one. Constants are made in
 ``leaves.ctx`` (None: Z3's main context) and every other term in its
@@ -54,6 +56,7 @@ from .ttir_reader import (
     DataDep,
     IntCast,
     IterArgOffset,
+    Loaded,
     LoopInfo,
     LoopVar,
     Not,
@@ -92,6 +95,10 @@ class TermLeaves(Protocol):
 
     def observed(self, t: Observed) -> ArithRef:
         """The value the access at ``t.access_index`` observed."""
+
+    def loaded(self, t: Loaded) -> ArithRef:
+        """The value the load at ``t.access_index`` read at the lane (its
+        ``offset``, ``mask`` and ``other`` are for the client to lower)."""
 
     def data_dep(self, t: DataDep) -> ArithRef:
         """A value the reader could not model (``t.why`` says which)."""
@@ -167,20 +174,23 @@ def _cmp(pred: str, a: Any, b: Any) -> BoolRef:
     raise ValueError(f"unknown cmpi predicate {pred!r}")
 
 
-def _loop(graph: AccessGraph, t: object) -> LoopInfo:
-    if graph.loop is None:
+def _loop(graph: AccessGraph, t: LoopVar | IterArgOffset, name: str) -> LoopInfo:
+    """The loop named ``name`` (none: the graph's only loop)."""
+    loop = graph.loop_info(name) if name else graph.loop
+    if loop is None:
         raise ValueError(
             f"kernel {graph.kernel_name!r}: a loop term ({type(t).__name__}) "
-            "without a loop"
+            "without a loop" + (f" named {name!r}" if name else "")
         )
-    return graph.loop
+    return loop
 
 
 def children(t: object, graph: AccessGraph) -> tuple:
     """The terms ``t``'s value is computed from: its operands; for a
     loop-carried pointer's offset, its IterArgInfo's ``offset0`` and
-    ``delta``; for the induction variable, the loop's ``lower`` and
-    ``step``. A leaf (a DataDep included) has none."""
+    ``delta``; for the induction variable, its loop's ``lower`` and
+    ``step``. A leaf has none: a Loaded's terms are its client's to lower,
+    and a DataDep's ``keep`` is not its value."""
     if isinstance(t, (Bin, Cmp, BoolBin)):
         return (t.a, t.b)
     if isinstance(t, Select):
@@ -193,7 +203,7 @@ def children(t: object, graph: AccessGraph) -> tuple:
         info = graph.iter_args[t.arg_id]
         return (info.offset0, info.delta)
     if isinstance(t, LoopVar):
-        loop = _loop(graph, t)
+        loop = _loop(graph, t, t.loop_ssa)
         return (loop.lower, loop.step)
     return ()
 
@@ -258,7 +268,7 @@ class Lowerer:
             return as_int(kids[0]) + k * as_int(kids[1])
         if isinstance(t, IterArgOffset):
             loop_ssa = self.graph.iter_args[t.arg_id].loop_ssa
-            k = leaves.iteration(loop_ssa or _loop(self.graph, t).loop_ssa)
+            k = leaves.iteration(loop_ssa or _loop(self.graph, t, "").loop_ssa)
             return as_int(kids[0]) + k * as_int(kids[1])
         if isinstance(t, Bin):
             return _bin(t.op, as_int(kids[0]), as_int(kids[1]))
@@ -283,6 +293,8 @@ class Lowerer:
             return as_int(kids[0])
         if isinstance(t, Observed):
             return leaves.observed(t)
+        if isinstance(t, Loaded):
+            return leaves.loaded(t)
         if isinstance(t, DataDep):
             return leaves.data_dep(t)
         raise TypeError(f"unknown term {type(t).__name__}")

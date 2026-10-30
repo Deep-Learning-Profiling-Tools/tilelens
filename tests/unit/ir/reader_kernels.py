@@ -361,6 +361,70 @@ def poll_while(flag_ptr, out_ptr, n):
     tl.store(out_ptr + pid, 1)
 
 
+@triton.jit
+def mp_loops(x_ptr, n, m):
+    # nested loops (the inner pointer advances by the outer induction
+    # variable), then a sequential loop under a branch
+    for i in range(0, n):
+        q = x_ptr + i
+        for j in range(0, m, 2):
+            tl.store(q + j, 1)
+            q += i
+    if tl.program_id(0) < n:
+        p = x_ptr
+        for k in range(0, n):
+            tl.store(p, 2)
+            p += m
+
+
+@triton.jit
+def mp_loaded(idx_ptr, x_ptr, f_ptr, n, B: tl.constexpr):
+    # integer loads in an address, a mask and a branch; a float load and a
+    # dropped mask; a loaded tile expanded; masks with a modelable conjunct
+    # (kept, also expanded) or disjunct (dropped); a float atomic operand
+    offs = tl.arange(0, B)
+    j = tl.load(idx_ptr + offs, mask=offs < n, other=0)
+    tl.store(x_ptr + j, 1.0)
+    v = tl.load(f_ptr + offs)
+    tl.store(x_ptr + offs, v, mask=j > 0)
+    t = tl.load(idx_ptr + offs, mask=offs < n, other=0)
+    tl.store(x_ptr + t[:, None] + offs[None, :], 3.0)
+    w = tl.load(idx_ptr + offs, mask=v > 0)
+    m = (offs < n) & (w > 0)
+    tl.store(x_ptr + offs, 4.0, mask=m)
+    if tl.load(idx_ptr) > 0:
+        tl.store(x_ptr, 5.0)
+    tl.store(x_ptr + offs, 6.0, mask=(offs < n) | (w > 0))
+    tl.store(x_ptr + offs[:, None] * B + offs[None, :], 7.0, mask=m[:, None])
+    tl.atomic_add(f_ptr + offs, v)
+
+
+@triton.jit
+def mp_early_return(x_ptr, f_ptr, n):
+    # an early return under a float condition: the rest is guarded
+    pid = tl.program_id(0)
+    if tl.load(f_ptr) > 0.0:
+        return
+    tl.store(x_ptr + pid, 1.0)
+
+
+@triton.jit
+def mp_loaded_advance(idx_ptr, x_ptr, n):
+    # an advance by a value loaded in the loop: variant
+    p = x_ptr
+    for i in range(0, n):
+        tl.store(p, 1)
+        tl.store(idx_ptr, i)
+        p += tl.load(idx_ptr)
+
+
+@triton.jit
+def mp_for_in_while(flag_ptr, x_ptr, n):
+    while tl.load(flag_ptr) == 0:
+        for i in range(0, n):
+            tl.store(x_ptr + i, 1)
+
+
 _F32 = "*fp32"
 # corpus name (reader_ttir/<name>.ttir, the kernel of that name) ->
 # (signature, constexprs), compiled for sm80 with the default options
@@ -425,4 +489,12 @@ SPECS: dict[str, tuple[dict[str, str], dict[str, Any]]] = {
     "fences": ({"x_ptr": "*i32", "n": "i32"}, {}),
     "pid_in_combine": ({"x_ptr": "*i32", "o_ptr": "*i32", "B": "constexpr"}, {"B": 8}),
     "poll_while": ({"flag_ptr": "*i32", "out_ptr": "*i32", "n": "i32"}, {}),
+    "mp_loops": ({"x_ptr": "*i32", "n": "i32", "m": "i32"}, {}),
+    "mp_loaded": (
+        {"idx_ptr": "*i32", "x_ptr": _F32, "f_ptr": _F32, "n": "i32", "B": "constexpr"},
+        {"B": 8},
+    ),
+    "mp_early_return": ({"x_ptr": _F32, "f_ptr": _F32, "n": "i32"}, {}),
+    "mp_loaded_advance": ({"idx_ptr": "*i32", "x_ptr": "*i32", "n": "i32"}, {}),
+    "mp_for_in_while": ({"flag_ptr": "*i32", "x_ptr": "*i32", "n": "i32"}, {}),
 }
