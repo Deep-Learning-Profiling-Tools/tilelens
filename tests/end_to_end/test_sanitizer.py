@@ -1615,3 +1615,43 @@ def test_strided_view_warns_on_large_numel(_isolate_per_element_threshold):
 
     # Warning path must not change correctness -- no OOB with correct mask.
     assert len(strided_view_sanitizer.records) == 0
+
+
+# ======== Repeated Launch Tests ===========
+
+
+relaunch_sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+
+@tilelens.trace(client=relaunch_sanitizer)
+@triton.jit
+def relaunch_gather_kernel(x_ptr, idx_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    idx = tl.load(idx_ptr + offs)
+    tl.store(out_ptr + offs, tl.load(x_ptr + idx))
+
+
+@pytest.mark.parametrize("num_blocks", [1, 2])
+def test_relaunch_with_new_loaded_indices_is_checked(num_blocks):
+    """
+    A launch that repeats an earlier launch's kernel, grid, and argument
+    shapes is checked against its own data.
+
+    Setup:
+      - x holds 8 float32 elements.
+      - The first launch gathers with in-bounds indices.
+      - The second launch keeps every shape but sets idx[0] = 100, so
+        block 0 loads x[100].
+    """
+    relaunch_sanitizer.records.clear()
+
+    x = torch.arange(8, dtype=torch.float32)
+    idx = torch.zeros((4 * num_blocks,), dtype=torch.int64)
+    out = torch.empty((4 * num_blocks,), dtype=torch.float32)
+
+    relaunch_gather_kernel[(num_blocks,)](x, idx, out, BLOCK=4)
+    assert relaunch_sanitizer.records == []
+
+    idx[0] = 100
+    relaunch_gather_kernel[(num_blocks,)](x, idx, out, BLOCK=4)
+    assert len(relaunch_sanitizer.records) > 0, "Expected OOB to be detected"

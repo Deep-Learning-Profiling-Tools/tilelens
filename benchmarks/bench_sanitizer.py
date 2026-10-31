@@ -36,10 +36,7 @@ import triton
 import triton.language as tl
 
 import tilelens
-from tilelens.clients.sanitizer.sanitizer import (
-    SymbolicSanitizer,
-    _fn_symbolic_cache_set,
-)
+from tilelens.clients.sanitizer.sanitizer import SymbolicSanitizer
 
 # ---------------------------------------------------------------------------
 # Benchmark timeout helper
@@ -694,14 +691,12 @@ def flaggems_ln_wb_backward_kernel(
 
 
 def _reset_sanitizer(san: SymbolicSanitizer):
-    """Clear sanitizer state and the global cache so re-runs are not skipped."""
-    _fn_symbolic_cache_set.clear()
+    """Clear sanitizer records between benchmark runs."""
     san.records.clear()
 
 
 # ---------------------------------------------------------------------------
 # GEMM benchmarks: multiple (M, N, K, TILE_SIZE) constexpr combos
-# Each unique combo is a separate symbolic cache entry.
 # ---------------------------------------------------------------------------
 
 _GEMM_CONFIGS = [

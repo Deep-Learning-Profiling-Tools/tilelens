@@ -1,6 +1,4 @@
 from collections.abc import Callable
-from dataclasses import dataclass
-from functools import cached_property
 from typing import (
     Any,
     ClassVar,
@@ -11,7 +9,6 @@ import sys
 
 import numpy as np
 from torch import Tensor
-from triton.tools.tensor_descriptor import TensorDescriptor
 from z3 import And, BoolVal, Not, Or, sat
 from z3.z3 import BoolRef, IntNumRef
 
@@ -136,34 +133,18 @@ def _make_signature(
     return hash((addr_hash, constr_hash))
 
 
-@dataclass(frozen=True)
-class _FnSymbolicCache:
-    fn: Callable
-    grid: tuple[int, ...]
-    args: tuple
-
-    @cached_property
-    def hash_value(self) -> int:
-        return hash((self.fn, self.grid, self.args))
-
-    def __hash__(self) -> int:
-        return self.hash_value
-
-
-_fn_symbolic_cache_set: set[_FnSymbolicCache] = set()
-
-
 class SymbolicSanitizer(Sanitizer, SymbolicClient):
     def __init__(self, abort_on_error: bool = True):
         super().__init__(abort_on_error=abort_on_error)
         self.records: list[OutOfBoundsRecordZ3] = []
-        self.cache_args: list[Any] = []
-        self.cache_grid: tuple[int, ...] | None = None
 
     # Explicit forwarders to SymbolicClient: the Sanitizer factory
     # carries concrete stubs (NotImplementedError or ``return True``) to
     # satisfy Client's @abstractmethod contract, and those stubs would
     # otherwise shadow SymbolicClient's impls in the subclass MRO.
+    def grid_callback(self, grid: tuple[int, ...]) -> None:
+        SymbolicClient.grid_callback(self, grid)
+
     def grid_idx_callback(self, grid_idx: tuple[int, ...]) -> None:
         SymbolicClient.grid_idx_callback(self, grid_idx)
 
@@ -186,6 +167,12 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
                 self.op_callback_cache[op_type] = cached
             return cached
         return SymbolicClient.register_op_callback(self, op_type)
+
+    # Every launch is analyzed, including one whose kernel, grid, and
+    # argument shapes match an earlier launch: the earlier result does not
+    # carry over when loaded values feed addresses, masks, or branches.
+    def pre_run_callback(self, fn: Callable) -> bool:
+        return SymbolicClient.pre_run_callback(self, fn)
 
     def post_run_callback(self, fn: Callable) -> bool:
         return SymbolicClient.post_run_callback(self, fn)
@@ -213,37 +200,6 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
         # per-access push/pop scope, because it may need tensor-specific
         # ranges instead of the global union of all registered tensors.
         return BoolVal(True)
-
-    def _cache_non_tensor_arg(self, name: str, arg: Any) -> None:
-        # TODO: init a reserved_args field per frontend to filter out these args
-        if name not in ["num_warps", "num_stages", "maxnreg", "num_ctas"]:
-            if isinstance(arg, TensorDescriptor):
-                self.cache_args.append(
-                    (
-                        "TensorDescriptor",
-                        repr(arg.base),
-                        tuple(arg.shape),
-                        tuple(arg.strides),
-                        tuple(arg.block_shape),
-                        arg.padding,
-                    )
-                )
-                return
-            self.cache_args.append(arg)
-
-    def _cache_tensor_arg(self, arg: Tensor) -> None:
-        self.cache_args.append((arg.shape, arg.stride(), arg.dtype))
-
-    def _clear_cache(self) -> None:
-        self.cache_args.clear()
-        self.cache_grid = None
-
-    def grid_callback(self, grid: tuple[int, ...]) -> None:
-        # Sanitizer needs ``cache_grid`` tracked alongside the shared setup so
-        # ``pre_run_callback`` can consult it before deciding whether to skip
-        # the launch.
-        self.cache_grid = tuple(int(g) for g in grid)
-        SymbolicClient.grid_callback(self, grid)
 
     def _op_load_overrider(self, ptr, mask, other, *_args):
         ptr = self._materialize_memory_operand(ptr)
@@ -350,16 +306,6 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
         if not ranges:
             return None
         return ConcreteRangeInfo(tensor, ranges)
-
-    def pre_run_callback(self, fn: Callable) -> bool:
-        if self.cache_grid:
-            fn_cache = _FnSymbolicCache(fn, self.cache_grid, tuple(self.cache_args))
-            self._clear_cache()
-            if fn_cache not in _fn_symbolic_cache_set:
-                _fn_symbolic_cache_set.add(fn_cache)
-                return SymbolicClient.pre_run_callback(self, fn)
-            return False
-        return SymbolicClient.pre_run_callback(self, fn)
 
     def _find_tensor_for_expr(
         self, symbolic_expr: SymbolicExpr, violation_addr: int
