@@ -14,7 +14,10 @@ from tilelens.clients.symbolic_engine import (
     _range_to_iterator_constraint,
 )
 from tilelens.core.symbolic_metadata import is_pointer_dtype
-from tilelens.clients.sanitizer.sanitizer import SymbolicSanitizer
+from tilelens.clients.sanitizer.sanitizer import (
+    SymbolicSanitizer,
+    _fn_symbolic_cache_set,
+)
 from tilelens.core.callbacks import ForLoopCallbacks
 from tilelens.core.config import config
 from tilelens.core.patch import LoopSite, loop_file_token
@@ -1276,6 +1279,44 @@ def test_sanitizer_materializes_loaded_masked_compaction_store_indices():
     masked_compaction_index_store_kernel[(1,)](bitmask, out, BLOCK=out.numel())
 
     assert len(masked_compaction_index_sanitizer.records) == 0
+
+
+loaded_row_index_sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+
+@tilelens.trace(client=loaded_row_index_sanitizer)
+@triton.jit
+def loaded_row_index_gather_kernel(
+    idx_ptr, v_ptr, out_ptr, N: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr
+):
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    acc = tl.zeros((D,), dtype=tl.float32)
+    for start_n in range(0, N, BLOCK_N):
+        rows = tl.load(idx_ptr + start_n + offs_n)
+        # 2-D pointer tile whose rows come from loaded indices.
+        v = tl.load(v_ptr + rows[:, None] * D + offs_d[None, :])
+        acc += tl.sum(v, 0)
+    tl.store(out_ptr + offs_d, acc)
+
+
+@pytest.mark.parametrize("oob", [False, True], ids=["in_bounds", "oob"])
+def test_sanitizer_resolves_2d_pointer_tile_from_loaded_indices(oob):
+    # Both cases launch with the same signature; analyze each instead of
+    # replaying the cached result of the first launch.
+    _fn_symbolic_cache_set.clear()
+    loaded_row_index_sanitizer.records.clear()
+
+    num_rows, D, N, BLOCK_N = 16, 8, 32, 8
+    v = torch.randn((num_rows, D))
+    idx = torch.randint(0, num_rows, (N,), dtype=torch.int32)
+    if oob:
+        idx[-1] = num_rows  # one row past the end of v
+    out = torch.empty((D,))
+
+    loaded_row_index_gather_kernel[(1,)](idx, v, out, N=N, BLOCK_N=BLOCK_N, D=D)
+
+    assert (len(loaded_row_index_sanitizer.records) > 0) == oob
 
 
 # ======== Data-Dependent Loop Bound (Integer Division) Tests ===========
