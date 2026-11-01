@@ -18,6 +18,8 @@ from typing import cast
 import numpy as np
 
 from tilelens.clients.symbolic_engine import (
+    LoopContext,
+    PendingCheck,
     SymbolicClient,
     SymbolicExpr,
     ConstSymbolicExpr,
@@ -115,6 +117,73 @@ def test_range_to_iterator_constraint():
     assert_constraint_allows(constraint, i, 0)
     assert_constraint_forbids(constraint, i, 1)
     assert_constraint_forbids(constraint, i, -1)
+
+
+def _allowed_values(constraint: BoolRef, var: ArithRef, candidates: range) -> list[int]:
+    allowed = []
+    for val in candidates:
+        solver = Solver()
+        solver.add(constraint, var == val)
+        if solver.check() == sat:
+            allowed.append(val)
+    return allowed
+
+
+def _loop_context(start: int, stop: int, step: int) -> LoopContext:
+    i = Int("i")
+    return LoopContext(
+        loop_site=LoopSite(1, loop_file_token(__file__)),
+        length=len(range(start, stop, step)),
+        idx=None,
+        idx_z3=i,
+        iterator_constraint=_range_to_iterator_constraint(
+            i, start=start, stop=stop, step=step
+        ),
+        start=start,
+        stop=stop,
+        step=step,
+    )
+
+
+@pytest.mark.parametrize(
+    "start, stop, step, values",
+    [
+        (0, 10, 1, {0, 1, 2, 5, 9}),
+        (1, 20, 3, {1, 4, 7, 16}),
+        (9, -1, -2, {9, 7, 1}),
+    ],
+    ids=["unit-step", "step-3", "negative-step"],
+)
+def test_loop_iterations_constraint_allows_exactly_the_values(
+    start, stop, step, values
+):
+    ctx = _loop_context(start, stop, step)
+    constraint = ctx.iterations_constraint(values)
+    assert constraint is not None
+    candidates = range(min(start, stop) - 2, max(start, stop) + 3)
+    assert _allowed_values(constraint, ctx.idx_z3, candidates) == sorted(values)
+
+
+def test_loop_iterations_constraint_of_every_iteration_is_the_range():
+    ctx = _loop_context(0, 8, 2)
+    assert ctx.iterations_constraint({0, 2, 4, 6}) is ctx.iterator_constraint
+    assert ctx.iterations_constraint(set()) is ctx.iterator_constraint
+
+
+def test_loop_defer_records_every_iteration_of_a_repeated_access():
+    ctx = _loop_context(0, 4, 1)
+    made = []
+
+    def make_pending():
+        made.append(object())
+        return PendingCheck(cast(SymbolicExpr, None), Int("addr"), None)
+
+    for value, signature in [(0, "a"), (1, "a"), (2, "b"), (3, "a")]:
+        ctx.current_value = value
+        ctx.defer(signature, make_pending)
+
+    assert len(made) == 2
+    assert [p.iterations for p in ctx.pending_checks] == [{0, 1, 3}, {2}]
 
 
 def test_loop_sites_in_different_files_get_distinct_iterator_state():

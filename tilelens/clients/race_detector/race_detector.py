@@ -217,7 +217,7 @@ class SymbolicRaceDetector(RaceDetector, SymbolicClient):
         enclosing loop's flush point, with ``_make_event_signature`` used to
         dedupe events that repeat across iterations of the same loop.
         """
-        z3_addr, z3_constraints = expr.eval()
+        z3_addr, z3_constraints = self._bind_loop_indices(expr, *expr.eval())
         source_location = capture_current_source_location()
 
         if not self.loop_stack:
@@ -235,22 +235,17 @@ class SymbolicRaceDetector(RaceDetector, SymbolicClient):
         signature = _make_event_signature(
             access_mode, source_location, z3_addr, z3_constraints
         )
-        pending_idx = ctx.signature_cache.get(signature)
-        if pending_idx is None:
-            ctx.signature_cache[signature] = len(ctx.pending_checks)
-            ctx.pending_checks.append(
-                PendingEvent(
-                    symbolic_expr=expr,
-                    addr_expr=z3_addr,
-                    constraints=z3_constraints,
-                    source_location=source_location,
-                    access_mode=access_mode,
-                    op_type=op_type,
-                )
-            )
-        else:
-            if cfg.verbose:
-                print(f"[{self.LOG_TAG}]  ↪ skip duplicated addr in loop")
+        ctx.defer(
+            signature,
+            lambda: PendingEvent(
+                symbolic_expr=expr,
+                addr_expr=z3_addr,
+                constraints=z3_constraints,
+                source_location=source_location,
+                access_mode=access_mode,
+                op_type=op_type,
+            ),
+        )
 
     # ── Per-pending handler invoked from SymbolicClient's loop template
 
