@@ -196,7 +196,7 @@ def _lane_var(
     """Return the lane variable of ``tl.arange(start, end)`` laid along ``axis``.
 
     The lanes of a tile along one axis are one index, so every arange laid
-    along that axis shares a variable, and aranges laid along different axes
+    along that axis shares a variable, and those laid along different axes
     (the rows and columns in ``a[:, None] + b[None, :]``) get different ones.
     Axes are counted from the last one (``axis`` 0 is the last axis), which is
     how broadcasting aligns operands of different ranks. A 1-D arange starts
