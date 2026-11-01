@@ -275,6 +275,56 @@ def test_binary_expr_eval(op: str, lhs: int, rhs: int, expected):
     assert constraints is None
 
 
+@pytest.mark.parametrize(
+    "lhs,rhs",
+    [(-63, 64), (63, 64), (-8, 2), (7, -2), (-7, -2), (-7, 2), (7, 2)],
+)
+def test_signed_idiv_and_mod_round_toward_zero(lhs: int, rhs: int):
+    # Triton's signed `//` and `%` truncate, as in C: -63 // 64 == 0 and
+    # -63 % 64 == -63 (Python and Z3 give -1 and 1).
+    quotient = int(lhs / rhs)
+    remainder = lhs - rhs * quotient
+    for op, expected in (("idiv", quotient), ("mod", remainder)):
+        expr = SymbolicExpr.create(
+            op,
+            SymbolicExpr.create("const", lhs, INT32),
+            SymbolicExpr.create("const", rhs, INT32),
+        )
+        result, _ = expr.eval()
+        assert cast(IntNumRef, result).as_long() == expected, op
+
+
+def test_signed_idiv_of_symbolic_dividend_rounds_toward_zero():
+    pid = SymbolicExpr.create("pid", 0)
+    expr = SymbolicExpr.create(
+        "idiv",
+        SymbolicExpr.create("sub", pid, SymbolicExpr.create("const", 63, INT32)),
+        SymbolicExpr.create("const", 64, INT32),
+    )
+    quotient, _ = expr.eval()
+    solver = Solver()
+    solver.add(SymbolicExpr.PID0 == 0, quotient != 0)
+    assert solver.check() != sat
+
+
+def test_unsigned_idiv_and_mod_eval():
+    lhs = SymbolicExpr.create("const", 7, UINT32)
+    rhs = SymbolicExpr.create("const", 2, UINT32)
+    for op, expected in (("idiv", 3), ("mod", 1)):
+        result, _ = SymbolicExpr.create(op, lhs, rhs).eval()
+        assert cast(IntNumRef, result).as_long() == expected, op
+
+
+def test_idiv_concretize_without_frontend_fn_rounds_toward_zero():
+    expr = SymbolicExpr.create(
+        "idiv",
+        SymbolicExpr.create("const", np.array([-63, 63, -8, 7]), INT32),
+        SymbolicExpr.create("const", np.array([64, 64, 2, -2]), INT32),
+    )
+    expr.concrete_fn = None
+    assert expr.concretize().data.tolist() == [0, 0, -4, -3]
+
+
 def test_ashr_expr_eval_scalar_constants():
     lhs = SymbolicExpr.create("const", -8, INT32)
     rhs = SymbolicExpr.create("const", 1, INT32)
