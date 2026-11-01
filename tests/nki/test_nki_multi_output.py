@@ -43,6 +43,26 @@ def test_companion_output_has_dtype_geometry_and_same_producer_as_primary():
     assert activation['output_ptr']==activation['output_ptrs'][0]
 
 
+def test_companion_outputs_and_sdk_partition_checks_work_together():
+    from triton_viz.core.simulation.nki_isa_contracts import partition_contract_checks
+    with partition_contract_checks():
+        events=run(True)
+    activation=next(e for e in events if e.get('api_op')=='exp')
+    consumer=next(e for e in events if e.get('api_op')=='multiply')
+    assert activation['output_roles']==['primary','reduction']
+    assert any(w[0]==_read_accesses(consumer)[0][0] and w[4]==_read_accesses(consumer)[0][4]
+               for w in _write_accesses(activation))
+
+
+def test_default_contiguous_hbm_reshape_survives_contract_integration():
+    from triton_viz.core.simulation import nki_beta2 as b2
+    data=np.arange(256*128,dtype=np.float32).reshape(256,128)
+    src=b2.NDArray(value=data,buffer='hbm')
+    dst=b2.ndarray((128,256),nl.float32,buffer=b2.sbuf)
+    b2.dma_copy(dst=dst,src=src)
+    np.testing.assert_array_equal(dst.data,data.reshape(128,256))
+
+
 def test_default_retains_single_output_trace_schema():
     events=run(False);activation=next(e for e in events if e.get('api_op')=='exp')
     assert 'output_storages' not in activation and 'output_dtypes' not in activation
