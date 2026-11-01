@@ -1309,6 +1309,9 @@ def test_activation_documented_scalar_success_case(patched_scope):
     data = _typed_ndarray((8, 8), "float32", buffer="sbuf")
     dst = b2.NDArray(shape=(8, 8), dtype=nl.float32, buffer="sbuf")
     reduce_res = b2.NDArray(shape=(8, 1), dtype=nl.float32, buffer="sbuf")
+    # An idle readout without a reduction reads the existing Scalar registers.
+    # Initialize them explicitly rather than relying on an undefined launch state.
+    nisa.activation(dst, nl.copy, data, reduce_cmd=nisa.reduce_cmd.reset)
     nisa.activation(
         dst,
         nl.copy,
@@ -1320,6 +1323,7 @@ def test_activation_documented_scalar_success_case(patched_scope):
         reduce_cmd=nisa.reduce_cmd.idle,
     )
     assert dst.data.shape == (8, 8)
+    np.testing.assert_array_equal(reduce_res.data, np.zeros((8, 1), np.float32))
 
 
 def test_activation_documented_vector_success_case(patched_scope):

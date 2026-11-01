@@ -44,6 +44,21 @@ def test_deferred_reductions_plain_call_idle_replace_and_reset():
     assert 'scalar_state' not in next(e for e in events if e.get('api_op')=='add')
 
 
+def test_state_companion_outputs_and_partition_checks_work_together():
+    from triton_viz.core.simulation.nki_isa_contracts import partition_contract_checks
+    x=np.arange(8,dtype=np.float32).reshape(2,4)/10;out=np.zeros((2,5),np.float32)
+    tracer=Tracer(allocation_metadata=True,multi_output_metadata=True,scalar_state_metadata=True)
+    triton_viz.clear()
+    with partition_contract_checks():
+        triton_viz.trace(client=tracer,frontend='nki_beta2')(state_kernel)[1,](x,out)
+    sums=np.exp(x).sum(axis=1,keepdims=True)
+    assert np.allclose(out,np.concatenate([2*sums,3*sums,sums,0*sums,sums],axis=1),rtol=1e-6)
+    events=records_to_events(launches[-1].records)
+    states=[e for e in events if 'scalar_state' in e]
+    assert len(states)==6 and all(not e['scalar_state']['physical_result_phase_modelled'] for e in states)
+    assert any(e.get('output_roles')==['primary','reduction'] for e in states)
+
+
 def uninitialized_kernel(x,out,initialize):
     tile=nl.ndarray((2,4),dtype=nl.float32,buffer=nl.sbuf)
     act=nl.ndarray((2,4),dtype=nl.float32,buffer=nl.sbuf)
