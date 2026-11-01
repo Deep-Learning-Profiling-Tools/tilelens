@@ -1615,3 +1615,135 @@ def test_strided_view_warns_on_large_numel(_isolate_per_element_threshold):
 
     # Warning path must not change correctness -- no OOB with correct mask.
     assert len(strided_view_sanitizer.records) == 0
+
+
+# ======== Loop Checks Bound to Their Iterations ===========
+
+
+loop_iteration_sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+
+@tilelens.trace(client=loop_iteration_sanitizer)
+@triton.jit
+def loop_branch_on_index_kernel(
+    y_ptr, s0_ptr, out_ptr, L, W, LAST: tl.constexpr, BLOCK: tl.constexpr
+):
+    cols = tl.arange(0, BLOCK)
+    mask = cols < W
+    for i in range(L):
+        t = L - 1 - i
+        if t > LAST:
+            s = tl.load(y_ptr + t * W + cols - W, mask=mask, other=0)
+        else:
+            s = tl.load(s0_ptr + cols, mask=mask, other=0)
+        tl.store(out_ptr + t * W + cols, s, mask=mask)
+
+
+@tilelens.trace(client=loop_iteration_sanitizer)
+@triton.jit
+def loop_carried_pointer_kernel(
+    a_ptr, out_ptr, K, EXTRA: tl.constexpr, BK: tl.constexpr
+):
+    offs = tl.arange(0, BK)
+    ptrs = a_ptr + offs
+    acc = tl.zeros([BK], dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BK)):
+        acc += tl.load(ptrs, mask=offs < K - k * BK + EXTRA, other=0.0)
+        ptrs += BK
+    tl.store(out_ptr + offs, acc)
+
+
+@tilelens.trace(client=loop_iteration_sanitizer)
+@triton.jit
+def outer_loop_carried_pointer_kernel(
+    x_ptr, out_ptr, R, N, EXTRA: tl.constexpr, BLOCK: tl.constexpr
+):
+    offs = tl.arange(0, BLOCK)
+    row_ptr = x_ptr
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for m in range(R):
+        for _ in range(1):
+            acc += tl.load(row_ptr + offs, mask=offs < N - m + EXTRA, other=0.0)
+        row_ptr += N - m
+    tl.store(out_ptr + offs, acc)
+
+
+@pytest.mark.parametrize("last, expect_oob", [(0, False), (-1, True)])
+def test_loop_branch_on_index_is_checked_in_taken_iterations(last, expect_oob):
+    """
+    A load under `if t > LAST` inside the loop is checked only for the
+    iterations that take the branch.
+
+    Setup: L = 5 rows of W = 6. With LAST = 0, the branch loads row t - 1
+    for t >= 1. With LAST = -1, it also runs for t = 0 and loads row -1.
+    """
+    loop_iteration_sanitizer.records.clear()
+
+    y = torch.zeros((5 * 6,), dtype=torch.float32)
+    s0 = torch.zeros((6,), dtype=torch.float32)
+    out = torch.empty((5 * 6,), dtype=torch.float32)
+    loop_branch_on_index_kernel[(1,)](y, s0, out, 5, 6, LAST=last, BLOCK=8)
+
+    assert (len(loop_iteration_sanitizer.records) > 0) == expect_oob
+
+
+@pytest.mark.parametrize("extra, expect_oob", [(0, False), (1, True)])
+def test_loop_carried_pointer_is_checked_per_iteration(extra, expect_oob):
+    """
+    The matmul K loop: the pointer advances by BK each iteration and the
+    mask is offs < K - k * BK.
+
+    Setup: K = 100, BK = 32, so the last iteration (k = 3) loads a[96:100].
+    With EXTRA = 1, its mask lets one more lane through and it loads a[100].
+    """
+    loop_iteration_sanitizer.records.clear()
+
+    a = torch.zeros((100,), dtype=torch.float32)
+    out = torch.empty((32,), dtype=torch.float32)
+    loop_carried_pointer_kernel[(1,)](a, out, 100, EXTRA=extra, BK=32)
+
+    assert (len(loop_iteration_sanitizer.records) > 0) == expect_oob
+
+
+@pytest.mark.parametrize("extra, expect_oob", [(0, False), (1, True)])
+def test_outer_loop_carried_pointer_is_checked_per_outer_iteration(extra, expect_oob):
+    """
+    An inner loop's access uses a pointer advanced by the outer loop and a
+    mask on the outer index.
+
+    Setup: x packs the rows of a triangle, row m holding N - m = 8 - m
+    elements, R = 4 rows, 26 elements in all. With EXTRA = 1, the mask lets
+    one more lane through and the last row loads x[26].
+    """
+    loop_iteration_sanitizer.records.clear()
+
+    x = torch.zeros((8 + 7 + 6 + 5,), dtype=torch.float32)
+    out = torch.empty((8,), dtype=torch.float32)
+    outer_loop_carried_pointer_kernel[(1,)](x, out, 4, 8, EXTRA=extra, BLOCK=8)
+
+    assert (len(loop_iteration_sanitizer.records) > 0) == expect_oob
+
+
+@tilelens.trace(client=loop_iteration_sanitizer)
+@triton.jit
+def loop_index_after_loop_kernel(out_ptr, n, EXTRA: tl.constexpr):
+    last = 0
+    for i in range(n):
+        last = i
+    tl.store(out_ptr + last + EXTRA, 1.0)
+
+
+@pytest.mark.parametrize("extra, expect_oob", [(0, False), (1, True)])
+def test_loop_index_used_after_the_loop_keeps_its_last_value(extra, expect_oob):
+    """
+    The index of the last iteration, used after the loop, is n - 1.
+
+    Setup: n = 4 and out holds 4 elements. With EXTRA = 1 the store
+    writes out[4].
+    """
+    loop_iteration_sanitizer.records.clear()
+
+    out = torch.zeros((4,), dtype=torch.float32)
+    loop_index_after_loop_kernel[(1,)](out, 4, EXTRA=extra)
+
+    assert (len(loop_iteration_sanitizer.records) > 0) == expect_oob

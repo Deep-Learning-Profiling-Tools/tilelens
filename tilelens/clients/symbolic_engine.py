@@ -33,6 +33,7 @@ from z3 import (
     LShR,
     BoolVal,
     Not,
+    substitute,
 )
 from z3.z3 import BoolRef, ArithRef, IntNumRef, ExprRef, Tactic, Probe
 
@@ -213,6 +214,11 @@ class PendingCheck:
     # Lightweight source location: (filename, lineno, func_name)
     # Captured immediately to preserve accurate line info for deferred checks
     source_location: tuple[str, int, str] | None = None
+    # Values of the loop index in the iterations that produced this access.
+    # The access is checked for these iterations only: its expression is
+    # what the loop body built in them (with loop-carried values and branches
+    # on the index taken there), not a function of the index valid for all.
+    iterations: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -228,6 +234,57 @@ class LoopContext:
     current_value: int | None = None
     signature_cache: dict[int, int] = field(default_factory=dict)
     pending_checks: list[PendingCheck] = field(default_factory=list)
+
+    def defer(self, signature: Any, make_pending: Callable[[], PendingCheck]) -> None:
+        """Queue an access for this loop's flush point, once per signature.
+
+        A repeat of an earlier signature only records the current iteration.
+        """
+        pending_idx = self.signature_cache.get(signature)
+        if pending_idx is None:
+            self.signature_cache[signature] = len(self.pending_checks)
+            pending = make_pending()
+            self.pending_checks.append(pending)
+        else:
+            pending = self.pending_checks[pending_idx]
+            if cfg.verbose:
+                print("  ↪ skip duplicated addr in loop")
+        if self.current_value is not None:
+            pending.iterations.add(self.current_value)
+
+    def iterations_constraint(self, values: set[int]) -> BoolRef | None:
+        """Constrain the loop index to ``values``, a subset of its range."""
+        if not values or len(values) >= self.length:
+            return self.iterator_constraint
+        abs_step = abs(self.step)
+        runs: list[list[int]] = []
+        for v in sorted(values):
+            if runs and v - runs[-1][1] == abs_step:
+                runs[-1][1] = v
+            else:
+                runs.append([v, v])
+        idx = self.idx_z3
+        terms = [
+            idx == lo
+            if lo == hi
+            else _range_to_iterator_constraint(
+                idx, start=lo, stop=hi + abs_step, step=abs_step
+            )
+            for lo, hi in runs
+        ]
+        return cast(BoolRef, terms[0] if len(terms) == 1 else Or(*terms))
+
+    def index_of_iteration(self, value: int) -> Any:
+        """Return a loop index node that stands for the iteration ``value``.
+
+        Each iteration gets its own node and z3 variable, so a value carried
+        from an earlier iteration keeps that iteration's index; see
+        ``SymbolicClient._bind_loop_indices``.
+        """
+        sym = SymbolicExpr.create("const", self.idx_z3, INT32)
+        sym.loop_ctx = self
+        sym.loop_iteration = value
+        return SymbolicExpr.wrap_loop_index(sym, INT32)
 
 
 class SymbolicExprDataWrapper:
@@ -482,6 +539,9 @@ class SymbolicExpr:
 
         # for-loop iterator association
         self.loop_ctx: LoopContext | None = None
+        # The loop index value of the iteration this index node stands for,
+        # or None for a node that stands for every iteration.
+        self.loop_iteration: int | None = None
 
         # z3
         self.z3: Z3Expr | None = None
@@ -490,6 +550,7 @@ class SymbolicExpr:
         self._simplified_z3: Z3Expr | None = None
         self._simplified_constraints: ConstraintConjunction | None = None
         self._has_op_cache: dict[str, bool] = {}
+        self._loop_index_nodes: tuple[SymbolicExpr, ...] | None = None
         self.expr_signature: int | None = None
         self._data_wrapper: SymbolicExprDataWrapper | None = None
 
@@ -505,6 +566,7 @@ class SymbolicExpr:
         self.children[name] = child
         setattr(self, name, child)
         self._has_op_cache.clear()
+        self._loop_index_nodes = None
         self.expr_signature = None
         self._simplified_z3 = None
         self._simplified_constraints = None
@@ -834,6 +896,23 @@ class SymbolicExpr:
         self._has_op_cache[op_name] = False
         return False
 
+    def loop_index_nodes(self) -> tuple[SymbolicExpr, ...]:
+        """Return the per-iteration loop index nodes in this subtree."""
+        if self._loop_index_nodes is not None:
+            return self._loop_index_nodes
+        if self.loop_iteration is not None:
+            self._loop_index_nodes = (self,)
+            return self._loop_index_nodes
+        found: dict[int, SymbolicExpr] = {}
+        for child in self.children.values():
+            if child is None:
+                continue
+            for item in child if isinstance(child, tuple) else (child,):
+                for node in item.loop_index_nodes():
+                    found.setdefault(id(node), node)
+        self._loop_index_nodes = tuple(found.values())
+        return self._loop_index_nodes
+
     def has_vector_const(self) -> bool:
         value = getattr(self, "value", None)
         if (
@@ -936,6 +1015,8 @@ class ConstSymbolicExpr(SymbolicExpr):
 
         if self.loop_ctx:  # if the self is a loop iterator
             z3_expr: Z3Expr = self.loop_ctx.idx_z3
+            if self.loop_iteration is not None:
+                z3_expr = Int(f"{z3_expr}@{self.loop_iteration}")
         elif isinstance(
             value, np.ndarray
         ):  # only const nodes can be created with ndarray
@@ -955,11 +1036,14 @@ class ConstSymbolicExpr(SymbolicExpr):
         if dtype is None:
             raise RuntimeError("const node is missing dtype information")
 
-        if self.loop_ctx is not None and self.loop_ctx.current_value is not None:
-            return SymbolicTensorValue(
-                np.array([self.loop_ctx.current_value], dtype=dtype_to_numpy(dtype)),
-                dtype,
-            )
+        if self.loop_ctx is not None:
+            value = self.loop_iteration
+            if value is None:
+                value = self.loop_ctx.current_value
+            if value is not None:
+                return SymbolicTensorValue(
+                    np.array([value], dtype=dtype_to_numpy(dtype)), dtype
+                )
         if isinstance(self.value, (int, np.integer, bool, float, np.floating)):
             return SymbolicTensorValue(
                 np.array([self.value], dtype=dtype_to_numpy(dtype)),
@@ -3069,8 +3153,9 @@ class SymbolicClient(Client):
         if self._should_skip_loop_hooks():
             return idx
         if self.loop_stack and self.loop_stack[-1].loop_site == loop_site:
-            self.loop_stack[-1].current_value = int(idx)
-            return self.loop_stack[-1].idx
+            ctx = self.loop_stack[-1]
+            ctx.current_value = int(idx)
+            return ctx.index_of_iteration(ctx.current_value)
         return idx
 
     def _loop_hook_after(self, loop_site: LoopSite) -> None:
@@ -3085,32 +3170,21 @@ class SymbolicClient(Client):
         assert solver is not None
         assert addr_sym is not None
 
-        all_iterator_constraints: list[BoolRef] = []
-        if ctx.pending_checks:
-            solver.push()
-            iterator_constraint = ctx.iterator_constraint
-            if iterator_constraint is not None:
-                solver.add(iterator_constraint)
-                all_iterator_constraints.append(iterator_constraint)
-
-            # Also add constraints for all outer loops that are still active.
-            for outer_ctx in self.loop_stack:
-                outer_constraint = outer_ctx.iterator_constraint
-                if outer_constraint is not None:
-                    solver.add(outer_constraint)
-                    all_iterator_constraints.append(outer_constraint)
-
         for pending in ctx.pending_checks:
+            iterator_constraint = ctx.iterations_constraint(pending.iterations)
+            iterator_constraints = (
+                [] if iterator_constraint is None else [iterator_constraint]
+            )
             if cfg.verbose:
                 print(
                     f"[{self.LOG_TAG}] ▶ {self.LOG_VERB}:",
                     pending.addr_expr,
-                    f" with iterator constraints: {all_iterator_constraints} ",
+                    f" with iterator constraints: {iterator_constraints} ",
                     f" and expression-related constraints: {pending.constraints} ",
                 )
-            self._process_pending_check(ctx, pending, all_iterator_constraints)
-
-        if ctx.pending_checks:
+            solver.push()
+            solver.add(*iterator_constraints)
+            self._process_pending_check(ctx, pending, iterator_constraints)
             solver.pop()
 
         if cfg.verbose:
@@ -3253,6 +3327,46 @@ class SymbolicClient(Client):
         )
         self._handle_access_check(ret, TensorPointerStore, "write")
         return ret
+
+    def _bind_loop_indices(
+        self,
+        expr: SymbolicExpr,
+        addr: Z3Expr,
+        constraints: ConstraintConjunction,
+    ) -> tuple[Z3Expr, ConstraintConjunction]:
+        """Give each loop index in an access the value of its iteration.
+
+        The loop body runs once per iteration, and the index node of each
+        iteration has its own z3 variable. In the access's z3 form, the
+        running iteration of the innermost loop becomes the loop's variable,
+        so that the access built the same way in other iterations shares its
+        check (bound to those iterations, see ``PendingCheck.iterations``).
+        Every other index becomes its iteration's value: values carried from
+        an earlier iteration, and the indices of outer loops, which are in a
+        single iteration while this access runs.
+        """
+        nodes = expr.loop_index_nodes()
+        if not nodes:
+            return addr, constraints
+        innermost = self.loop_stack[-1] if self.loop_stack else None
+        pairs = []
+        for node in nodes:
+            var, _ = node._to_z3()
+            ctx = node.loop_ctx
+            assert ctx is not None and node.loop_iteration is not None
+            if ctx is innermost and node.loop_iteration == ctx.current_value:
+                pairs.append((var, ctx.idx_z3))
+            else:
+                pairs.append((var, IntVal(node.loop_iteration)))
+
+        def bind(e: Any) -> Any:
+            if e is None:
+                return None
+            if isinstance(e, list):
+                return [bind(x) for x in e]
+            return simplify(substitute(e, *pairs))
+
+        return bind(addr), bind(constraints)
 
     # ── Abstract hooks subclasses MUST implement ──────────────────────
 

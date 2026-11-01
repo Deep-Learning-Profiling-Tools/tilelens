@@ -35,6 +35,10 @@ class DummyExpr:
         """Return a stable z3 address expression with no extra constraints."""
         return Int("addr"), None
 
+    def loop_index_nodes(self):
+        """Return no loop index nodes: the address does not use the loop index."""
+        return ()
+
 
 def _identity(fn):
     """Return function unchanged for optional decorator wiring."""
