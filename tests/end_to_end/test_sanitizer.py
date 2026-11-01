@@ -1615,3 +1615,120 @@ def test_strided_view_warns_on_large_numel(_isolate_per_element_threshold):
 
     # Warning path must not change correctness -- no OOB with correct mask.
     assert len(strided_view_sanitizer.records) == 0
+
+
+# ======== Lane Variables of Tile Axes ===========
+
+
+lane_axis_sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+
+@tilelens.trace(client=lane_axis_sanitizer)
+@triton.jit
+def square_tile_kernel(x_ptr, out_ptr, M, N, B: tl.constexpr, COL_MASK: tl.constexpr):
+    rows = tl.arange(0, B)[:, None]
+    cols = tl.arange(0, B)[None, :]
+    mask = rows < M
+    if COL_MASK:
+        mask = mask & (cols < N)
+    x = tl.load(x_ptr + rows * N + cols, mask=mask, other=0.0)
+    tl.store(out_ptr + rows * B + cols, x)
+
+
+@tilelens.trace(client=lane_axis_sanitizer)
+@triton.jit
+def self_broadcast_tile_kernel(x_ptr, out_ptr, M, N, B: tl.constexpr):
+    offs = tl.arange(0, B)
+    x = tl.load(x_ptr + offs[:, None] * N + offs[None, :], mask=offs[:, None] < M)
+    tl.store(out_ptr + offs[:, None] * B + offs[None, :], x)
+
+
+@tilelens.trace(client=lane_axis_sanitizer)
+@triton.jit
+def transposed_tile_kernel(x_ptr, out_ptr, M, N, B: tl.constexpr, SWAP: tl.constexpr):
+    rows = tl.arange(0, B)[:, None]
+    cols = tl.arange(0, B)[None, :]
+    # offs_t[c, r] = r * N + c
+    offs_t = tl.trans(rows * N + cols)
+    if SWAP:
+        mask_t = (tl.arange(0, B)[:, None] < M) & (tl.arange(0, B)[None, :] < N)
+    else:
+        mask_t = (tl.arange(0, B)[:, None] < N) & (tl.arange(0, B)[None, :] < M)
+    x = tl.load(x_ptr + offs_t, mask=mask_t, other=0.0)
+    tl.store(out_ptr + rows * B + cols, x)
+
+
+@tilelens.trace(client=lane_axis_sanitizer)
+@triton.jit
+def two_aranges_one_axis_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    mask = tl.arange(0, BLOCK) < n
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask, other=0.0))
+
+
+@pytest.mark.parametrize("col_mask, expect_oob", [(True, False), (False, True)])
+def test_square_tile_rows_and_columns_are_independent(col_mask, expect_oob):
+    """
+    The rows and columns of a 16 x 16 tile are two lane indices, not one.
+
+    Setup: x is 4 x 8. Without the column mask, row 3 reads columns 8-15,
+    up to x[3 * 8 + 15] = x[39]; on the tile's diagonal (row == column)
+    every access stays in x.
+    """
+    lane_axis_sanitizer.records.clear()
+
+    x = torch.zeros((4 * 8,), dtype=torch.float32)
+    out = torch.empty((16 * 16,), dtype=torch.float32)
+    square_tile_kernel[(1,)](x, out, 4, 8, B=16, COL_MASK=col_mask)
+
+    assert (len(lane_axis_sanitizer.records) > 0) == expect_oob
+
+
+def test_arange_broadcast_against_itself_uses_two_lanes():
+    """
+    offs[:, None] and offs[None, :] are the rows and columns of the tile,
+    although both come from one arange.
+
+    Setup: as above, x is 4 x 8 and only the rows are masked.
+    """
+    lane_axis_sanitizer.records.clear()
+
+    x = torch.zeros((4 * 8,), dtype=torch.float32)
+    out = torch.empty((16 * 16,), dtype=torch.float32)
+    self_broadcast_tile_kernel[(1,)](x, out, 4, 8, B=16)
+
+    assert len(lane_axis_sanitizer.records) > 0, "Expected OOB to be detected"
+
+
+@pytest.mark.parametrize("swap, expect_oob", [(False, False), (True, True)])
+def test_transposed_tile_keeps_lanes_with_their_axes(swap, expect_oob):
+    """
+    tl.trans moves the row and column lanes with their axes.
+
+    Setup: x is M x N = 4 x 6 and the tile is 8 x 8. The transposed offsets
+    offs_t[c, r] = r * N + c are masked by c < N and r < M. With SWAP the
+    mask is c < M and r < N, so r = 5 reads x[30:34].
+    """
+    lane_axis_sanitizer.records.clear()
+
+    x = torch.zeros((4 * 6,), dtype=torch.float32)
+    out = torch.empty((8 * 8,), dtype=torch.float32)
+    transposed_tile_kernel[(1,)](x, out, 4, 6, B=8, SWAP=swap)
+
+    assert (len(lane_axis_sanitizer.records) > 0) == expect_oob
+
+
+def test_two_aranges_on_one_axis_are_one_lane():
+    """
+    A mask and an address built from two tl.arange calls over the same range
+    index the same lanes.
+
+    Setup: n = 100, BLOCK = 128, x holds 100 elements.
+    """
+    lane_axis_sanitizer.records.clear()
+
+    x = torch.zeros((100,), dtype=torch.float32)
+    out = torch.empty((128,), dtype=torch.float32)
+    two_aranges_one_axis_kernel[(1,)](x, out, 100, BLOCK=128)
+
+    assert lane_axis_sanitizer.records == []

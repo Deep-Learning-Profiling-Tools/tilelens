@@ -430,6 +430,35 @@ def test_reshape_expr_eval(op: str, extra):
 # ======== Regression Tests: expand_dims/broadcast Shape Fix =========
 
 
+def test_expand_dims_lays_an_arange_along_its_axis():
+    arange = SymbolicExpr.create("arange", INT32, 0, 8)
+    rows = SymbolicExpr.create("expand_dims", arange, 1)
+    cols = SymbolicExpr.create("expand_dims", arange, 0)
+    rows_z3, _ = rows.eval()
+    cols_z3, _ = cols.eval()
+    assert str(rows_z3) == "arange_0_8_ax1"
+    assert str(cols_z3) == "arange_0_8"
+    # Two calls over the same range on one axis share the lane variable.
+    other_z3, _ = SymbolicExpr.create(
+        "expand_dims", SymbolicExpr.create("arange", INT32, 0, 8), 0
+    ).eval()
+    assert str(other_z3) == str(cols_z3)
+
+
+def test_trans_swaps_the_lanes_of_a_tile():
+    arange = SymbolicExpr.create("arange", INT32, 0, 8)
+    rows = SymbolicExpr.create("expand_dims", arange, 1)
+    cols = SymbolicExpr.create("expand_dims", arange, 0)
+    tile = SymbolicExpr.create(
+        "add",
+        SymbolicExpr.create("mul", rows, SymbolicExpr.create("const", 10, INT32)),
+        cols,
+    )
+    transposed, constraints = SymbolicExpr.create("trans", tile, (1, 0)).eval()
+    assert str(transposed) == "10*arange_0_8 + arange_0_8_ax1"
+    assert "arange_0_8_ax1" in str(constraints)
+
+
 def test_expand_dims_updates_shape():
     # Scalar constant has empty shape
     arg = SymbolicExpr.create("const", 5, INT32)
