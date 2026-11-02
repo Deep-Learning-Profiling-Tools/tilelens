@@ -15,6 +15,13 @@ import numpy as np
 from dataclasses import dataclass, replace
 
 
+def _element_size(ptr) -> int:
+    if isinstance(ptr, TensorHandle):
+        return _get_np_dtype(ptr.get_element_ty()).itemsize
+    # Non-Triton frontends (e.g. cuTile) pass arrays backed by NumPy data.
+    return ptr.data.dtype.itemsize
+
+
 @dataclass(frozen=False)
 class LoopInfo:
     length: int | None = None
@@ -93,6 +100,9 @@ class Profiler(Client):
         # Config has enable_load_store_skipping, but profiler uses disable_load_store_skipping
         self.disable_load_store_skipping = not cfg.profiler_enable_load_store_skipping
 
+        # Frontend whose op signatures the skipping overriders follow
+        self.frontend_name = "triton"
+
     def pre_run_callback(self, fn: Callable) -> bool:
         # If block sampling is enabled, check if current block is selected
         if self.block_sampling and self.sampled_blocks is not None:
@@ -159,12 +169,11 @@ class Profiler(Client):
     def _report_load_store_bytes(
         self, type, ptr: TensorHandle, mask: TensorHandle
     ):  # internal methods assumed to be called under the lock
-        dtype_tt = ptr.get_element_ty()
-        dtype_np: np.dtype = _get_np_dtype(dtype_tt)
+        itemsize = _element_size(ptr)
         mask_true = np.count_nonzero(mask.data)
         mask_false = np.count_nonzero(np.logical_not(mask.data))
-        total_bytes_true = mask_true * dtype_np.itemsize
-        total_bytes_attempted = (mask_true + mask_false) * dtype_np.itemsize
+        total_bytes_true = mask_true * itemsize
+        total_bytes_attempted = (mask_true + mask_false) * itemsize
         if type == "load":
             self.load_bytes.total_bytes_attempted += total_bytes_attempted
             self.load_bytes.total_bytes_true += total_bytes_true
@@ -305,25 +314,43 @@ class Profiler(Client):
             if not self.disable_buffer_load_check:
                 self._check_32bit_range(byte_offset, element_bytewidth, offset_data)
 
+        overriders: dict[type[Op], Callable] = {
+            Load: load_overrider,
+            Store: store_overrider,
+            Dot: dot_overrider,
+        }
+        if self.frontend_name == "cutile":
+            from ...core.frontend.cutile import (
+                cutile_skip_store,
+                cutile_zero_dot,
+                cutile_zero_load,
+            )
+
+            overriders = {
+                Load: self.lock_fn(cutile_zero_load),
+                Store: self.lock_fn(cutile_skip_store),
+                Dot: self.lock_fn(cutile_zero_dot),
+            }
+
         if op_type is Load:
             if self.disable_load_store_skipping:
                 return OpCallbacks(before_callback=pre_load_callback)
             else:
                 return OpCallbacks(
-                    before_callback=pre_load_callback, op_overrider=load_overrider
+                    before_callback=pre_load_callback, op_overrider=overriders[Load]
                 )
         elif op_type is Store:
             if self.disable_load_store_skipping:
                 return OpCallbacks(before_callback=pre_store_callback)
             else:
                 return OpCallbacks(
-                    before_callback=pre_store_callback, op_overrider=store_overrider
+                    before_callback=pre_store_callback, op_overrider=overriders[Store]
                 )
         elif op_type is Dot:
             if self.disable_load_store_skipping:
                 return OpCallbacks()
             else:
-                return OpCallbacks(op_overrider=dot_overrider)
+                return OpCallbacks(op_overrider=overriders[Dot])
         elif op_type is AddPtr:
             return OpCallbacks(before_callback=pre_addptr_callback)
 

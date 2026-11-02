@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 ct = pytest.importorskip("cuda.tile")
 
@@ -215,6 +216,44 @@ def test_reduction_and_interpreter_wrapper():
     assert [type(r) for r in launches[-1].records] == [Grid, Load, ReduceSum, Store]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("trace", [False, True])
+def test_device_tensors_run_on_host_copies(trace):
+    from tilelens.core.simulation.cutile import CuTileInterpretedFunction
+
+    def kernel(src, dst):
+        block = ct.bid(0)
+        tile = ct.load(src, (block,), (2,))
+        ct.store(dst, (block,), tile + 1)
+
+    buffer = torch.zeros(8, dtype=torch.bfloat16, device="cuda")
+    buffer[:4] = torch.arange(4, device="cuda")
+    runner = (
+        tilelens.trace(frontend="cutile")(kernel)
+        if trace
+        else CuTileInterpretedFunction(kernel)
+    )
+    # Aliased views share one host copy, and writes return to the device.
+    runner.run(buffer[:4], buffer[4:], grid=(2,))
+    assert buffer.device.type == "cuda"
+    torch.testing.assert_close(
+        buffer.cpu(), torch.tensor([0, 1, 2, 3, 1, 2, 3, 4], dtype=torch.bfloat16)
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_device_tensors_are_restored_after_early_stop():
+    class StopAfterFirstBlock(Tracer):
+        def post_run_callback(self, fn):
+            return False
+
+    dst = torch.zeros(4, dtype=torch.float32, device="cuda")
+    tilelens.trace(StopAfterFirstBlock(), frontend="cutile")(copy_kernel).run(
+        torch.ones(8, dtype=torch.float32, device="cuda"), dst, grid=(2,)
+    )
+    torch.testing.assert_close(dst.cpu(), torch.ones(4))
+
+
 @pytest.mark.parametrize("grid", [2, (2,), (2, 2), (2, 2, 2)])
 @pytest.mark.parametrize("trace", [False, True])
 def test_grid_axes(grid, trace):
@@ -239,8 +278,8 @@ def test_grid_axes(grid, trace):
 
 
 def test_unsupported_client_is_rejected():
-    with pytest.raises(ValueError, match="only the tracer"):
-        tilelens.trace("profiler", frontend="cutile")(copy_kernel)
+    with pytest.raises(ValueError, match="only the tracer and profiler"):
+        tilelens.trace("sanitizer", frontend="cutile")(copy_kernel)
 
 
 def test_trace_tiled_views(tmp_path):
