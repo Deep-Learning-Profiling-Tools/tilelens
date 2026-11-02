@@ -123,7 +123,7 @@ uv sync --extra test # tests but no NKI support
 ### Testing
 * To run core TileLens tests, run `pytest tests/`.
 * (if NKI installed) To run NKI-specific tests, run `pytest tests/ -m nki`.
-* To run cuTile-specific tests, run `pytest tests/unit/test_cutile.py tests/end_to_end/test_cutile.py tests/cutile/test_cutile_tracer.py`.
+* To run cuTile-specific tests, run `pytest tests/unit/test_cutile.py tests/end_to_end/test_cutile.py tests/cutile/`.
 * To run all tests (Triton + NKI), run `pytest tests/ -m ""`.
 * To run visualizer web UI tests, run `npm run test:frontend`.
 
@@ -187,7 +187,9 @@ simulation runtimes live under `tilelens/core/simulation/`.
 
 ### cuTile tracing
 
-cuTile kernels run on the CPU with NumPy arrays and support tracing and visualization:
+cuTile kernels run on the CPU with NumPy arrays or Torch tensors and support tracing
+and visualization. Like Triton's interpreter, device tensors are copied to the host
+for the run and copied back afterwards:
 
 ```sh
 uv sync --extra test
@@ -205,7 +207,10 @@ kernel[grid](lhs, rhs, result)
 ```
 
 Use contiguous NumPy arrays for visualization. cuTile analysis currently supports
-only the tracer client; numerical behavior may differ from GPU execution.
+the tracer and profiler clients; numerical behavior may differ from GPU execution.
+The profiler reports load/store bytes, out-of-bounds tile elements, and for-loop
+lengths, and `tile-profiler` runs `ct.launch` calls through the interpreter.
+It skips the buffer-load check, which only applies to Triton on AMD GPUs.
 
 ## Analysis Clients
 

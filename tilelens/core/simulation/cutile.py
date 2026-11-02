@@ -35,6 +35,10 @@ from ..frontend.base import get_frontend
 
 cutile_execution_lock = threading.RLock()
 
+# Rewrites a function's for-loops to report them to clients. The cuTile
+# frontend installs it through its patch scope for traced runs only.
+_rewrite_loops: Any = None
+
 
 DTYPES = {
     ct.bool_: np.dtype(np.bool_),
@@ -1087,7 +1091,8 @@ class Builder:
             )
         keys, valid = _indexed_access(array, indices, check_bounds=check_bounds)
         updates = np.broadcast_to(_implicit_value(update, array.dtype), valid.shape)
-        previous = self.gather(array, indices, check_bounds=check_bounds)
+        # _atomic marks accesses that op overriders must not skip.
+        previous = self.gather(array, indices, check_bounds=check_bounds, _atomic=True)
         old = previous.data.copy()
         final = previous.data.copy()
         positions = tuple(key[valid] for key in keys)
@@ -1143,7 +1148,12 @@ class Builder:
         old[valid], final[valid] = old_values, new_values
         # One vector access per operation, even when addresses repeat.
         self.scatter(
-            array, indices, Tile(final), mask=Tile(valid), check_bounds=check_bounds
+            array,
+            indices,
+            Tile(final),
+            mask=Tile(valid),
+            check_bounds=check_bounds,
+            _atomic=True,
         )
         return Tile(old)
 
@@ -1928,13 +1938,16 @@ def _execution_scope(fn):
             scope.callback(operator.setitem, namespace, name, previous)
         namespace[name] = value
 
+    def rewritten(function):
+        return function if _rewrite_loops is None else _rewrite_loops(function)
+
     def patched_value(value):
         operation = originals.get(id(value))
         if operation is not None:
             wrapper = _language_operation(operation)
             visited.add(id(wrapper))
             return wrapper
-        return inspect.unwrap(value) if _is_tile_function(value) else value
+        return rewritten(inspect.unwrap(value) if _is_tile_function(value) else value)
 
     def tile_minmax(original, operation):
         def execute(*args, **kwargs):
@@ -1991,13 +2004,14 @@ def _execution_scope(fn):
             # through values the static scan cannot see, patching them on call.
             class InterpreterMode(DispatchMode):
                 def call_tile_function_from_host(self, func, args, kwargs):
-                    function = inspect.unwrap(func)
+                    function = rewritten(inspect.unwrap(func))
                     patch_function(function)
                     return function(*args, **kwargs)
 
             scope.enter_context(InterpreterMode().as_current())
-        patch_function(fn)
-        yield fn
+        execution_fn = rewritten(fn)
+        patch_function(execution_fn)
+        yield execution_fn
 
 
 def _parameter_annotations(fn):
@@ -2034,7 +2048,25 @@ def _check_integer_scalar(value, dtype):
         raise ValueError(f"Integer argument is out of range of {dtype}")
 
 
-def _wrap_argument(arg, scalar_dtype=None):
+def _to_host(arg, storages):
+    """Copy a device tensor to the CPU once per storage, like Triton's interpreter."""
+    storage = arg.untyped_storage()
+    if storage.data_ptr() not in storages:
+        storages[storage.data_ptr()] = (storage, storage.cpu())
+    host = arg.new_empty(0, device="cpu")
+    host.set_(
+        storages[storage.data_ptr()][1], arg.storage_offset(), arg.size(), arg.stride()
+    )
+    return host
+
+
+def _restore_args_dev(storages):
+    """Copy host storages back to their device tensors to propagate writes."""
+    for device_storage, host_storage in storages.values():
+        device_storage.copy_(host_storage)
+
+
+def _wrap_argument(arg, scalar_dtype, storages):
     if scalar_dtype is not None:
         _check_integer_scalar(arg, scalar_dtype)
         return Tile(arg, scalar_dtype)
@@ -2047,7 +2079,7 @@ def _wrap_argument(arg, scalar_dtype=None):
     torch = sys.modules.get("torch")
     if torch is not None and isinstance(arg, torch.Tensor):
         if arg.device.type != "cpu":
-            raise TypeError("cuTile interpretation requires CPU tensors")
+            arg = _to_host(arg, storages)
         arg = arg.detach()
         storage = {
             torch.bfloat16: torch.int16,
@@ -2095,19 +2127,25 @@ class CuTileInterpretedFunction:
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         annotations = _parameter_annotations(self.fn)
+        # Device tensors run on host copies of their storages, keyed by device
+        # pointer so aliased arguments keep sharing memory.
+        storages: dict[int, tuple[Any, Any]] = {}
         for name, arg in bound.arguments.items():
             is_constant, scalar_dtype = annotations.get(name, (False, None))
             if is_constant:
                 continue
             kind = signature.parameters[name].kind
             if kind is inspect.Parameter.VAR_POSITIONAL:
-                arg = tuple(_wrap_argument(item, scalar_dtype) for item in arg)
+                arg = tuple(
+                    _wrap_argument(item, scalar_dtype, storages) for item in arg
+                )
             elif kind is inspect.Parameter.VAR_KEYWORD:
                 arg = {
-                    key: _wrap_argument(item, scalar_dtype) for key, item in arg.items()
+                    key: _wrap_argument(item, scalar_dtype, storages)
+                    for key, item in arg.items()
                 }
             else:
-                arg = _wrap_argument(arg, scalar_dtype)
+                arg = _wrap_argument(arg, scalar_dtype, storages)
             bound.arguments[name] = arg
         args, kwargs = bound.args, bound.kwargs
 
@@ -2142,10 +2180,12 @@ class CuTileInterpretedFunction:
                     if client_manager is not None:
                         client_manager.grid_idx_callback(grid_idx)
                         if not client_manager.pre_run_callback(self.fn):
-                            return
+                            continue
                     execution_fn(*args, **kwargs)
                     if client_manager is not None:
                         if not client_manager.post_run_callback(self.fn):
-                            return
+                            break
         finally:
             cutile_unpatch_lang(scope)
+        # Like Triton, copy arguments back to propagate side effects.
+        _restore_args_dev(storages)

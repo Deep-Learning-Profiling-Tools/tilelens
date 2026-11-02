@@ -241,8 +241,15 @@ class CuTileTrace(LaunchInterface, TraceInterface):
 
     def add_client(self, new_client: str | Client) -> None:
         selected = self._normalize_client(new_client)
-        if not isinstance(selected, Tracer):
-            raise ValueError("cuTile currently supports only the tracer client")
+        if not isinstance(selected, (Tracer, Profiler)):
+            raise ValueError(
+                "cuTile currently supports only the tracer and profiler clients"
+            )
+        if isinstance(selected, Profiler):
+            # Skip cuTile ops with cuTile signatures; the buffer-load check
+            # inspects AMD assembly, which interpreted cuTile never produces.
+            selected.frontend_name = self.frontend_name
+            selected.disable_buffer_load_check = True
         super().add_client(selected)
 
     def run(self, *args, grid=(1,), **kwargs):
