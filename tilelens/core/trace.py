@@ -240,10 +240,19 @@ class CuTileTrace(LaunchInterface, TraceInterface):
         TraceInterface.__init__(self, client)
 
     def add_client(self, new_client: str | Client) -> None:
+        from ..clients.sanitizer.cutile import CuTileSanitizer
+        from ..clients.sanitizer.sanitizer import SymbolicSanitizer
+
         selected = self._normalize_client(new_client)
-        if not isinstance(selected, (Tracer, Profiler)):
+        if isinstance(selected, SymbolicSanitizer) and not isinstance(
+            selected, CuTileSanitizer
+        ):
+            # cuTile checks the accesses its user mask guards, not pointers.
+            selected = CuTileSanitizer(abort_on_error=selected.abort_on_error)
+        if not isinstance(selected, (Tracer, Profiler, CuTileSanitizer)):
             raise ValueError(
-                "cuTile currently supports only the tracer and profiler clients"
+                "cuTile currently supports only the tracer, profiler, and "
+                "sanitizer clients"
             )
         if isinstance(selected, Profiler):
             # Skip cuTile ops with cuTile signatures; the buffer-load check
