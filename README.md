@@ -207,10 +207,17 @@ kernel[grid](lhs, rhs, result)
 ```
 
 Use contiguous NumPy arrays for visualization. cuTile analysis currently supports
-the tracer and profiler clients; numerical behavior may differ from GPU execution.
-The profiler reports load/store bytes, out-of-bounds tile elements, and for-loop
-lengths, and `tile-profiler` runs `ct.launch` calls through the interpreter.
+the tracer, profiler, and sanitizer clients; numerical behavior may differ from GPU
+execution. The profiler reports load/store bytes, out-of-bounds tile elements, and
+for-loop lengths, and `tile-profiler` runs `ct.launch` calls through the interpreter.
 It skips the buffer-load check, which only applies to Triton on AMD GPUs.
+
+cuTile bounds-checks tiled loads and stores, and gather, scatter, and atomics by
+default, so the sanitizer checks only gather, scatter, and atomics run with
+`check_bounds=False`, where the user's `mask=` keeps indices in bounds. Like the
+Triton sanitizer, it uses Z3 to check every block at once, and falls back to
+checking each block when indices come from loaded data. `tile-sanitizer` runs
+`ct.launch` calls through the interpreter.
 
 ## Analysis Clients
 

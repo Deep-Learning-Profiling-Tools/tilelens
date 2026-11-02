@@ -8,7 +8,26 @@ from typing import Any
 
 import numpy as np
 
-from tilelens.core.data import Dot, Load, Op, ProgramId, ReduceSum, Store
+from tilelens.core.data import (
+    AtomicCas,
+    AtomicRMW,
+    BinaryOp,
+    Broadcast,
+    CastImpl,
+    Dot,
+    ExpandDims,
+    Load,
+    MakeRange,
+    Op,
+    ProgramId,
+    ReduceSum,
+    Reshape,
+    Splat,
+    Store,
+    TernaryOp,
+    UnaryOp,
+    Unsplat,
+)
 
 from ..patch import LoopSite, loop_file_token
 from .base import AdapterResult, Frontend, _LangPatchScope, register_frontend
@@ -199,7 +218,59 @@ if HAS_CUTILE:
             "mma": Dot,
             "mma_scaled": Dot,
             "sum": ReduceSum,
-        }
+            # Index arithmetic, so the sanitizer can follow how indices are built.
+            "arange": MakeRange,
+            **dict.fromkeys(
+                (
+                    "add",
+                    "sub",
+                    "mul",
+                    "floordiv",
+                    "mod",
+                    "less",
+                    "less_equal",
+                    "greater",
+                    "greater_equal",
+                    "equal",
+                    "not_equal",
+                    "maximum",
+                    "minimum",
+                    "bitwise_and",
+                    "bitwise_or",
+                    "bitwise_xor",
+                    "bitwise_lshift",
+                    "bitwise_rshift",
+                ),
+                BinaryOp,
+            ),
+            "negative": UnaryOp,
+            "where": TernaryOp,
+            "reshape": Reshape,
+            "broadcast_to": Broadcast,
+            "expand_dims": ExpandDims,
+            "astype": CastImpl,
+            "full": Splat,
+            "zeros": Splat,
+            "ones": Splat,
+            **dict.fromkeys(
+                (
+                    "atomic_add",
+                    "atomic_max",
+                    "atomic_min",
+                    "atomic_and",
+                    "atomic_or",
+                    "atomic_xor",
+                    "atomic_xchg",
+                ),
+                AtomicRMW,
+            ),
+            "atomic_cas": AtomicCas,
+        },
+        # Tile indexing, and Tiles deciding Python control flow.
+        Tile: {
+            "__getitem__": ExpandDims,
+            "__bool__": Unsplat,
+        },
     }
 
     CUTILE_ADAPTERS = {
@@ -241,6 +312,10 @@ class CuTileFrontend(Frontend):
         # separate ops that overriders never replace, so run them unchanged.
         if kwargs.get("_atomic", False):
             return op(*args, **kwargs)
+        # One op type covers several cuTile ops, so overriders that wrap the
+        # op (like Gluon's callable adapters) receive the original op first.
+        if getattr(op_overrider, "receives_op", False):
+            return op_overrider(op, *args, **kwargs)
         return op_overrider(*args, **kwargs)
 
     def patch_for_loop(self) -> None:
@@ -310,6 +385,7 @@ def interpreted_launches(client="tracer", *, cli=False):
     import cuda.tile as ct
     import tilelens
     from tilelens.core.trace import CuTileTrace
+    from tilelens.core.simulation.cutile import CuTileInterpretedFunction
 
     traces: dict[Any, CuTileTrace] = {}
 
@@ -319,6 +395,9 @@ def interpreted_launches(client="tracer", *, cli=False):
             if kernel not in traces:
                 traces[kernel] = tilelens.trace(client, frontend="cutile")(kernel)
             runner = traces[kernel]
+            if not isinstance(runner, CuTileTrace):
+                # A disabled client (e.g. ENABLE_SANITIZER=0) leaves kernels untraced.
+                runner = CuTileInterpretedFunction(runner)
         elif isinstance(kernel, CuTileTrace):
             runner = kernel
         else:
