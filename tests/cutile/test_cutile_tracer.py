@@ -278,8 +278,8 @@ def test_grid_axes(grid, trace):
 
 
 def test_unsupported_client_is_rejected():
-    with pytest.raises(ValueError, match="only the tracer and profiler"):
-        tilelens.trace("sanitizer", frontend="cutile")(copy_kernel)
+    with pytest.raises(ValueError, match="only the tracer, profiler, and sanitizer"):
+        tilelens.trace("race_detector", frontend="cutile")(copy_kernel)
 
 
 def test_trace_tiled_views(tmp_path):
