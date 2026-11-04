@@ -59,6 +59,7 @@ from ..symbolic_engine import (
 )
 from .data import (
     AccessEventRecord,
+    CompiledRaceRecord,
     MemorySem,
     RaceAccess,
     RaceRecord,
@@ -66,6 +67,7 @@ from .data import (
     RaceType,
 )
 from .hb_common import (
+    MAIN_CONTEXT_LOCK,
     UnsupportedSymbolicRaceQuery,
     apply_sub,
     normalize_copy_local_vars,
@@ -149,9 +151,11 @@ class PendingEvent(PendingCheck):
 class RaceDetector(Client):
     """Factory class that returns the concrete race-detector implementation:
     :class:`NullRaceDetector` when ``cfg.enable_race_detector`` is off,
-    otherwise :class:`SymbolicRaceDetector`, the eager detector, which
-    reasons about global memory across program instances from one
-    interpreter-driven symbolic capture.
+    otherwise ``RaceDetector()`` the eager one, :class:`SymbolicRaceDetector`,
+    which reasons about global memory across program instances from one
+    interpreter-driven symbolic capture, and ``RaceDetector(compile=True)``
+    the compiled one (``CompiledRaceDetector``, a virtual subclass), which
+    reads each launch's host-compiled TTIR.
     """
 
     NAME = "race_detector"
@@ -162,6 +166,15 @@ class RaceDetector(Client):
         if cls is RaceDetector:
             # The disable flag wins over the mode, as for the Sanitizer:
             # RaceDetector(compile=True) is a NullRaceDetector when it is off.
+            if kwargs.pop("compile", False) and cfg.enable_race_detector:
+                from .compiled.client import CompiledRaceDetector
+
+                # Only a virtual RaceDetector subclass, so Python does not
+                # call its __init__ after __new__: call it here, without
+                # ``compile``.
+                compiled = object.__new__(CompiledRaceDetector)
+                CompiledRaceDetector.__init__(compiled, *args, **kwargs)
+                return cast(RaceDetectorT, compiled)
             target_cls = cast(
                 type["RaceDetector"],
                 SymbolicRaceDetector if cfg.enable_race_detector else NullRaceDetector,
@@ -317,8 +330,12 @@ def print_race_record(record: RaceRecord) -> None:
     """Print one race the detector found."""
     print("============================================================")
     print("                      Data Race Detected                    ")
+    if isinstance(record, CompiledRaceRecord):
+        print("                  (compiled race detector)")
     print("============================================================")
     print(f"Race Type: {record.race_type}")
+    if isinstance(record, CompiledRaceRecord) and record.config:
+        print(f"Config: {record.config}")
     for label, access, program in (
         ("First", record.first, record.programs[0]),
         ("Second", record.second, record.programs[1]),
@@ -350,9 +367,9 @@ class SymbolicRaceDetector(RaceDetector, SymbolicClient):
     # constructs this class with it.
     def __init__(self, abort_on_error: bool = False, *, compile: bool = False):
         if compile:
-            raise NotImplementedError(
-                "RaceDetector(compile=True): the compiled race detector is not "
-                "available yet; RaceDetector() is the eager one."
+            raise TypeError(
+                "SymbolicRaceDetector is the eager race detector; the compiled "
+                "one is RaceDetector(compile=True)"
             )
         super().__init__(abort_on_error=abort_on_error)
         self.records: list[AccessEventRecord] = []
@@ -1032,6 +1049,10 @@ class SymbolicRaceDetector(RaceDetector, SymbolicClient):
             self._clear_launch_runtime()
 
     def _solve(self) -> None:
+        with MAIN_CONTEXT_LOCK:
+            self._solve_locked()
+
+    def _solve_locked(self) -> None:
         try:
             solver = TwoCopySymbolicHBSolver(
                 self.records,

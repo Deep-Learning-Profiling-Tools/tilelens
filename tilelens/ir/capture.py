@@ -5,6 +5,9 @@ launch: per compiled specialization its declared IR stages and compile
 metadata plus the LaunchBindings seen for it, and every compile failure.
 ``ParseCache`` runs a reader once per distinct text and keeps what it gave,
 a graph or a typed refusal, so a refusal's kind survives cache hits.
+``configs_of`` groups a specialization's bindings by the config kwargs they
+were called with, each config as values a saved trace can hold
+(``saveable_config``).
 
 Mechanism only: which specialization counts, what an absent stage means and
 what a refusal or an error becomes are the client's calls. Neither class
@@ -24,7 +27,13 @@ from importlib import import_module
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
-from .launch import LaunchBinding, bind_launch, config_kwargs
+from .launch import (
+    LaunchBinding,
+    TensorFacts,
+    bind_launch,
+    config_kwargs,
+    tensor_facts,
+)
 
 if TYPE_CHECKING:
     from ..core.client import LaunchCall, LaunchEvent
@@ -139,6 +148,7 @@ class ArtifactLog:
             Hashable, tuple[CompiledArtifacts, list[LaunchBinding]]
         ] = {}
         self._failures: list[CompileFailure] = []
+        self._last: LaunchBinding | None = None
 
     def record(self, event: LaunchEvent) -> LaunchBinding:
         """Record one before_launch event; returns the binding recorded for
@@ -150,7 +160,13 @@ class ArtifactLog:
             self._compiled[event.specialization] = (artifacts, [binding])
         else:
             entry[1].append(binding)
+        self._last = binding
         return binding
+
+    @property
+    def last_binding(self) -> LaunchBinding | None:
+        """The binding the latest ``record`` recorded (None since reset)."""
+        return self._last
 
     def record_failure(self, event: LaunchEvent) -> None:
         self._failures.append(
@@ -278,3 +294,82 @@ class ParseCache:
             outcome = ParseOutcome(refusal=_without_frames(exc, outer))
         self._outcomes[key] = outcome
         return outcome
+
+
+# ─────────────── the configs of a specialization ───────────────
+
+_PLAIN = (str, int, float, bool, type(None))
+
+
+def _tensor_of(value: Any) -> TensorFacts | None:
+    """``value``'s tensor facts, None if it is no (readable) tensor."""
+    if not hasattr(value, "data_ptr"):
+        return None
+    try:
+        return tensor_facts(value)
+    except Exception:
+        return None
+
+
+def saveable_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """The config kwargs, each value a saved trace cannot hold put as text:
+    a tensor (e.g. a heuristic's view) described by its facts, never its
+    data, anything else (e.g. a heuristic's tl.dtype) as its repr."""
+
+    def describe(value: Any) -> Any:
+        if isinstance(value, _PLAIN):
+            return value
+        facts = _tensor_of(value)
+        if facts is None:
+            return repr(value)
+        return (
+            f"<tensor data_ptr={facts.data_ptr:#x} shape={facts.shape} "
+            f"strides={facts.strides} dtype={facts.dtype}>"
+        )
+
+    return {name: describe(value) for name, value in config.items()}
+
+
+def _config_key(config: Mapping[str, Any]) -> Hashable:
+    """What tells two bindings' config kwargs apart: a plain value by type
+    and value, a tuple item by item, a tensor by its data_ptr, shape,
+    strides and dtype (never its data), any other hashable value by type
+    and equality, anything else by identity (the bindings hold the values
+    while the keys are compared)."""
+
+    def key(value: Any) -> Hashable:
+        if isinstance(value, float):
+            return (float, value.hex())  # -0.0 apart from 0.0, NaN equal
+        if isinstance(value, _PLAIN):
+            return (type(value), value)
+        if isinstance(value, tuple):
+            return (type(value), tuple(key(item) for item in value))
+        facts = _tensor_of(value)
+        if facts is not None:
+            return ("tensor", facts.data_ptr, facts.shape, facts.strides, facts.dtype)
+        try:
+            hash(value)
+        except Exception:
+            return ("id", id(value))
+        return (type(value), value)
+
+    return tuple(sorted((name, key(value)) for name, value in config.items()))
+
+
+def configs_of(
+    spec: CompiledSpecialization,
+) -> list[tuple[dict[str, Any], list[LaunchBinding]]]:
+    """``spec``'s bindings grouped by their config kwargs (see _config_key),
+    each group with its saveable config, in the order first seen, so the
+    first group's config is ``spec.config``. Configs that compile to one
+    kernel (e.g. differing only in a runtime int kwarg) share a
+    specialization but not their bindings."""
+    groups: dict[Hashable, tuple[dict[str, Any], list[LaunchBinding]]] = {}
+    for binding in spec.bindings:
+        key = _config_key(binding.config)
+        group = groups.get(key)
+        if group is None:
+            groups[key] = (saveable_config(binding.config), [binding])
+        else:
+            group[1].append(binding)
+    return list(groups.values()) or [(saveable_config(spec.config), [])]

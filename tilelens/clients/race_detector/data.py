@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -7,6 +8,7 @@ from typing import Any, Literal
 import torch
 
 from ...core.data import Op
+from ...ir.verdict import ConfigVerdict, IRVerdict
 
 
 MemorySem = Literal["plain", "relaxed", "acquire", "release", "acq_rel"]
@@ -187,12 +189,82 @@ class RaceRecord:
         object.__setattr__(self, "race_type", RaceType(self.race_type).value)
 
 
+@dataclass(frozen=True)
+class CompiledRaceRecord(RaceRecord):
+    """A race the compiled race detector found in one config of a launch
+    (``config``: its config kwargs, as RaceConfigVerdict.config). An
+    access's ``element`` is counted from the launch tensor's data pointer."""
+
+    config: Mapping[str, Any] = field(default_factory=dict)
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(self, "config", dict(self.config))
+
+
+@dataclass(frozen=True)
+class RaceConfigVerdict(ConfigVerdict):
+    """The compiled race detector's verdict on one config of a launch.
+
+    ``status`` is "ok" (proved race-free), "races", "unsupported" or
+    "vacuous" (no execution satisfies the premises, so no proof is
+    claimed). For "ok", ``rung`` is the proof's: "T0" (any scalar
+    parameters and any grid), "T1" (this launch's parameters, any grid)
+    or "T1-launch" (this launch's parameters and grid). "Any grid" is any
+    extent along the grid axes the kernel reads (a program id or the
+    program count) and this launch's extent along the others (a kernel
+    with atomics: any extent along those too, except at T1 with a launch
+    grid). ``qualifiers`` name what a proof or a race assumes or read:
+    "assumes no i32 overflow" (the widths whose obligations can fail in
+    the proof's domain; they hold at this launch), "assumes termination"
+    (the kernel spins on a flag), "reads tensor contents" (it holds for
+    the launch's pre-launch contents of the tensors it read). ``grid_fragile`` are the races the
+    query found at some other grid behind a "T1-launch" proof, or behind an
+    "unsupported" config whose query at the launch's grid was not decided:
+    evidence only, never races of this launch."""
+
+    rung: str | None = None
+    qualifiers: tuple[str, ...] = ()
+    grid_fragile: tuple[CompiledRaceRecord, ...] = ()
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(self, "qualifiers", tuple(self.qualifiers))
+        object.__setattr__(self, "grid_fragile", tuple(self.grid_fragile))
+
+
+@dataclass(frozen=True)
+class RaceVerdict(IRVerdict):
+    """The compiled race detector's verdict on one traced launch: ``status``
+    "races" if a config races, else "unsupported" if a config was not
+    decided, else "vacuous" if a config's proof would be vacuous, else
+    "ok". For "ok", ``scope`` says what the weakest config's proof holds
+    for ("any-params-any-grid", "this-params-any-grid" or
+    "this-params-this-grid"; "any grid" as RaceConfigVerdict.rung says),
+    and ``qualifiers`` gathers the configs'."""
+
+    qualifiers: tuple[str, ...] = ()
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(self, "qualifiers", tuple(self.qualifiers))
+
+
 __all__ = [
     "AccessEventRecord",
     "AtomicKind",
+    "CompiledRaceRecord",
     "MemorySem",
     "RaceAccess",
+    "RaceConfigVerdict",
     "RaceRecord",
     "RaceReport",
     "RaceType",
+    "RaceVerdict",
 ]

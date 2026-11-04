@@ -282,6 +282,36 @@ def kernel(x_ptr, n, BLOCK: tl.constexpr):
 - Requires Triton 3.8; on another release every launch is `unsupported`
   (`host-compile-unavailable`), nothing compiled, and the program goes on.
 
+### Compiled race detector
+
+`RaceDetector(compile=True)` (or `tile-race --compile my_script.py`) decides
+whether two program instances of a launch can race on global memory, from the
+host-compiled TTIR, like the compiled sanitizer: no GPU is needed, kernels are
+not run, every autotune config is analyzed, and a config that fails to compile
+for the target is `unsupported` (`compile-failed`) while the program goes on.
+
+- Each launch gets a `RaceVerdict` in its records, after a `CompiledRaceRecord`
+  per race (printed too). `ok` is a proof; its `scope` says what it holds for:
+  any scalar arguments and any grid (`any-params-any-grid`), this launch's
+  arguments and any grid, or this launch's arguments and grid. Its
+  `qualifiers` say what it assumes or read: `assumes no i32 overflow` (address
+  or mask arithmetic that could wrap somewhere in that scope, though not at
+  this launch: one that can wrap here is `unsupported`, `integer-overflow`),
+  `assumes termination` (the kernel spins on a flag), `reads tensor contents`
+  (the proof read an index table, so it holds for those contents). "Any grid"
+  is any extent along the grid axes the kernel reads.
+- `unsupported` names what was not modeled (e.g. a `while` loop that is not a
+  spin on a flag, `spin-shape`; a CAS operand the integer model cannot follow,
+  `cas-value`), a Z3 timeout, or races found only under over-approximation
+  (`potential-race`).
+- A loaded integer index is read from the tensor's contents at the launch
+  (integer, contiguous, at most 16384 elements); since kernels are not run, a
+  later launch sees the contents the script left, not an earlier kernel's
+  outputs (nor what an autotune `pre_hook` would have written).
+- Races are always printed; the parts of a launch that were not decided, and
+  a race-free launch's scope, are printed under `TILELENS_VERBOSE` or
+  `tile-race`.
+
 ### Save and load traces
 
 ```py
