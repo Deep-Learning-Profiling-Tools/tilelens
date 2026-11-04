@@ -57,8 +57,10 @@ SanitizerT = TypeVar("SanitizerT", bound="Sanitizer")
 
 class Sanitizer(Client):
     """
-    Factory class that returns the concrete sanitizer implementation
-    based on the value of ``cfg.enable_sanitizer``.
+    Factory class that returns the concrete sanitizer implementation:
+    ``Sanitizer()`` the eager one, ``Sanitizer(compile=True)`` the compiled
+    one (``CompiledSanitizer``, a virtual subclass); both are the
+    ``NullSanitizer`` while ``cfg.enable_sanitizer`` is off.
     """
 
     NAME = "sanitizer"
@@ -67,13 +69,23 @@ class Sanitizer(Client):
 
     def __new__(cls: type[SanitizerT], *args: Any, **kwargs: Any) -> SanitizerT:
         if cls is Sanitizer:
+            # The disable flag wins over the mode: trace() leaves a kernel
+            # traced with a NullSanitizer untraced, compile=True or not.
+            if kwargs.pop("compile", False) and cfg.enable_sanitizer:
+                from .compiled.client import CompiledSanitizer
+
+                # Only a virtual Sanitizer subclass, so Python does not call
+                # its __init__ after __new__: call it here, without ``compile``.
+                compiled = object.__new__(CompiledSanitizer)
+                CompiledSanitizer.__init__(compiled, *args, **kwargs)
+                return cast(SanitizerT, compiled)
             target_cls = cast(
                 type["Sanitizer"],
                 SymbolicSanitizer if cfg.enable_sanitizer else NullSanitizer,
             )
-            obj = object.__new__(target_cls)
-            cast(Any, target_cls).__init__(obj, *args, **kwargs)
-            return cast(SanitizerT, obj)
+            # A Sanitizer subclass: Python calls its __init__ once this
+            # returns, with the call's own arguments, ``compile`` included.
+            return cast(SanitizerT, object.__new__(target_cls))
         return cast(SanitizerT, object.__new__(cls))
 
     def __init__(self, abort_on_error: bool = True, *args, **kwargs):
@@ -154,7 +166,14 @@ _fn_symbolic_cache_set: set[_FnSymbolicCache] = set()
 
 
 class SymbolicSanitizer(Sanitizer, SymbolicClient):
-    def __init__(self, abort_on_error: bool = True):
+    # ``compile`` is the factory's mode switch: Sanitizer(compile=False)
+    # reaches this __init__ with it.
+    def __init__(self, abort_on_error: bool = True, *, compile: bool = False):
+        if compile:
+            raise TypeError(
+                "SymbolicSanitizer is the eager sanitizer; the compiled one is "
+                "Sanitizer(compile=True)"
+            )
         super().__init__(abort_on_error=abort_on_error)
         self.records: list[OutOfBoundsRecordZ3] = []
         self.cache_args: list[Any] = []

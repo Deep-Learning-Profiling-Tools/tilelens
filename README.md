@@ -124,6 +124,8 @@ uv sync --extra test # tests but no NKI support
 * To run core TileLens tests, run `pytest tests/`.
 * (if NKI installed) To run NKI-specific tests, run `pytest tests/ -m nki`.
 * To run all tests (Triton + NKI), run `pytest tests/ -m ""`.
+* The IR-mode tests (the compiled sanitizer, below, and its IR layer) need
+  Triton 3.8, the one release IR mode runs on; on another release they fail.
 * To run visualizer web UI tests, run `npm run test:frontend`.
 
 ## Working with Examples
@@ -190,6 +192,95 @@ Analyze kernels across visualization, profiling, and sanitization with a single 
 - Visualizer: currently supports load, store, and matmul operations for 1/2/3D tensors (more operations and dimensions coming soon).
 - Profiler: flags non-unrolled loops, inefficient mask usage, and missing buffer_load optimizations while tracking load/store byte counts with low-overhead sampling.
 - Sanitizer: symbolically checks tensor memory accesses for out-of-bounds errors and emits reports with tensor metadata, call stack, and expression trees; optional fake-memory storage avoids real reads.
+
+### Compiled sanitizer
+
+`Sanitizer(compile=True)` checks each launch against the kernel Triton compiles
+for it (its TTIR) instead of interpreting it: out-of-bounds accesses (against the
+tensor's view, strides included), integer-width overflows in address, mask and
+branch arithmetic, and divisions by zero, each with a witness (program ids, lanes,
+loop iteration). The kernel is compiled on the host, exactly as the JIT would
+compile the launch but only through the TTIR stage, so **no GPU is needed**: CPU
+tensors work, and so does a machine without a driver. From the CLI, give the
+flag before the script name (the legacy `triton-sanitizer` alias takes it too):
+
+```sh
+tile-sanitizer --compile my_script.py --my-script-flag
+```
+
+```py
+from tilelens.clients import Sanitizer
+
+
+@tilelens.trace(Sanitizer(compile=True))
+@triton.jit
+def kernel(x_ptr, n, BLOCK: tl.constexpr):
+    ...
+```
+
+- Kernels are compiled and checked, **not run**: their outputs are never written,
+  so a script that checks its own results fails under `--compile`, and a launch
+  whose arguments the script computes from an earlier kernel's output is checked
+  with those unwritten values.
+- Kernels are compiled for a fixed target, `cuda:89` (sm89, e.g. RTX 4090) by
+  default, so a verdict does not depend on the machine it was computed on.
+  Choose another with `Sanitizer(compile=True, target="cuda:90")` (or
+  `"hip:gfx942"`, or a Triton `GPUTarget`), or for every client that names none
+  with the environment variable `TILELENS_IR_TARGET=cuda:90` (e.g. for
+  `tile-sanitizer --compile`). The kernel's
+  own target queries (`tl.target_info.is_cuda()`, `cuda_capability_geq()`,
+  `is_hip()`) answer for that target too, and `TRITON_OVERRIDE_ARCH` does not
+  apply: the target is the one named. The TTIR can differ between targets (e.g.
+  tensor descriptors, target-dependent branches), and a verdict holds for the
+  target it was checked for.
+- Targets also differ in what compiles at all: `fp8e4nv` (`torch.float8_e4m3fn`,
+  `tl.float8e4nv`) needs `cuda:89` or later, `num_ctas > 1` and 16-bit tensor
+  descriptor atomic min/max need `cuda:90`. A kernel or autotune config that fails
+  to compile for the target never stops the script (it was not going to run
+  anyway): it is reported `unsupported`, kind `compile-failed`, naming the target
+  and how to choose another, since it may run on a GPU of another kind unchecked.
+  Name a target it compiles for to check it. Only a failure no target compiles
+  past (a failing `tl.static_assert`, or a Python construct Triton never compiles,
+  unless the kernel asked Triton's driver anything first, e.g. through
+  `tl.target_info` or a device query it catches, or an earlier compile of the
+  kernel for the target did) is just a note in the verdict: that config never
+  launches (the autotuner skips it too). A target answer the kernel's own code
+  keeps from outside the check (another trace or target, the untraced program)
+  and never asks for again cannot be seen. A launch none of whose configs
+  compiled is `unsupported` (`compile-failed`), and its notes are printed with
+  it. Each report names where the kernel failed (`file:line`) and the innermost
+  error in one line.
+- A call that does not match the kernel's signature (a missing, extra or
+  misnamed argument), or that Triton cannot key (e.g. an unhashable constexpr
+  value), is a bug in the call, not a compile failure: it raises the very
+  `TypeError` the untraced call raises, on any GPU, and the script stops there
+  (under `tile-sanitizer --compile` with a traceback and exit status 1). So does
+  a trace that also interprets the kernel (e.g. with the `Tracer`), before the
+  interpreter runs, which would fail on the call too. An autotuned call that
+  passes an autotuned meta-parameter itself raises the autotuner's own
+  `Conflicting meta-parameters` `ValueError`. A keyword that names no parameter
+  is a compile option, which the target may not know (e.g. `waves_per_eu`, a
+  HIP option, under a CUDA target): that is the target's `compile-failed`, and
+  the report names the keyword (misspelled, it fails on every GPU untraced too).
+  All of this holds on Triton 3.8 (below): on another release nothing is
+  compiled, so nothing binds the call, and the launch is `unsupported`
+  (`host-compile-unavailable`), a call that does not bind included (a trace
+  that also interprets the kernel raises the interpreter's own error for it).
+- Each launch gets an `IRVerdict` in its records: `ok` is a proof for that
+  launch's scalar arguments, grid and tensors (`scope="launch"`); `violations`
+  comes with the findings; `unsupported` names what was not checked (e.g. a
+  data-dependent address, a construct the TTIR reader does not model, a Z3
+  query that timed out, which can depend on the machine's load, a config that
+  failed to compile for the target, `compile-failed`, or a compile the host
+  cannot run, `host-compile-unavailable`, e.g. under `TRITON_KERNEL_OVERRIDE`,
+  `USE_IR_LOC` or a custom pipeline, which change the TTIR through stages the
+  host compile does not run). An autotuned
+  launch checks every config, each with its own arguments and grid and with a
+  `ConfigVerdict` of its own, also when several configs compile to one kernel.
+- With the default `abort_on_error=True` the findings are printed and the
+  process exits with status 1; `ENABLE_SANITIZER=0` leaves kernels untraced.
+- Requires Triton 3.8; on another release every launch is `unsupported`
+  (`host-compile-unavailable`), nothing compiled, and the program goes on.
 
 ### Save and load traces
 

@@ -1,5 +1,7 @@
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from unittest.mock import MagicMock, patch
@@ -7,14 +9,19 @@ from unittest.mock import MagicMock, patch
 import tilelens
 from tilelens.core.config import config as cfg
 from tilelens.core.trace import TraceInterface
+from tilelens.clients.sanitizer.compiled import CompiledSanitizer
 from tilelens.wrapper import (
+    COMPILE_NOTE,
     create_patched_jit,
     create_patched_autotune,
     sanitizer_wrapper,
+    compiled_sanitizer_wrapper,
     profiler_wrapper,
     apply_sanitizer,
     apply_profiler,
 )
+
+REPO = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
@@ -58,6 +65,24 @@ def test_sanitizer_wrapper_accepts_frontend():
         assert mock_trace.call_args.kwargs["frontend"] == "gluon"
         mock_decorator.assert_called_once_with(mock_kernel)
         assert result == "wrapped_kernel"
+
+
+def test_compiled_sanitizer_wrapper_traces_with_the_compiled_sanitizer(monkeypatch):
+    monkeypatch.setattr(cfg, "enable_sanitizer", True)
+    mock_kernel = MagicMock()
+    mock_kernel.__name__ = "test_kernel"
+
+    with patch("tilelens.wrapper.tilelens.trace") as mock_trace:
+        mock_decorator = MagicMock(return_value="wrapped_kernel")
+        mock_trace.return_value = mock_decorator
+
+        result = compiled_sanitizer_wrapper(mock_kernel, frontend="gluon")
+
+    client = mock_trace.call_args.kwargs["client"]
+    assert isinstance(client, CompiledSanitizer) and client.abort_on_error
+    assert mock_trace.call_args.kwargs["frontend"] == "gluon"
+    mock_decorator.assert_called_once_with(mock_kernel)
+    assert result == "wrapped_kernel"
 
 
 def test_profiler_wrapper_applies_trace():
@@ -256,3 +281,60 @@ def test_wrapper_imports_without_pytest():
     code = "import sys; sys.modules['pytest'] = None; import tilelens.wrapper"
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
+
+
+# ======== tile-sanitizer --compile ===========
+
+_CLIENTS_SCRIPT = """\
+import sys
+import triton
+
+
+@triton.jit
+def kernel(x_ptr):
+    pass
+
+
+print(sorted(kernel.client_manager.clients), sys.argv[1:])
+"""
+
+
+def _run_cli(argv):
+    """Run apply_sanitizer in a subprocess (it patches triton.jit for good)
+    as the command ``argv[0]`` with ``argv[1:]``."""
+    code = (
+        f"import sys; sys.argv = {argv!r}; "
+        "from tilelens.wrapper import apply_sanitizer; apply_sanitizer()"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "TRITON_INTERPRET"}
+    return subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, cwd=REPO, env=env
+    )
+
+
+@pytest.mark.parametrize(
+    "command, before, after, clients",
+    [
+        ("tile-sanitizer", ["--compile"], [], ["compiled_sanitizer"]),
+        ("triton-sanitizer", ["--compile"], ["--compile"], ["compiled_sanitizer"]),
+        # After the script name the flag is the script's own argument.
+        ("tile-sanitizer", [], ["--compile"], ["sanitizer"]),
+    ],
+)
+def test_the_compile_flag_before_the_script_selects_the_compiled_sanitizer(
+    tmp_path, command, before, after, clients
+):
+    script = tmp_path / "script.py"
+    script.write_text(_CLIENTS_SCRIPT)
+    proc = _run_cli([command, *before, str(script), *after])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == f"{clients} {after}"
+    # Under the flag the user is told, once, that kernels do not run.
+    assert proc.stderr.count(COMPILE_NOTE) == (1 if before else 0)
+
+
+def test_the_compile_flag_without_a_script_prints_the_usage():
+    proc = _run_cli(["tile-sanitizer", "--compile"])
+    assert proc.returncode == 1
+    assert "Usage: tile-sanitizer [--compile] <script.py> [args...]" in proc.stdout
+    assert "kernels are not run" in proc.stdout

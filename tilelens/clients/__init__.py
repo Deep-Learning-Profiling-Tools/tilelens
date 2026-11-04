@@ -10,7 +10,15 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "OpTypeCounts": ("tilelens.clients.profiler.data", "OpTypeCounts"),
     "RaceDetector": ("tilelens.clients.race_detector.race_detector", "RaceDetector"),
     "Sanitizer": ("tilelens.clients.sanitizer.sanitizer", "Sanitizer"),
+    "CompiledSanitizer": (
+        "tilelens.clients.sanitizer.compiled.client",
+        "CompiledSanitizer",
+    ),
     "OutOfBoundsRecord": ("tilelens.clients.sanitizer.data", "OutOfBoundsRecord"),
+    "CompiledSanitizerRecord": (
+        "tilelens.clients.sanitizer.data",
+        "CompiledSanitizerRecord",
+    ),
     "SymbolicExpr": ("tilelens.clients.symbolic_engine", "SymbolicExpr"),
     "SymbolicClient": ("tilelens.clients.symbolic_engine", "SymbolicClient"),
     "RangeWrapper": ("tilelens.clients.symbolic_engine", "RangeWrapper"),
