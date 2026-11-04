@@ -6,18 +6,34 @@ renaming PIDs, ``tl.arange`` lane vars, and per-record copy-local vars such as
 the CAS return), then asks Z3 whether any pair of cross-copy events is
 unordered, in conflict, and aliasing.
 
-Model boundary (closed-world atomic source assumption):
-  When an initial scalar source is identifiable AND no unmodeled write (plain
-  store or atomic RMW) can overlap the location, source choices are closed
-  over: (initial source) + (modeled CAS writers in the two selected copies).
-  Otherwise ``rf_unknown_R`` is introduced but does NOT enable a
-  synchronizes-with edge — an overlapping plain-store/RMW can publish a value
-  outside the closed world (e.g. a flag set via ``tl.atomic_xchg``), so the
-  reader's old value must not be over-constrained or every conflict gated on
-  it silently disappears. Synchronization through a third program instance is
-  not modeled. The guarded acquire/release CAS no-race result depends on the
-  closed world, which holds whenever the flag is only ever written by modeled
-  CAS.
+Model boundary (atomic read-from sources):
+  A value-modeled atomic reader takes its value from the initial contents
+  (when identifiable), from a value-modeled atomic writer event of the two
+  copies, or from the open world: any thread of the grid (another lane of
+  either modeled instance, or a third instance) running a CAS or a
+  value-modeled xchg / max / min, lowered under fresh pid, lane and
+  copy-local variables. Within one copy the events of one arange variable
+  are on one lane, so without the open world a write by another lane of the
+  same instance, or by a third instance, could never be the source. An
+  open-world writer synchronizes only with what its own instance orders
+  before it (a fence, or a dependency at its position); synchronization
+  that reaches it through a third instance is not modeled (over-reported).
+  When no initial source is identifiable, or an unmodeled write (plain
+  store, wrap-capable or unmodeled atomic RMW) can overlap the location,
+  ``rf_unknown_R`` admits any value but does NOT enable a synchronizes-with
+  edge, so the reader's old value is never over-constrained. Identity
+  writes and counted records need no open-world source (see
+  ``_open_world_writer_records``). The closed world remains only for the
+  compiled frontends' pre-exit and await-gated records.
+
+  Thread identity: within one copy, two records' events run on one thread
+  only at a known same position of two blocks of one shape
+  (``_same_thread``). A record whose lane variables do not name its lanes
+  (no ``lane_position``: a block on one address, a broadcast, transposed or
+  reshaped pointer) is never identified with one thread by its variables:
+  it has distinct lanes at any assignment, its two copies in one instance
+  may or may not be one operation, it gets no open-world exclusion, and
+  coherence and rf candidacy give it no program order.
 
 Address-domain invariant:
   ``record.addr_expr`` consumed by this solver MUST be a byte address matching
@@ -34,13 +50,15 @@ Intra-instance duplicate lanes:
   Cross-copy queries assert ``different_blocks``, so they can never witness
   two lanes of one store colliding inside a single program instance — and a
   grid=(1,1,1) launch makes ``different_blocks`` UNSAT outright. A separate
-  same-instance query pins ``pid_a == pid_b`` and every launch-level
-  copy-local var equal, leaving the arange lane vars as the only
-  alpha-difference between the copies; requiring a lane-identity difference
-  then asks whether two DISTINCT lanes of the same dynamic access conflict.
-  Distinct operations of one instance are concurrently in flight unless the
-  caller's ``fence_between`` hook or a dependency orders them, so unordered
-  pairs of distinct operations enter the same query.
+  same-instance query pins ``pid_a == pid_b``; loop iterators stay free, and
+  an atomic's observation is shared only at one lane of its record.
+  Requiring a lane-identity difference then asks whether two DISTINCT lanes
+  of the same access conflict, in any two iterations. Distinct operations
+  of one instance are concurrently in flight unless the caller's
+  ``fence_between`` hook or a dependency (at one position and iteration)
+  orders them, so unordered pairs of distinct operations enter the same
+  query, also across iterations. The caller's ``fence_epoch`` hook keeps
+  only the executions no fence separates.
 
 Z3 ``unknown`` policy:
   Every query runs on its own Solver with a per-Solver timeout
@@ -48,7 +66,7 @@ Z3 ``unknown`` policy:
   timeout included) is never treated as unsat. A race query that comes back
   undecided raises :class:`UnsupportedSymbolicRaceQuery` (the launch reports
   ``unsupported`` instead of a silent clean verdict), and an undecided
-  overlap in the closed-world escape check opens the ``rf_unknown`` escape.
+  overlap in the unmodeled-writer check opens the ``rf_unknown`` escape.
 
 RMW value modeling:
   An integer AtomicRMW with a modeled op (``add``/``max``/``min``/``xchg``)
@@ -88,9 +106,14 @@ Limitations (current):
     non-contiguous tensors fall through to ``rf_unknown_R``, which
     deliberately does NOT enable synchronizes-with; guarded acq/rel CAS over
     them is reported as races conservatively.
-  - **Two program instances only** — synchronization that travels through a
-    third block (writer-via-third-block CAS chains) is not modeled directly;
+  - **Two program instances, plus open-world writers** — a third block is
+    an rf source, but synchronization that travels through it
+    (writer-via-third-block CAS chains, a lock passed on) is not modeled;
     the counting axiom is the one guarded exception.
+  - **One symbolic lane for a record whose lanes are not named** (``z +
+    tl.zeros([B])``, a broadcast or transposed pointer): its lanes are
+    taken to be distinct and unordered, which over-reports (two columns of
+    one broadcast row writing one value, say).
   - **Float-typed RMW returns and bitwise/unsigned RMW ops are not value-
     modeled** (``fadd``, float max, ``and``/``or``/``xor``, ``umax``/
     ``umin``): they get no modeled write part, so the record's write stays
@@ -373,9 +396,16 @@ class TwoCopySymbolicHBSolver:
         launch_ceiling: bool = False,
         fence_between: Callable[[AccessEventRecord, AccessEventRecord], bool]
         | None = None,
+        fence_epoch: Callable[[AccessEventRecord], Any] | None = None,
         timeout_ms: int | None = None,
     ) -> None:
         self.records = list(records)
+        # ``fence_epoch(record)``: the number of fences one instance has
+        # executed before an execution of ``record``, an int or a term over
+        # the record's loop iterators. Two executions of one instance with
+        # equal epochs have no fence between them; with different epochs a
+        # fence orders them. None: no epoch constraint.
+        self.fence_epoch = fence_epoch
         # Fence-ordered intra-instance semantics: program order between two
         # records of one instance is a happens-before edge only when a
         # fence orders them, and same-instance pairs of distinct operations
@@ -481,6 +511,24 @@ class TwoCopySymbolicHBSolver:
 
         # 6. Lower every record under both contexts.
         self.events: list[SymbolicMemoryEvent] = self._lower_two_copies()
+        self._event_of: dict[tuple[int, str, int], SymbolicMemoryEvent] = {
+            (id(e.record), e.copy, e.lane): e for e in self.events
+        }
+        # Observation vars (CAS / RMW returns) among the copy-local vars; the
+        # other copy-local vars are loop iterators.
+        copy_local_keys = {
+            _z3_var_key(orig) for orig, _ in self.ctx_a.copy_local_substitutions
+        }
+        self._observation_keys: set[tuple[int, str, str]] = set()
+        for record in self.records:
+            self._observation_keys |= (
+                _collect_z3_var_keys((record.old_value,)) & copy_local_keys
+            )
+        self._record_by_id = {record.event_id: record for record in self.records}
+        self._record_cache: dict[tuple[str, int], Any] = {}
+        self._anchor_pin_cache: dict[int, tuple[BoolRef, ...]] = {}
+        self._same_thread_cache: dict[tuple[int, int], BoolRef | None] = {}
+        self._epoch_cache: dict[int, tuple[Any, Any]] = {}
 
         # 7. Atomic-order vars, counting axioms, RF source booleans, and the
         # reads-through relation, BEFORE building the HB closure (HB reads
@@ -493,12 +541,27 @@ class TwoCopySymbolicHBSolver:
         self.rf_init_source: dict[int, BoolRef] = {}
         self.rf_unknown_source: dict[int, BoolRef] = {}
         self.rf_chain_source: dict[int, BoolRef] = {}
+        # Open-world rf choices: (selector, reader, writer record, the
+        # writer's event in a fresh context, that context, the condition
+        # the selector implies).
+        self.rf_open_world: list[
+            tuple[
+                BoolRef,
+                SymbolicMemoryEvent,
+                AccessEventRecord,
+                SymbolicMemoryEvent,
+                CopyContext,
+                BoolRef,
+            ]
+        ] = []
+        self._open_world_edges: dict[tuple[int, int], list[BoolRef]] = {}
         self.rf_constraints: list[BoolRef] = []
         self.atomic_coherence_constraints: list[BoolRef] = []
         self.counting_constraints: list[BoolRef] = []
         self._counting_grid_restricted: set[int] = set()
         self._counting: dict[int, _CountingInfo] = self._build_counting_axioms()
         self._build_read_from_choices()
+        self._build_open_world_edges()
         self._build_atomic_coherence_constraints()
         # wf-vc (value causality / no out-of-thin-air): its own family —
         # coherence is per-location order, value causality is a
@@ -955,8 +1018,8 @@ class TwoCopySymbolicHBSolver:
         conflict = self._conflict(a, b)
         if same_instance:
             assert lane_cond is not None
-            # In one instance, pids and copy-local observations/iterations
-            # agree. Lane variables MUST remain independent.
+            # In one instance, pids agree. Lane variables, iterators and
+            # observations MUST remain independent.
             if common.intra_expression is None:
                 common.intra_expression = apply_sub(common.expression, common.shared)
             conditions = [
@@ -1011,17 +1074,14 @@ class TwoCopySymbolicHBSolver:
         ):
             return cached
         self._conflict_common_cache = None
-        shared = tuple(zip(self.ctx_b.pid, self.ctx_a.pid)) + tuple(
-            (bvar, avar)
-            for (_, avar), (_, bvar) in zip(
-                self.ctx_a.copy_local_substitutions,
-                self.ctx_b.copy_local_substitutions,
-            )
-        )
+        # One instance shares its pids only: its two lane roles may be at
+        # different loop iterations and see different atomic results.
+        shared = tuple(zip(self.ctx_b.pid, self.ctx_a.pid))
         correspondence = shared + tuple(
             (bvar, avar)
             for (_, avar), (_, bvar) in zip(
-                self.ctx_a.arange_substitutions, self.ctx_b.arange_substitutions
+                self.ctx_a.copy_local_substitutions + self.ctx_a.arange_substitutions,
+                self.ctx_b.copy_local_substitutions + self.ctx_b.arange_substitutions,
             )
         )
         expression = And(
@@ -1042,6 +1102,10 @@ class TwoCopySymbolicHBSolver:
         when the pair cannot race within one instance (fence-ordered,
         serialized, never writes, or the symmetric duplicate of an
         already-queried pair).
+
+        The two copies of one instance may be at different iterations of
+        a loop, so the condition also requires equal fence epochs: no fence
+        executed between the two executions.
         """
         if a.record is b.record:
             # Lanes of one atomic op serialize against each other; a
@@ -1051,8 +1115,10 @@ class TwoCopySymbolicHBSolver:
             if a.lane > b.lane:
                 return None  # symmetric duplicate
             if a.lane < b.lane:
-                return BoolVal(True)  # explicitly distinct lanes
-            return self._lane_identity_differs(a)
+                return self._with_epochs(a, b, BoolVal(True))  # distinct lanes
+            # One lane rewriting at another iteration is program order.
+            differ = self._lane_identity_differs(a)
+            return None if differ is None else self._with_epochs(a, b, differ)
         # Distinct ops of one instance are concurrently in flight unless
         # fence_between or a dependency orders them.
         if a.event_id > b.event_id:
@@ -1073,14 +1139,81 @@ class TwoCopySymbolicHBSolver:
                 b.event_id,
                 a.event_id,
             ) in self.dep_pairs:
-                # Dependency order: the same position is ordered by
-                # causality, so only DISTINCT positions can race.
-                return self._lanes_differ(a, b)
+                # Dependency order: the same position IN ONE ITERATION is
+                # ordered by causality, so only distinct positions or
+                # distinct iterations can race.
+                parts = [self._lanes_differ(a, b)]
+                shared = {
+                    _z3_var_key(orig) for orig, _, _ in self._record_iterators(a.record)
+                }
+                parts += [
+                    var_a != var_b
+                    for orig, var_a, var_b in self._record_iterators(b.record)
+                    if _z3_var_key(orig) in shared
+                ]
+                parts = [p for p in parts if p is not None]
+                if not parts:
+                    return None
+                return self._with_epochs(
+                    a, b, parts[0] if len(parts) == 1 else Or(*parts)
+                )
             # Fence-ordered semantics: two distinct operations of one
             # instance with no fence between them are concurrently in
             # flight, so the pair is queried like any conflicting pair.
-            return BoolVal(True)
-        return BoolVal(True)
+        return self._with_epochs(a, b, BoolVal(True))
+
+    def _with_epochs(
+        self, a: SymbolicMemoryEvent, b: SymbolicMemoryEvent, cond: BoolRef
+    ) -> BoolRef | None:
+        """``cond`` restricted to executions of one instance that no fence
+        separates (equal fence epochs), or ``None`` when every pair of
+        executions is separated."""
+        if self.fence_epoch is None:
+            return cond
+        epoch_a = self._epoch(a.record)[0]
+        epoch_b = self._epoch(b.record)[1]
+        if isinstance(epoch_a, int) and isinstance(epoch_b, int):
+            return cond if epoch_a == epoch_b else None
+        same = epoch_a == epoch_b
+        return same if is_true(cond) else And(cond, same)
+
+    def _epoch(self, record: AccessEventRecord) -> tuple[Any, Any]:
+        """The record's fence epoch in copy a and in copy b (an int in
+        both when it is constant). An epoch the caller leaves unknown,
+        ``fence_epoch_unknown_*``, is no copy-local variable, so it is the
+        same in both copies: harmless, it constrains nothing."""
+        cached = self._epoch_cache.get(id(record))
+        if cached is None:
+            assert self.fence_epoch is not None
+            epoch = self.fence_epoch(record)
+            if isinstance(epoch, int):
+                cached = (epoch, epoch)
+            else:
+                cached = (
+                    apply_sub(epoch, self.ctx_a.copy_local_substitutions),
+                    apply_sub(epoch, self.ctx_b.copy_local_substitutions),
+                )
+            self._epoch_cache[id(record)] = cached
+        return cached
+
+    @staticmethod
+    def _positions_equal(
+        rec1: AccessEventRecord,
+        sub1: tuple[tuple[Any, Any], ...],
+        rec2: AccessEventRecord,
+        sub2: tuple[tuple[Any, Any], ...],
+    ) -> BoolRef | None:
+        """A lane of ``rec1`` (lane variables renamed by ``sub1``) and one
+        of ``rec2`` (by ``sub2``) are at the same block position, compared
+        dimension by dimension; ``None`` unless both records carry a
+        ``lane_position`` of one rank. The single position comparison of
+        the solver: one copy (dependency edge), two copies (distinct
+        positions), or a fresh context (open-world sources)."""
+        pos1, pos2 = rec1.lane_position, rec2.lane_position
+        if not (pos1 and pos2 and len(pos1) == len(pos2)):
+            return None
+        dims = [apply_sub(p, sub1) == apply_sub(q, sub2) for p, q in zip(pos1, pos2)]
+        return dims[0] if len(dims) == 1 else And(*dims)
 
     def _lanes_differ(
         self, a: SymbolicMemoryEvent, b: SymbolicMemoryEvent
@@ -1095,14 +1228,14 @@ class TwoCopySymbolicHBSolver:
         may index its block with its own aranges (every block-pointer
         access does), and then some variable always differs, whatever the
         two lanes' positions."""
-        pos_a, pos_b = a.record.lane_position, b.record.lane_position
-        if pos_a and pos_b and len(pos_a) == len(pos_b):
-            sub_a = self.ctx_a.arange_substitutions
-            sub_b = self.ctx_b.arange_substitutions
-            dims = [
-                apply_sub(p, sub_a) != apply_sub(q, sub_b) for p, q in zip(pos_a, pos_b)
-            ]
-            return dims[0] if len(dims) == 1 else Or(*dims)
+        same = self._positions_equal(
+            a.record,
+            self.ctx_a.arange_substitutions,
+            b.record,
+            self.ctx_b.arange_substitutions,
+        )
+        if same is not None:
+            return Not(same)
         occurring = _collect_z3_var_keys((a.addr, a.active, b.addr, b.active))
         diffs = [
             var_a != var_b
@@ -1124,8 +1257,13 @@ class TwoCopySymbolicHBSolver:
         of the record's arange vars differing across the copies witnesses
         two distinct lanes. Vars in the activity condition count too: a
         store whose address ignores the lane still has its lanes
-        distinguished by the mask.
+        distinguished by the mask. A record whose lane variables do not
+        name its lanes (_lanes_not_named) has distinct lanes at any
+        assignment: the B lanes of ``z + tl.zeros([B])``, or the columns of
+        a broadcast row pointer that share its row variable.
         """
+        if self._lanes_not_named(e.record):
+            return BoolVal(True)
         occurring = _collect_z3_var_keys((e.addr, e.active, e.writes))
         diffs = [
             var_a != var_b
@@ -1141,18 +1279,118 @@ class TwoCopySymbolicHBSolver:
     def _same_instance_constraints(self) -> tuple[BoolRef, ...]:
         """Pin the b copy onto the a copy's program instance.
 
-        ``pid_a == pid_b`` makes the two copies the same block. Copy-local
-        vars (loop iterators, CAS returns) are pinned equal because within
-        one instance the two lane roles share each dynamic op's iteration
-        and return value — leaving them free would let an ordered
-        cross-iteration pair masquerade as an intra-instance lane conflict.
+        ``pid_a == pid_b`` makes the two copies the same block. Loop
+        iterators stay free: the two lane roles may be at different
+        iterations, and the pair's fence epochs and dependency condition
+        decide which iteration pairs race. An atomic's observation is one
+        dynamic operation's result only at one lane and iteration of its
+        record, so it is shared exactly there.
         """
         cons: list[BoolRef] = [self.ctx_a.pid[i] == self.ctx_b.pid[i] for i in range(3)]
-        for (_, var_a), (_, var_b) in zip(
-            self.ctx_a.copy_local_substitutions, self.ctx_b.copy_local_substitutions
-        ):
-            cons.append(var_a == var_b)
+        renamed = {
+            _z3_var_key(orig): (var_a, var_b)
+            for (orig, var_a), (_, var_b) in zip(
+                self.ctx_a.copy_local_substitutions, self.ctx_b.copy_local_substitutions
+            )
+        }
+        seen: set[tuple[int, str, str]] = set()
+        for record in self.records:
+            keys = _collect_z3_var_keys((record.old_value,)) & self._observation_keys
+            keys -= seen
+            if not keys:
+                continue
+            seen |= keys
+            same_op = self._same_op_condition(record)
+            for key in sorted(keys):
+                var_a, var_b = renamed[key]
+                cons.append(
+                    var_a == var_b
+                    if is_true(same_op)
+                    else Implies(same_op, var_a == var_b)
+                )
         return tuple(cons)
+
+    def _record_lane_vars(self, record: AccessEventRecord) -> tuple[Any, ...]:
+        """The original arange variables a record's fields use: together
+        with the pid, they name one lane of the record."""
+        key = ("lane_vars", id(record))
+        cached = self._record_cache.get(key)
+        if cached is None:
+            occurring = _collect_z3_var_keys(
+                (
+                    record.addr_expr,
+                    record.active,
+                    record.reads,
+                    record.writes,
+                    record.local_constraints,
+                    record.old_value,
+                    record.rmw_operand,
+                    record.cas_cmp_value,
+                    record.cas_new_value,
+                    record.lane_position,
+                )
+            )
+            cached = self._record_cache[key] = tuple(
+                orig
+                for orig, _ in self.ctx_a.arange_substitutions
+                if _z3_var_key(orig) in occurring
+            )
+        return cached
+
+    def _record_iterators(
+        self, record: AccessEventRecord
+    ) -> list[tuple[Any, Any, Any]]:
+        """(original, copy-a, copy-b) of the record's loop iterators."""
+        mine = {_z3_var_key(v) for v in record.copy_local_vars}
+        return [
+            (orig, var_a, var_b)
+            for (orig, var_a), (_, var_b) in zip(
+                self.ctx_a.copy_local_substitutions, self.ctx_b.copy_local_substitutions
+            )
+            if _z3_var_key(orig) in mine
+            and _z3_var_key(orig) not in self._observation_keys
+        ]
+
+    def _lane_equal(
+        self,
+        record: AccessEventRecord,
+        sub_x: tuple[tuple[Any, Any], ...],
+        sub_y: tuple[tuple[Any, Any], ...],
+    ) -> BoolRef:
+        """Two renamings of ``record`` are at the same lane."""
+        eqs = [
+            apply_sub(v, sub_x) == apply_sub(v, sub_y)
+            for v in self._record_lane_vars(record)
+        ]
+        if not eqs:
+            return BoolVal(True)
+        return eqs[0] if len(eqs) == 1 else And(*eqs)
+
+    def _same_op_condition(self, record: AccessEventRecord) -> BoolRef:
+        """Within one instance, the copy-a and copy-b events of one record
+        lane are one dynamic operation exactly when they are at the same
+        lane and the same loop iteration. Equal lane variables name one
+        lane only when they name the record's lanes; otherwise
+        (_lanes_not_named) a free choice keeps both worlds: one operation,
+        or two lanes at equal variables."""
+        key = ("same_op", id(record))
+        cached = self._record_cache.get(key)
+        if cached is None:
+            lane = self._lane_equal(
+                record, self.ctx_a.arange_substitutions, self.ctx_b.arange_substitutions
+            )
+            eqs = [] if is_true(lane) else [lane]
+            eqs += [
+                var_a == var_b for _, var_a, var_b in self._record_iterators(record)
+            ]
+            if self._lanes_not_named(record):
+                eqs.append(Bool(f"same_op_choice_{record.event_id}"))
+            if not eqs:
+                cached = BoolVal(True)
+            else:
+                cached = eqs[0] if len(eqs) == 1 else And(*eqs)
+            self._record_cache[key] = cached
+        return cached
 
     # ──────────────────────── Construction ────────────────────────
 
@@ -1196,6 +1434,7 @@ class TwoCopySymbolicHBSolver:
         return grid_constraints, different_blocks
 
     def _make_arange_subs_and_constraints(self):
+        self._arange_ranges: dict[tuple[int, str, str], tuple[Any, Any]] = {}
         sub_a, sub_b = [], []
         cons_a, cons_b = [], []
         for key, value in self.arange_dict.items():
@@ -1212,6 +1451,7 @@ class TwoCopySymbolicHBSolver:
                 continue
             var_a = Int(f"{base_name}__a")
             var_b = Int(f"{base_name}__b")
+            self._arange_ranges[_z3_var_key(orig_var)] = (start, end)
             sub_a.append((orig_var, var_a))
             sub_b.append((orig_var, var_b))
             cons_a.append(And(var_a >= start, var_a < end))
@@ -1252,6 +1492,8 @@ class TwoCopySymbolicHBSolver:
         record: AccessEventRecord,
         ctx: CopyContext,
         start_idx: int,
+        *,
+        launch_premises: bool = True,
     ) -> list[SymbolicMemoryEvent]:
         if record.addr_expr is None:
             raise UnsupportedSymbolicRaceQuery(
@@ -1292,7 +1534,8 @@ class TwoCopySymbolicHBSolver:
         # record.reads / record.writes.
         local_terms = tuple(as_bool(c) for c in iter_constraints(local_all))
         prem_terms = tuple(as_bool(c) for c in iter_constraints(prem_all))
-        self.launch_premises.extend(prem_terms)
+        if launch_premises:
+            self.launch_premises.extend(prem_terms)
         causal_terms = tuple(as_bool(c) for c in iter_constraints(causal_all))
 
         out: list[SymbolicMemoryEvent] = []
@@ -1405,15 +1648,20 @@ class TwoCopySymbolicHBSolver:
     def _fence_orders(self, e1: SymbolicMemoryEvent, e2: SymbolicMemoryEvent) -> bool:
         """The caller's fence rule for two operations of one instance at
         distinct known positions, asked in program order."""
+        first, second = (e1, e2) if e1.program_seq < e2.program_seq else (e2, e1)
+        return self._fence_orders_records(first.record, second.record)
+
+    def _fence_orders_records(
+        self, first: AccessEventRecord, second: AccessEventRecord
+    ) -> bool:
+        """``fence_between(first, second)``, cached; ``first`` comes first
+        in program order."""
         if self.fence_between is None:
             return False
-        first, second = (e1, e2) if e1.program_seq < e2.program_seq else (e2, e1)
-        key = (id(first.record), id(second.record))
+        key = (id(first), id(second))
         cached = self._fence_cache.get(key)
         if cached is None:
-            cached = self._fence_cache[key] = bool(
-                self.fence_between(first.record, second.record)
-            )
+            cached = self._fence_cache[key] = bool(self.fence_between(first, second))
         return cached
 
     def _program_order(
@@ -1459,14 +1707,35 @@ class TwoCopySymbolicHBSolver:
         (``z + tl.zeros([B])``: B positions, no arange), so the caller must
         not list such a block anchor in ``dep_pairs``; SymbolicRaceDetector
         anchors no dependency on a block record without a position."""
-        pos1, pos2 = e1.record.lane_position, e2.record.lane_position
-        if pos1 and pos2 and len(pos1) == len(pos2):
-            sub = (self.ctx_a if e1.copy == "a" else self.ctx_b).arange_substitutions
-            dims = [apply_sub(p, sub) == apply_sub(q, sub) for p, q in zip(pos1, pos2)]
-            return dims[0] if len(dims) == 1 else And(*dims)
+        sub = (self.ctx_a if e1.copy == "a" else self.ctx_b).arange_substitutions
+        same = self._positions_equal(e1.record, sub, e2.record, sub)
+        if same is not None:
+            return same
         if e1.lane != e2.lane or self._uses_arange(e1) or self._uses_arange(e2):
             return None
         return BoolVal(True)
+
+    def _same_thread(
+        self, e1: SymbolicMemoryEvent, e2: SymbolicMemoryEvent
+    ) -> BoolRef | None:
+        """Constraint that two events of one copy run on one thread: the
+        same position (_same_position) of two blocks of one shape,
+        simplified, so that a position shared through one arange variable
+        is ``True``. ``None`` when that cannot be told: a transposed or
+        broadcast pointer keeps the variables of another position, and two
+        positionless blocks of different shapes have no common lane."""
+        key = (e1.idx, e2.idx)
+        if key in self._same_thread_cache:
+            return self._same_thread_cache[key]
+        shape_1 = getattr(getattr(e1.record, "symbolic_expr", None), "shape", None)
+        shape_2 = getattr(getattr(e2.record, "symbolic_expr", None), "shape", None)
+        same = None
+        if tuple(shape_1 or ()) == tuple(shape_2 or ()):
+            same = self._same_position(e1, e2)
+            if same is not None:
+                same = simplify(same)
+        self._same_thread_cache[key] = same
+        return same
 
     def _uses_arange(self, e: SymbolicMemoryEvent) -> bool:
         """Whether an arange variable of the event's copy occurs in it."""
@@ -1498,7 +1767,8 @@ class TwoCopySymbolicHBSolver:
     ) -> BoolRef:
         """Predicate: the two events denote ONE dynamic operation — the
         cross-copy alpha-twins of a record (same record, same lane) with
-        both copies pinned to the same block. The same-instance query pins
+        both copies pinned to the same block, at the same lane position
+        and loop iteration. The same-instance query pins
         pids equal, so without this identification the coherence machinery
         would demand two distinct order positions and two distinct rf
         sources for what is a single real operation, making e.g. the
@@ -1507,7 +1777,11 @@ class TwoCopySymbolicHBSolver:
         if e.record is not f.record or e.lane != f.lane or e.copy == f.copy:
             return BoolVal(False)
         pid_a, pid_b = self.ctx_a.pid, self.ctx_b.pid
-        return And(*[pid_a[i] == pid_b[i] for i in range(3)])
+        same = self._same_op_condition(e.record)
+        return And(
+            *[pid_a[i] == pid_b[i] for i in range(3)],
+            *([] if is_true(same) else [same]),
+        )
 
     @staticmethod
     def _scope_ok(w: SymbolicMemoryEvent, r: SymbolicMemoryEvent) -> BoolRef:
@@ -1546,15 +1820,20 @@ class TwoCopySymbolicHBSolver:
         )
 
     def _edge(self, e1: SymbolicMemoryEvent, e2: SymbolicMemoryEvent) -> BoolRef:
+        # Synchronization through an open-world source (_build_open_world_edges),
+        # a self-edge included: it makes reading such a write cyclic.
+        extra = self._open_world_edges.get((e1.idx, e2.idx), ())
         if e1.idx == e2.idx:
-            return BoolVal(False)
+            return Or(*extra) if extra else BoolVal(False)
         # Without a reads-through source, sw is identically False. Avoid
         # constructing Or(po, False) for every pair in a large capture.
         if (e1.idx, e2.idx) not in self.reads_through:
-            return self._program_order(e1, e2)
+            base = self._program_order(e1, e2)
+            return Or(base, *extra) if extra else base
         return Or(
             self._program_order(e1, e2),
             self._synchronizes_with(e1, e2),
+            *extra,
         )
 
     # ──────────────────────── Read-from / RF source choices ────────────────
@@ -1564,9 +1843,15 @@ class TwoCopySymbolicHBSolver:
     ) -> bool:
         if w.idx == r.idx:
             return False
-        # A same-instance writer at or after the reader is no rf source.
+        # A writer of the reader's own operation, or a later one of its
+        # thread, is no rf source. A later writer that may be another
+        # thread (another position, or one that cannot be told) may run
+        # first; co-po excludes it at a known same position.
         if w.copy == r.copy and w.program_seq >= r.program_seq:
-            return False
+            if w.program_seq == r.program_seq:
+                return False
+            same = self._same_thread(w, r)
+            return not (same is not None and is_true(same))
         return True
 
     # Cap on initial-source disjunction size. Above this, the solver falls
@@ -1653,8 +1938,7 @@ class TwoCopySymbolicHBSolver:
         non-identity bitwise RMW, unsigned umax/umin) — can overlap the
         location ``r`` reads.
 
-        Such a writer can publish a value the closed-world choice set
-        excludes; without an escape hatch the reader's ``old_value`` would be
+        Such a writer can publish a value no modeled rf choice contains; without an escape hatch the reader's ``old_value`` would be
         over-constrained and every conflict gated on it silently vanishes
         (e.g. a guard flag set via an unmodeled ``tl.atomic_xchg``). Overlap
         is decided by Z3 on the symbolic addresses under grid/arange bounds
@@ -1731,20 +2015,18 @@ class TwoCopySymbolicHBSolver:
         return False
 
     def _build_read_from_choices(self) -> None:
-        # Closed-world atomic source model.
+        # Atomic source model.
         # If the initial scalar source is identifiable, source choices are
-        # closed over: (initial source) + (value-modeled atomic writers —
-        # CAS and modeled RMW write parts incl. identity or/xor-of-zero).
+        # (initial source) + (value-modeled atomic writers of the two copies
+        # — CAS and modeled RMW write parts incl. identity or/xor-of-zero) +
+        # (open-world writers: _open_world_sources).
         # If the initial source is not identifiable — or an UNMODELED write
         # (plain store, float RMW, non-identity bitwise RMW) can overlap the
-        # location, publishing a value the closed world does not contain —
+        # location, publishing a value no modeled write contains —
         # rf_unknown is introduced and does NOT enable synchronizes-with.
-        # This is intentionally NOT a
-        # full coherence/read-from model over all program instances; the
-        # guarded acq_rel CAS no-race result depends on this closed-world
-        # assumption holding whenever the flag is only ever written by
-        # modeled atomics. For a COUNTED record the closed world is
-        # widened by rf_chain: the reader may take its value from an
+        # Coherence orders the two copies' writer events only; an
+        # open-world writer joins no order. For a COUNTED record the source
+        # set is widened by rf_chain: the reader may take its value from an
         # unmodeled grid instance at rank-1 (the counting equations already
         # pin the value), so real races at non-adjacent ranks are not
         # squeezed out. rf_chain never enables synchronizes-with either —
@@ -1752,6 +2034,7 @@ class TwoCopySymbolicHBSolver:
         modeled_writers = [
             e for e in self.events if e.is_atomic and e.written_value is not None
         ]
+        open_world_writers = self._open_world_writer_records()
         for r in self.events:
             if not r.is_atomic or r.old_value is None:
                 continue
@@ -1795,6 +2078,10 @@ class TwoCopySymbolicHBSolver:
                     )
                 )
 
+            if r.idx not in self.rf_unknown_source:
+                # rf_unknown already admits any value for r.
+                choices.extend(self._open_world_sources(r, open_world_writers))
+
             if choices:
                 self.rf_constraints.append(Implies(r.reads, Or(*choices)))
                 self.rf_constraints.append(
@@ -1802,6 +2089,263 @@ class TwoCopySymbolicHBSolver:
                 )
                 if len(choices) > 1:
                     self.rf_constraints.append(AtMost(*choices, 1))
+
+    # ──────────────────── open-world rf sources ────────────────────
+
+    def _open_world_writer_records(self) -> list[AccessEventRecord]:
+        """Value-modeled atomic writers that any thread of the grid may run:
+        every CAS, and every value-modeled xchg / max / min RMW. The rest
+        need no open-world source:
+
+          * ``add`` with a nonzero operand is wrap-capable, so it is an
+            unmodeled writer and opens rf_unknown for every reader it can
+            overlap;
+          * an identity write (``add`` / ``or`` / ``xor`` of zero, the
+            no-change branch of ``max`` / ``min``) writes back the value it
+            read: its reader can read that value's writer instead, through
+            the same release sequence;
+          * a counted record is covered by rf_chain and the counting
+            equations;
+          * a pre-exit or await-gated record (compiled frontends only)
+            keeps the closed world.
+        """
+        return [
+            record
+            for record in self.records
+            if record.is_atomic
+            and not record.pre_exit
+            and not record.await_dependencies
+            and not record.await_observations
+            and id(record) not in self._counting
+            and (
+                record.atomic_kind == "cas"
+                or (
+                    record.old_value is not None
+                    and record.rmw_op in ("xchg", "max", "min")
+                    and record.rmw_operand is not None
+                )
+            )
+        ]
+
+    def _fresh_context(self, tag: str) -> tuple[CopyContext, BoolRef]:
+        """A copy context for one more thread of the grid: fresh pid,
+        lane and copy-local variables, and their bounds."""
+        pid = tuple(Int(f"pid_{tag}_{i}") for i in range(3))
+        arange_subs = []
+        bounds = [And(pid[i] >= 0, pid[i] < self.grid[i]) for i in range(3)]
+        for orig, _ in self.ctx_a.arange_substitutions:
+            start, end = self._arange_ranges[_z3_var_key(orig)]
+            var = Int(f"{orig.decl().name()}__{tag}")
+            arange_subs.append((orig, var))
+            bounds.append(And(var >= start, var < end))
+        copy_local = tuple(
+            (orig, Const(f"{var_a.decl().name()}__{tag}", orig.sort()))
+            for orig, var_a in self.ctx_a.copy_local_substitutions
+        )
+        ctx = CopyContext(
+            label=tag,
+            pid=pid,
+            pid_substitutions=tuple(zip(_import_symbolic_expr_pids(), pid)),
+            arange_substitutions=tuple(arange_subs),
+            arange_constraints=(),
+            copy_local_substitutions=copy_local,
+        )
+        return ctx, And(*bounds)
+
+    @staticmethod
+    def _lanes_not_named(record: AccessEventRecord) -> bool:
+        """A block record without a lane_position: its lane variables, if
+        any, do not name its lanes. On a block on one address (``z +
+        tl.zeros([B])``) one symbolic lane stands for all of them; on a
+        broadcast pointer one assignment of its variables stands for
+        several lanes; on a transposed or reshaped pointer an assignment
+        names a lane at another position than an untransposed record with
+        the same variables."""
+        shape = getattr(getattr(record, "symbolic_expr", None), "shape", None)
+        return bool(shape) and record.lane_position is None
+
+    def _value_needs_no_other_observation(self, record: AccessEventRecord) -> bool:
+        """The record's write uses no copy-local value but its own
+        observation and those of same-thread anchors, so its event in a
+        copy and a fresh lowering at the same pid and lane write the same
+        value. A same-thread anchor X is outside any loop, names its lanes,
+        and uses only lane variables of the record: at the record's pid and
+        lane in a copy, X's event is the one dynamic X whose result that
+        thread uses (a scalar CAS's result, say)."""
+        key = ("same_value", id(record))
+        cached = self._record_cache.get(key)
+        if cached is not None:
+            return cached
+        own = _collect_z3_var_keys((record.old_value,))
+        used = _collect_z3_var_keys(
+            (
+                record.addr_expr,
+                record.active,
+                record.local_constraints,
+                record.premises,
+                record.rmw_operand,
+                record.cas_cmp_value,
+                record.cas_new_value,
+            )
+        )
+        copy_local = {
+            _z3_var_key(orig) for orig, _ in self.ctx_a.copy_local_substitutions
+        }
+        rest = (used & copy_local) - own
+        mine = {_z3_var_key(v) for v in self._record_lane_vars(record)}
+        for other in self.records:
+            if not rest:
+                break
+            keys = _collect_z3_var_keys((other.old_value,)) & rest
+            if not keys:
+                continue
+            if (
+                self._record_iterators(other)
+                or self._lanes_not_named(other)
+                or not {_z3_var_key(v) for v in self._record_lane_vars(other)} <= mine
+            ):
+                break
+            rest -= keys
+        cached = self._record_cache[key] = not rest
+        return cached
+
+    def _open_world_sources(
+        self, r: SymbolicMemoryEvent, writers: list[AccessEventRecord]
+    ) -> list[BoolRef]:
+        """rf choices for ``r`` from any thread that runs an open-world
+        writer record W: another lane of one of the two modeled instances,
+        or another instance of the grid. Each (reader, W) gets W lowered
+        under its own fresh context. The lowered writer is no event of the
+        solver: it joins no race pair, coherence order, value causality,
+        counting or reads-through relation, and it synchronizes only
+        through _build_open_world_edges.
+
+        Exclusions apply only when W's lane variables name its lanes
+        (not _lanes_not_named). A fresh writer at the pid and lane of W's
+        event in a copy is that event itself (atomics run in no loop). It
+        is excluded where the copy's event is already an rf choice of ``r``
+        with the same value, so that the coherence of the copy's event is
+        not bypassed, and where the copy's event is a later operation of
+        ``r``'s own thread, which ``r`` cannot read. A writer at ``r``'s
+        own pid and lane is ``r`` itself, which never reads its own
+        write. Every other thread running W stays a source."""
+        choices: list[BoolRef] = []
+        template: Solver | None = None
+        ctx_r = self.ctx_a if r.copy == "a" else self.ctx_b
+        for record in writers:
+            if max(1, int(record.elem_size)) != r.elem_size:
+                continue
+            tag = f"ow{r.idx}w{record.event_id}"
+            ctx, bounds = self._fresh_context(tag)
+            identifiable = not self._lanes_not_named(record)
+            same_value = self._value_needs_no_other_observation(record)
+            for w in self._lower_record(record, ctx, -1, launch_premises=False):
+                value = (
+                    w.written_value if record.atomic_kind == "cas" else w.rmw_operand
+                )
+                if value is None:
+                    continue
+                if template is None:
+                    template = self._template_solver()
+                template.push()
+                template.add(bounds, w.writes, r.reads, w.addr == r.addr)
+                feasible = template.check() != unsat  # unknown keeps it
+                template.pop()
+                if not feasible:
+                    continue
+                cond = [
+                    bounds,
+                    w.writes,
+                    r.reads,
+                    w.addr == r.addr,
+                    value == r.old_value,
+                ]
+                for c in (self.ctx_a, self.ctx_b) if identifiable else ():
+                    same_thread = And(
+                        *[ctx.pid[i] == c.pid[i] for i in range(3)],
+                        self._lane_equal(
+                            record, ctx.arange_substitutions, c.arange_substitutions
+                        ),
+                    )
+                    if record is r.record and c is ctx_r and w.lane == r.lane:
+                        cond.append(Not(same_thread))
+                        continue
+                    twin = self._event_of.get((id(record), c.label, w.lane))
+                    if twin is None:
+                        continue
+                    if same_value and (twin.idx, r.idx) in self.rf_source:
+                        cond.append(Not(same_thread))
+                    elif twin.copy == r.copy and twin.program_seq > r.program_seq:
+                        later = self._same_thread(twin, r)
+                        if later is not None and is_true(later):
+                            cond.append(Not(same_thread))
+                rf = Bool(f"rf_any_{record.event_id}_{w.lane}_to_{r.idx}")
+                condition = And(*cond)
+                self.rf_constraints.append(Implies(rf, condition))
+                self.rf_open_world.append((rf, r, record, w, ctx, condition))
+                choices.append(rf)
+        return choices
+
+    def _build_open_world_edges(self) -> None:
+        """Synchronizes-with through an open-world source: when ``r``
+        acquires what a release W writes, every event of W's instance that
+        a fence, or a dependency at W's own position, orders before W
+        happens before ``r``. The edges join the HB matrix as direct
+        (e, r) edges; nothing else of W's instance is modeled, so
+        synchronization that reaches W through a third instance is lost
+        (over-reported)."""
+        template: Solver | None = None
+        for rf, r, record, w, ctx, condition in self.rf_open_world:
+            if not (is_release_sem(record.sem) and is_acquire_sem(r.sem)):
+                continue
+            if record.program_seq < 0:
+                continue
+            scope = self._scope_ok(w, r)
+            # An edge from a copy's event needs the fresh writer in that
+            # copy's instance. Where the choice rules that out (a twin
+            # exclusion, an address only another instance writes), the edge
+            # is always false: skip it, which keeps the HB closure small.
+            alive: dict[str, bool] = {}
+            for c in (self.ctx_a, self.ctx_b):
+                if template is None:
+                    template = self._template_solver()
+                template.push()
+                template.add(condition, *[w.pid[i] == c.pid[i] for i in range(3)])
+                alive[c.label] = template.check() != unsat  # unknown keeps it
+                template.pop()
+            for e in self.events:
+                if e.program_seq < 0 or e.program_seq >= record.program_seq:
+                    continue
+                if not alive[e.copy]:
+                    continue
+                if self._fence_orders_records(e.record, record):
+                    ordered: BoolRef = BoolVal(True)
+                elif (e.event_id, record.event_id) in self.dep_pairs:
+                    sub_e = (
+                        self.ctx_a if e.copy == "a" else self.ctx_b
+                    ).arange_substitutions
+                    same = self._positions_equal(
+                        e.record, sub_e, record, ctx.arange_substitutions
+                    )
+                    if same is None:
+                        if (
+                            e.lane != w.lane
+                            or self._uses_arange(e)
+                            or self._record_lane_vars(record)
+                        ):
+                            continue
+                        same = BoolVal(True)
+                    ordered = same
+                else:
+                    continue
+                term = And(
+                    rf,
+                    scope,
+                    *[w.pid[i] == e.pid[i] for i in range(3)],
+                    e.active,
+                    ordered,
+                )
+                self._open_world_edges.setdefault((e.idx, r.idx), []).append(term)
 
     # ──────────────────────── Conflict / race query ────────────────────────
 
@@ -1845,11 +2389,99 @@ class TwoCopySymbolicHBSolver:
             return False
         return None
 
+    def _faithful_position(self, record: AccessEventRecord) -> bool:
+        """The record's lane_position names every lane: one distinct arange
+        variable per dimension. (Two same-range aranges on one source line
+        share a variable; a position over them covers the diagonal only.)"""
+        key = ("faithful", id(record))
+        cached = self._record_cache.get(key)
+        if cached is None:
+            cached = bool(record.lane_position)
+            seen: set[tuple[int, str, str]] = set()
+            for coord in record.lane_position or ():
+                keys = _collect_z3_var_keys((coord,)) & set(self._arange_ranges)
+                if len(keys) != 1 or keys & seen:
+                    cached = False
+                    break
+                seen |= keys
+            self._record_cache[key] = cached
+        return cached
+
+    def _position_extents(self, record: AccessEventRecord) -> tuple[Any, ...]:
+        """Per dimension, the size of the arange feeding it (faithful
+        positions only)."""
+        out = []
+        for coord in record.lane_position or ():
+            (key,) = _collect_z3_var_keys((coord,)) & set(self._arange_ranges)
+            start, end = self._arange_ranges[key]
+            out.append(end - start)
+        return tuple(out)
+
+    def _anchor_pins(self, e: SymbolicMemoryEvent) -> tuple[BoolRef, ...]:
+        """Pin the lanes of a race endpoint's dependency anchors to its own
+        position, in its copy.
+
+        A dependent consumes its anchors' results element-wise, so the lane
+        of ``e`` at position q uses each anchor's lane at q (transitively).
+        Within a copy, an anchor with its own aranges is otherwise on an
+        independent lane, and the endpoint's mask or value would read
+        another lane's result. Pinning only chooses which lanes of the
+        anchors the copy stands for; every other lane of a value-modeled
+        writer stays an rf source through the open world. So a pin is
+        added only when it is satisfiable for every lane of ``e``: both
+        positions faithful with equal extents, and the anchor's position
+        variables disjoint from those already pinned (or the two positions
+        identical). A pin is never needed for soundness; skipping one only
+        loses precision."""
+        cached = self._anchor_pin_cache.get(e.idx)
+        if cached is not None:
+            return cached
+        pins: list[BoolRef] = []
+        record = e.record
+        if record.dep_loads and self._faithful_position(record):
+            sub = (self.ctx_a if e.copy == "a" else self.ctx_b).arange_substitutions
+            lane_vars = {_z3_var_key(var) for _, var in sub}
+            target = tuple(apply_sub(p, sub) for p in record.lane_position or ())
+            extents = self._position_extents(record)
+            pinned = _collect_z3_var_keys(target) & lane_vars
+            positions = [target]
+            seen: set[int] = set()
+            queue = list(record.dep_loads)
+            while queue:
+                eid = int(queue.pop(0))
+                if eid in seen:
+                    continue
+                seen.add(eid)
+                anchor = self._record_by_id.get(eid)
+                if anchor is None:
+                    continue
+                queue.extend(anchor.dep_loads)
+                coords = anchor.lane_position or ()
+                if (
+                    not self._faithful_position(anchor)
+                    or len(coords) != len(target)
+                    or self._position_extents(anchor) != extents
+                ):
+                    continue
+                position = tuple(apply_sub(p, sub) for p in coords)
+                if any(
+                    all(x.eq(y) for x, y in zip(position, other)) for other in positions
+                ):
+                    continue  # already the endpoint's position
+                keys = _collect_z3_var_keys(position) & lane_vars
+                if keys & pinned:
+                    continue
+                pinned |= keys
+                positions.append(position)
+                pins.extend(x == y for x, y in zip(position, target))
+        cached = self._anchor_pin_cache[e.idx] = tuple(pins)
+        return cached
+
     def _race_expr(self, a: SymbolicMemoryEvent, b: SymbolicMemoryEvent) -> BoolRef:
         forward, reverse = self.hb[a.idx][b.idx], self.hb[b.idx][a.idx]
         if is_true(forward) or is_true(reverse):
             return BoolVal(False)
-        terms = [self._conflict(a, b)]
+        terms = [self._conflict(a, b), *self._anchor_pins(a), *self._anchor_pins(b)]
         if not is_false(forward):
             terms.append(Not(forward))
         if not is_false(reverse):
@@ -1929,11 +2561,27 @@ class TwoCopySymbolicHBSolver:
                 )
                 cons.append(Implies(same_op, ord_e == ord_f))
 
-                if e.copy == f.copy and e.program_seq >= 0 and f.program_seq >= 0:
+                # co-po: per-location order follows program order on one
+                # thread (it holds on hardware, fence or not; the race
+                # query's fence-ordered HB is a separate over-approximation).
+                # Only at a known same thread: a transposed pointer's lane
+                # with the same variables is another thread.
+                same_thread = self._same_thread(e, f) if e.copy == f.copy else None
+                if (
+                    same_thread is not None
+                    and e.program_seq >= 0
+                    and f.program_seq >= 0
+                    and e.program_seq != f.program_seq
+                ):
+                    guard = (
+                        both_active_same_addr
+                        if is_true(same_thread)
+                        else And(both_active_same_addr, same_thread)
+                    )
                     if e.program_seq < f.program_seq:
-                        cons.append(Implies(both_active_same_addr, ord_e < ord_f))
-                    elif f.program_seq < e.program_seq:
-                        cons.append(Implies(both_active_same_addr, ord_f < ord_e))
+                        cons.append(Implies(guard, ord_e < ord_f))
+                    else:
+                        cons.append(Implies(guard, ord_f < ord_e))
 
         # rf_init: no modeled successful writer at the same address may
         # precede the reader in the per-location order. The reader's own
@@ -2017,7 +2665,9 @@ class TwoCopySymbolicHBSolver:
                 if f.idx == e.idx:
                     continue
                 if e.copy == f.copy and 0 <= e.program_seq < f.program_seq:
-                    continue  # co-po already asserts this pair without the hb antecedent
+                    same_thread = self._same_thread(e, f)
+                    if same_thread is not None and is_true(same_thread):
+                        continue  # co-po asserts this pair without the hb antecedent
                 cons.append(
                     Implies(
                         And(
@@ -2169,9 +2819,10 @@ class TwoCopySymbolicHBSolver:
 
         Guards, all checked on the TEMPLATE (Z3 ``unknown`` fails a guard —
         the axiom is then OMITTED, never approximated):
-          (a) the record is a value-modeled ``add`` RMW with exactly one
-              lane per copy, and its address simplifies to ONE numeral in
-              both copies (a fixed scalar location L);
+          (a) the record is a value-modeled ``add`` RMW on a true scalar
+              (rank 0, no lane variable: a block of lanes on one address
+              increments it once per lane), and its address simplifies to
+              ONE numeral in both copies (a fixed scalar location L);
           (b) its activity is provably true for every instance;
           (c) the increment is a constant c > 0;
           (d) L's initial value is known via the rf-init machinery's own
@@ -2227,6 +2878,15 @@ class TwoCopySymbolicHBSolver:
         # numeral (no pid/arange/copy-local dependence survives simplify).
         loc = _as_numeral(e_a.addr)
         if loc is None or _as_numeral(e_b.addr) != loc:
+            return None
+        # One increment per instance: a block of lanes on one address
+        # (cnt + 0 * offs, cnt + tl.zeros([B])) increments it once per lane.
+        record = e_a.record
+        if (
+            record.lane_position is not None
+            or self._record_lane_vars(record)
+            or getattr(getattr(record, "symbolic_expr", None), "shape", None)
+        ):
             return None
         # (c) constant increment > 0, identical in both copies.
         inc = _as_numeral(e_a.rmw_operand)
