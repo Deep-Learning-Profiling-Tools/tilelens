@@ -43,6 +43,7 @@ from tilelens.ir.ttir_reader import (
     Const,
     DataDep,
     FuncArg,
+    Loaded,
     LoopInfo,
     LoopVar,
     Observed,
@@ -513,10 +514,11 @@ def test_an_unbound_loop_bound_refuses_the_loop():
 def test_unmodeled_values_and_unusable_facts_refuse():
     """Defensive: the reader never lets a DataDep into an address, and
     bind_launch never builds such facts."""
-    g = _synthetic(_access(Bin("+", Const(0), DataDep("loaded value"))))
-    r = check_graph(g, _bind(p=_facts(4)))
-    assert r.abstained == ((0, K.UNMODELED_VALUE),)
-    assert "an unmodeled value (loaded value)" in r.refusal.message
+    for leaf in (DataDep("loaded value"), Loaded(0, Const(0), None, None)):
+        g = _synthetic(_access(Bin("+", Const(0), leaf)))
+        r = check_graph(g, _bind(p=_facts(4)))
+        assert r.abstained == ((0, K.UNMODELED_VALUE),)
+        assert "an unmodeled value (loaded value)" in r.refusal.message
     bad = TensorFacts(PTR, 4, 4, (4,), (), "torch.float32", False)
     r = check_graph(_synthetic(_access(Const(0))), _bind(p=bad))
     assert r.abstained == ((0, K.MISSING_BINDING),)

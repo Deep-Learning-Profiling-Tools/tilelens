@@ -27,6 +27,7 @@ from tilelens.ir.ttir_reader import (
     IntCast,
     IterArgInfo,
     IterArgOffset,
+    Loaded,
     LoopInfo,
     LoopVar,
     Not,
@@ -74,6 +75,9 @@ class _Leaves:
 
     def observed(self, t):
         return self._var(f"observed_{t.access_index}")
+
+    def loaded(self, t):
+        return self._var(f"loaded_{t.access_index}")
 
     def data_dep(self, t):
         raise _Refusal(t.why)
@@ -201,7 +205,9 @@ def test_children_is_the_value_dependency_relation():
     assert kids(LoopVar("%loop")) == [id(LOOP.lower), id(LOOP.step)]
     for leaf in (Const(1), Pid(0), NumPrograms(1), Arange("%r", 0, 4), X, Observed(0)):
         assert kids(leaf) == []
-    assert kids(DataDep()) == []
+    # a loaded value's terms are the client's; keep is no value dependency
+    assert kids(DataDep()) == kids(DataDep("x", keep=less)) == []
+    assert kids(Loaded(0, X, less, Y)) == []
 
 
 # ─────────────────────────── operator semantics ───────────────────────────
@@ -325,9 +331,28 @@ def test_loop_terms_read_the_clients_iteration():
     assert _proved(lowerer.lower(IterArgOffset(0)) == _v("o0") + k * _v("d0"))
     assert _proved(lowerer.lower(IterArgOffset(1)) == _v("o1") + other * _v("d1"))
     assert "hi" not in leaves.made  # the upper bound is not the variable's value
+    # with several loops, each variable reads its own loop by name
+    inner = LoopInfo(
+        "%loop1", lower=Param("lo1"), upper=Param("hi1"), step=Param("st1")
+    )
+    graph = AccessGraph("k", (), (), None, loops=(LOOP, inner))
+    lowerer = Lowerer(graph, _Leaves())
+    assert _proved(
+        lowerer.lower(LoopVar("%loop1")) == _v("lo1") + _v("k%loop1") * _v("st1")
+    )
+    assert _proved(lowerer.lower(LoopVar("%loop")) == _v("lo") + k * _v("st"))
+    with pytest.raises(ValueError, match="without a loop named '%loop2'"):
+        lowerer.lower(LoopVar("%loop2"))
 
 
 # ─────────────────────────── leaves and bugs ───────────────────────────
+
+
+def test_a_loaded_value_is_the_clients_leaf():
+    leaves = _Leaves()
+    term = Bin("+", X, Loaded(3, Param("o"), None, None))
+    assert _proved(Lowerer(_graph(), leaves).lower(term) == _v("x") + _v("loaded_3"))
+    assert "o" not in leaves.made
 
 
 def test_a_leaf_refusal_propagates_unchanged():

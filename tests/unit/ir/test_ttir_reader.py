@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import itertools
 import pickle
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -21,10 +22,14 @@ from tilelens.ir.ttir_reader import (
     Arange,
     AtomicInfo,
     Bin,
+    BoolBin,
     Cmp,
     Const,
     IntCast,
     IterArgOffset,
+    Loaded,
+    LoopVar,
+    Not,
     Observed,
     Param,
     Pid,
@@ -194,6 +199,11 @@ REFUSED = {
     "reader_ttir/pure_asm_int_addr.ttir": "inline-asm",
     "reader_ttir/observed_lanes.ttir": "indirect-address",
     "reader_ttir/poll_while.ttir": "control-flow",
+    "reader_ttir/mp_loops.ttir": "nested-loop",
+    "reader_ttir/mp_loaded.ttir": "indirect-address",
+    "reader_ttir/mp_early_return.ttir": "control-flow",
+    "reader_ttir/mp_loaded_advance.ttir": "indirect-address",
+    "reader_ttir/mp_for_in_while.ttir": "control-flow",
 }
 
 
@@ -1064,3 +1074,276 @@ def test_while_regions_are_read_only_on_request():
         assert parse_ttir(_text(name), while_regions=True) == _graph(name)
     outcome = ParseCache().get(text, while_regions=True)
     assert len(outcome.graph.whiles) == 4
+    # with multipath too, a poll's load stays an observation
+    for name in ("reader_ttir/poll_while.ttir", "ttir/spike_spin_while.ttir"):
+        both = parse_ttir(_text(name), while_regions=True, multipath=True)
+        assert pickle.dumps(both) == pickle.dumps(
+            parse_ttir(_text(name), while_regions=True)
+        )
+
+
+# ─────────────────────────── multipath ───────────────────────────
+
+
+def _mp(name: str) -> AccessGraph:
+    return parse_ttir(_text(name), multipath=True)
+
+
+@pytest.mark.parametrize("name", FILES)
+def test_multipath_reads_a_default_text_alike_but_for_loaded_values(name):
+    try:
+        g = _graph(name)
+    except UnsupportedTTIR:
+        return
+    # the default's loop facts: its one loop
+    assert g.loops == ((g.loop,) if g.loop else ())
+    for x in g.accesses + g.fences:
+        assert x.loops == (("%loop",) if x.in_loop else ())
+    m = _mp(name)
+    roots = [f.path for f in m.fences] + [
+        t for a in m.accesses for t in (a.offset, a.mask, a.path, a.atomic_val)
+    ]
+    keep = any(a.mask_dropped and a.mask is not None for a in m.accesses)
+    if not keep and not any(R.loaded_indices(t, m) for t in roots):
+        # pickle: byte for byte, and iterative (kernel_deep_chain)
+        assert pickle.dumps(m) == pickle.dumps(g)
+
+
+def test_several_loops_each_with_their_own_variable():
+    assert _refusal("reader_ttir/mp_loops.ttir").kind is TTIRKind.NESTED_LOOP
+    g = _mp("reader_ttir/mp_loops.ttir")
+    outer, inner, under_if = g.loops
+    # a graph built with one of loop and loops gets the other
+    assert AccessGraph("k", (), (), outer).loops == (outer,)
+    assert AccessGraph("k", (), (), None, loops=(outer,)).loop is outer
+    assert g.loop is None and [lp.loop_ssa for lp in g.loops] == [
+        "%loop",
+        "%loop1",
+        "%loop2",
+    ]
+    assert (inner.upper, inner.step, under_if.upper) == (
+        Param("m"),
+        Const(2),
+        Param("n"),
+    )
+    nested, seq = g.accesses
+    assert (nested.loops, seq.loops, seq.in_loop) == (
+        ("%loop", "%loop1"),
+        ("%loop2",),
+        True,
+    )
+    assert nested.offset == Bin("+", IterArgOffset(0), LoopVar("%loop1"))
+    assert seq.path == Cmp("slt", Pid(0), Param("n"), 32)
+    # the inner pointer advances by the outer variable: invariant inside
+    q, p = g.iter_args
+    assert (q.loop_ssa, q.delta, p.loop_ssa) == ("%loop1", LoopVar("%loop"), "%loop2")
+    # one increment obligation per enclosing loop, outermost first
+    latches = [ob.term for ob in width_obligations(g, nested) if ob.role == "loop"]
+    assert [t.b for t in latches] == [outer.step, inner.step]
+    assert [ob.term.b for ob in width_obligations(g, seq)] == [under_if.step]
+    # an advance by the loop's own variable, or by a value loaded in the
+    # loop, is still variant; a loop in an scf.while still refuses
+    for name in ("p1_variant_delta", "mp_loaded_advance"):
+        with pytest.raises(UnsupportedTTIR, match="loop-variant amount") as e:
+            _mp(f"reader_ttir/{name}.ttir")
+        assert e.value.kind is TTIRKind.LOOP_VARIANT_ADVANCE
+    text = _text("reader_ttir/mp_for_in_while.ttir")
+    with pytest.raises(UnsupportedTTIR) as e:
+        parse_ttir(text, while_regions=True, multipath=True)
+    assert e.value.kind is TTIRKind.NESTED_LOOP
+
+
+def test_integer_loads_read_as_loaded_values():
+    assert _refusal("reader_ttir/mp_loaded.ttir").kind is TTIRKind.INDIRECT_ADDRESS
+    g = _mp("reader_ttir/mp_loaded.ttir")
+    j, gather, _, by_j, _, tile, w, kept, _, under, either, kept2, add = g.accesses
+    lane = Arange(j.offset.b.ssa, 0, 8)
+    loaded = Loaded(0, j.offset, Cmp("slt", lane, Param("n"), 32), Const(0))
+    # in an address, a mask and a branch condition
+    assert gather.offset == Bin("+", Const(0), loaded)
+    assert by_j.mask == Cmp("sgt", loaded, Const(0), 32) and not by_j.mask_dropped
+    assert under.path == Cmp("sgt", Loaded(8, Const(0), None, None), Const(0), 32)
+    assert R.loaded_indices(under.path, g) == {8}
+    # an expanded tile is re-placed along the new dimension, its mask too
+    (row,) = [n for n in R._nodes((tile.offset,), None) if isinstance(n, Loaded)]
+    row_lane = replace(lane, dim=0)
+    assert row == Loaded(
+        4,
+        Bin("+", Const(0), row_lane),
+        Cmp("slt", row_lane, Param("n"), 32),
+        Const(0),
+    )
+    # a load whose mask is dropped stays DataDep; the modelable conjunct of
+    # a dropped mask is kept (re-placed by an expand_dims), a disjunct not
+    assert (w.mask_dropped, kept.mask_dropped, kept2.mask_dropped) == (True,) * 3
+    assert kept.mask == Cmp("slt", lane, Param("n"), 32)
+    assert kept2.mask == Cmp("slt", row_lane, Param("n"), 32)
+    assert (either.mask, either.mask_dropped) == (None, True)
+    # a float load never reaches an integer term (an atomic operand here)
+    assert add.atomic is not None and add.atomic_val is None
+    # loaded_indices follows a loop variable into its loop's bounds
+    body = """%c1 = arith.constant 1 : i32
+        %lo = tt.load %q : !tt.ptr<i32>
+        scf.for %k = %lo to %n step %c1 : i32 {
+        %a = tt.addptr %q, %k : !tt.ptr<i32>, i32
+        tt.store %a, %c1 : !tt.ptr<i32>
+        }"""
+    csr = parse_ttir(_module(body, "%q: !tt.ptr<i32>, %n: i32"), multipath=True)
+    assert csr.accesses[1].offset == Bin("+", Const(0), LoopVar("%loop"))
+    assert R.loaded_indices(csr.accesses[1].offset, csr) == {0}
+
+
+def test_cf_blocks_read_with_block_predicates_and_merged_arguments():
+    g = _mp("ttir/golden_nested_guard_merge_sm80.ttir")
+    pid, n, T = Pid(0), Param("n"), Param("T")
+    go_on = Not(Cmp("sge", pid, T, 32))
+    first = BoolBin(
+        "and",
+        BoolBin("and", go_on, Cmp("eq", pid, Const(0), 32)),
+        Not(Cmp("slt", n, Const(0), 32)),
+    )
+    other = BoolBin("and", go_on, Not(Cmp("eq", pid, Const(0), 32)))
+    load, store = g.accesses
+    # ^bb5's predicate, its two incoming edges, is the path; its argument
+    # (`base`) a Select over what they pass
+    assert load.path == store.path == BoolBin("or", first, other)
+    base = Select(first, Const(0), Bin("+", Bin("*", pid, Const(64), 32), n, 32))
+    assert load.offset == Bin(
+        "+", Const(0), Bin("+", base, Arange(load.offset.b.b.ssa, 0, 64), 32)
+    )
+    # both arms of one cond_br into one block
+    (store,) = _mp("ttir/crafted_same_dest.ttir").accesses
+    c, a, b = Cmp("slt", Param("arg1"), Param("arg2"), 32), Param("arg1"), Param("arg2")
+    assert store.path == BoolBin("and", BoolBin("or", c, Not(c)), c)
+    assert store.offset == Bin("+", Const(0), Bin("+", Select(c, a, b), a, 32))
+    # an edge under an unmodeled condition leaves the block guarded
+    _, store = _mp("reader_ttir/mp_early_return.ttir").accesses
+    assert (store.guarded, store.path) == (True, None)
+    # an address handed to inline asm through a block argument
+    asm = (
+        "%i = tt.ptr_to_int %p : !tt.ptr<f32> -> i64\ncf.br ^bb1(%i : i64)\n"
+        '^bb1(%x: i64):\n%y = tt.elementwise_inline_asm "mov.b64 $0, $1;" '
+        '{constraints = "=l,l", packed_element = 1 : i32, pure = true} %x : i64 -> i64'
+    )
+    with pytest.raises(UnsupportedTTIR, match="computed from a pointer"):
+        parse_ttir(_module(asm), multipath=True)
+    # but not one whose block argument only the branch condition's is
+    clean = asm.replace(
+        "cf.br ^bb1(%i : i64)",
+        "%z = arith.constant 0 : i64\n%c = arith.cmpi ne, %i, %z : i64\n"
+        "cf.cond_br %c, ^bb1(%z : i64), ^bb1(%z : i64)",
+    )
+    parse_ttir(_module(clean), multipath=True)
+
+
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        # a block entered before its predecessor holds an access
+        "cf.cond_br %c, ^bb2, ^bb1\n^bb1:\ntt.store %p, %n : !tt.ptr<i32>\n"
+        "tt.return\n^bb2:\ncf.cond_br %c, ^bb1, ^bb3\n^bb3:",
+        # a block branching back to itself
+        "cf.cond_br %c, ^bb1, ^bb2\n^bb1:\ncf.br ^bb1\n^bb2:",
+        # an address made from the argument of a block entered early
+        "cf.cond_br %c, ^bb2, ^bb1(%n : i32)\n^bb1(%x: i32):\n"
+        "%q = tt.addptr %p, %x : !tt.ptr<i32>, i32\ntt.return\n"
+        "^bb2:\ncf.br ^bb1(%n : i32)\n^bb3:",
+    ],
+)
+def test_cf_blocks_out_of_order_or_cyclic_refuse(blocks):
+    text = _module(blocks, "%p: !tt.ptr<i32>, %n: i32, %c: i1")
+    with pytest.raises(UnsupportedTTIR, match="entered") as e:
+        parse_ttir(text, multipath=True)
+    assert e.value.kind is TTIRKind.CONTROL_FLOW
+
+
+_STORE_AT_X = "^bb1(%x: i32):\n%q = tt.addptr %p, %x : !tt.ptr<i32>, i32\n"
+_STORE_AT_X += "tt.store %q, %n : !tt.ptr<i32>"
+
+
+@pytest.mark.parametrize(
+    "blocks, match",
+    [
+        # an edge under an unmodeled condition: a merged value is unknown
+        (
+            "%v = tt.load %f : !tt.ptr<f32>\n%z = arith.constant 0.0 : f32\n"
+            "%c = arith.cmpf ogt, %v, %z : f32\ncf.cond_br %c, ^bb1(%n : i32), "
+            "^bb1(%n2 : i32)\n" + _STORE_AT_X,
+            "block argument",
+        ),
+        # an unmodelable incoming value
+        (
+            "%v = tt.load %f : !tt.ptr<f32>\n%i = arith.fptosi %v : f32 to i32\n"
+            "%c = arith.cmpi slt, %n, %n2 : i32\ncf.cond_br %c, ^bb1(%i : i32), "
+            "^bb1(%n : i32)\n" + _STORE_AT_X,
+            "block argument",
+        ),
+        # pointers of two bases
+        (
+            "%c = arith.cmpi slt, %n, %n2 : i32\ncf.cond_br %c, ^bb1(%p : "
+            "!tt.ptr<i32>), ^bb1(%p2 : !tt.ptr<i32>)\n^bb1(%x: !tt.ptr<i32>):\n"
+            "tt.store %x, %n : !tt.ptr<i32>",
+            "block argument",
+        ),
+        # a branch in generic form names no successors the reader reads
+        ('"cf.br"()[^bb1] : () -> ()\n^bb1:', "control flow cf.br"),
+    ],
+)
+def test_cf_block_arguments_merge_only_modeled_values(blocks, match):
+    args = "%p: !tt.ptr<i32>, %p2: !tt.ptr<i32>, %f: !tt.ptr<f32>, %n: i32, %n2: i32"
+    with pytest.raises(UnsupportedTTIR, match=match):
+        parse_ttir(_module(blocks, args), multipath=True)
+
+
+@pytest.mark.parametrize(
+    "body, kind",
+    [
+        # a bitwise op the reader does not model over an integer load
+        (
+            "%j = tt.load %q : !tt.ptr<i32>\n%c1 = arith.constant 1 : i32\n"
+            "%x = arith.xori %j, %c1 : i32\n"
+            "%a = tt.addptr %q, %x : !tt.ptr<i32>, i32\n"
+            "tt.store %a, %c1 : !tt.ptr<i32>",
+            TTIRKind.INDIRECT_ADDRESS,
+        ),
+        # casts of an integer load, in a loop bound
+        (
+            "%j = tt.load %q : !tt.ptr<i32>\n%f = arith.sitofp %j : i32 to f32\n"
+            "%u = arith.fptosi %f : f32 to i32\n%c0 = arith.constant 0 : i32\n"
+            "%c1 = arith.constant 1 : i32\n"
+            "scf.for %i = %c0 to %u step %c1 : i32 {\n"
+            "tt.store %q, %c0 : !tt.ptr<i32>\n}",
+            TTIRKind.DATA_DEPENDENT_BOUND,
+        ),
+        # a float load cast to an integer, in an address
+        (
+            "%v = tt.load %p : !tt.ptr<f32>\n%i = arith.fptosi %v : f32 to i32\n"
+            "%a = tt.addptr %q, %i : !tt.ptr<i32>, i32\n"
+            "tt.store %a, %i : !tt.ptr<i32>",
+            TTIRKind.INDIRECT_ADDRESS,
+        ),
+        # i1 arithmetic over a load
+        (
+            "%b = tt.load %r : !tt.ptr<i1>\n%s = arith.addi %b, %b : i1\n"
+            "%e = arith.extui %s : i1 to i32\n"
+            "%a = tt.addptr %q, %e : !tt.ptr<i32>, i32\n"
+            "tt.store %a, %e : !tt.ptr<i32>",
+            TTIRKind.INDIRECT_ADDRESS,
+        ),
+        # a loop-carried integer that starts as a load
+        (
+            "%j = tt.load %q : !tt.ptr<i32>\n%c0 = arith.constant 0 : i32\n"
+            "%c1 = arith.constant 1 : i32\n%o = scf.for %i = %c0 to %c1 step %c1 "
+            "iter_args(%x = %j) -> (i32) : i32 {\n"
+            "%a = tt.addptr %q, %x : !tt.ptr<i32>, i32\n"
+            "tt.store %a, %c0 : !tt.ptr<i32>\nscf.yield %x : i32\n}",
+            TTIRKind.INDIRECT_ADDRESS,
+        ),
+    ],
+)
+def test_a_value_made_from_a_load_refuses_alike_in_both_modes(body, kind):
+    text = _module(body, "%p: !tt.ptr<f32>, %q: !tt.ptr<i32>, %r: !tt.ptr<i1>")
+    for options in ({}, {"multipath": True}):
+        with pytest.raises(UnsupportedTTIR) as e:
+            parse_ttir(text, **options)
+        assert e.value.kind is kind

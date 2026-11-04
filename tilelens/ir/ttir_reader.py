@@ -11,7 +11,8 @@ nodes) and are substituted with concrete launch values later;
 
 Why TTIR (not TTGIR): element addressing is cleanest here, before
 layouts/pipelining add noise, and TTIR has no indirect loads unless the
-kernel itself gathers — the data-dependent case, marked with ``DataDep``.
+kernel itself gathers — the data-dependent case, marked with ``DataDep``
+(with ``parse_ttir(multipath=True)``, an integer load is a ``Loaded``).
 
 This module is mechanism-only: it reads and flags (``DataDep`` markers,
 ``guarded`` accesses, width obligations, ``UnsupportedTTIR``); what to do
@@ -34,7 +35,7 @@ the element offset escapes ``[0, numel)`` of its base tensor.
 Integer model: every integer term denotes the IR value's SIGNED
 reading as an unbounded integer (i1 terms are booleans, 0/1). That reading
 is exact while the ``width_obligations`` of the access hold (they include
-the loop's own increment); a consumer that evaluates terms with unbounded
+the loops' own increments); a consumer that evaluates terms with unbounded
 integers must discharge (or report) them. ``Param`` values are the IR's
 signed reading of the argument too. Division or remainder by zero is
 undefined in the IR rather than a width condition, and so is an scf.for
@@ -282,6 +283,11 @@ class IntCast:
 @dataclass(frozen=True)
 class DataDep:
     why: str = "value derived from loaded data"
+    # Under parse_ttir(multipath=True), for an i1 ``and`` with an operand
+    # that cannot be modeled: the modelable conjunct(s). The value implies
+    # ``keep``, so an access's mask is ``keep`` instead of free (still
+    # ``mask_dropped``: wider than the real mask). Not a value dependency.
+    keep: "Term | None" = None
 
 
 @dataclass(frozen=True)
@@ -307,6 +313,29 @@ class Observed:
     access_index: int
 
 
+@dataclass(frozen=True)
+class Loaded:
+    """The value the ``tt.load`` at ``graph.accesses[access_index]`` read,
+    bound under ``parse_ttir(multipath=True)`` to an integer-typed load
+    whose mask is modeled (a float or pointer load, or one with a dropped
+    mask, keeps DataDep): at the lane the surrounding term is read at, the
+    element at ``offset`` of the load's base where ``mask`` holds, and
+    ``other`` (None: any value) where it does not. The element is read in
+    the load's own integer type: through a same-width pointer bitcast (an
+    ``f32`` base read as ``i32``) it is the base's bits reinterpreted, not
+    its value converted. ``offset``, ``mask`` and ``other`` are the load's
+    own terms with their lanes placed where the value is read (an
+    ``expand_dims`` of the loaded tile re-places them like any lane term),
+    so unlike an Observed, lanes of one load may meet. What a loaded value
+    means (memory contents, a free value, a refusal) is each consumer's
+    policy; find them with :func:`loaded_indices`."""
+
+    access_index: int
+    offset: "Term"
+    mask: "Term | None"
+    other: "Term | None"
+
+
 Term = (
     Const
     | Pid
@@ -323,6 +352,7 @@ Term = (
     | IntCast
     | DataDep
     | Observed
+    | Loaded
 )
 
 
@@ -335,6 +365,10 @@ def _children(t: object) -> tuple:
         return (t.a,)
     if isinstance(t, IntCast):
         return (t.x,)
+    if isinstance(t, Loaded):
+        return tuple(x for x in (t.offset, t.mask, t.other) if x is not None)
+    if isinstance(t, DataDep) and t.keep is not None:
+        return (t.keep,)
     return ()
 
 
@@ -342,7 +376,8 @@ def _nodes(
     roots: Iterable[object], iter_args: "Sequence[IterArgInfo] | None"
 ) -> Iterator[object]:
     """Every node reachable from ``roots`` in pre-order, each once (by
-    identity); with ``iter_args``, an IterArgOffset also reaches its
+    identity), a Loaded's offset, mask and other and a DataDep's keep
+    included; with ``iter_args``, an IterArgOffset also reaches its
     IterArgInfo's ``offset0`` and ``delta``. Iterative: terms can be deeper
     than Python's recursion limit."""
     seen: set[int] = set()
@@ -376,6 +411,35 @@ def observed_indices(term: object, graph: "AccessGraph") -> frozenset[int]:
         for n in _nodes((term,), graph.iter_args)
         if isinstance(n, Observed)
     )
+
+
+def loaded_indices(term: object, graph: "AccessGraph") -> frozenset[int]:
+    """The access indices of every :class:`Loaded` leaf ``term`` reaches,
+    through loop-carried pointers (see :func:`mentions_observed`) and
+    through the ``lower``, ``upper`` and ``step`` of the loop of each
+    LoopVar and loop-carried pointer it reaches (the bounds give the
+    iterations, and so the values, there are). Whether an access runs at
+    all also depends on the bounds of its enclosing loops: scan
+    ``graph.loop_info(name)`` for each name in ``access.loops`` too."""
+    found: set[int] = set()
+    seen: set[str] = set()
+    roots: list[object] = [term]
+    while roots:
+        names: list[str | None] = []
+        for n in _nodes(roots, graph.iter_args):
+            if isinstance(n, Loaded):
+                found.add(n.access_index)
+            elif isinstance(n, LoopVar):
+                names.append(n.loop_ssa)
+            elif isinstance(n, IterArgOffset):
+                names.append(graph.iter_args[n.arg_id].loop_ssa)
+        roots = []
+        for name in names:
+            lp = graph.loop_info(name) if name else graph.loop
+            if lp is not None and lp.loop_ssa not in seen:
+                seen.add(lp.loop_ssa)
+                roots += [lp.lower, lp.upper, lp.step]
+    return frozenset(found)
 
 
 # DataDep is also the generic unknown-value top (loop accumulators,
@@ -438,16 +502,18 @@ class AccessEvent:
     elem_bits: int
     loc: SourceLoc | None
     line_no: int
-    # True when some enclosing scf.if condition could NOT be modeled (it
-    # derives from loaded data). The access is then checked as if
+    # True when some enclosing scf.if condition (or, under multipath, a
+    # branch into its cf block) could NOT be modeled (it derives from
+    # loaded data). The access is then checked as if
     # unconditional: UNSAT stays a sound proof, but a SAT model may sit in a
     # branch the launch never takes. Modeled conditions ride in ``path``
     # instead and do not set this flag.
     guarded: bool = False
     # Conjunction of the MODELED enclosing branch conditions, with
-    # else-regions negated (Not). The access executes iff path ∧ mask.
+    # else-regions negated (Not), after its cf block's predicate under
+    # multipath. The access executes iff path ∧ mask.
     path: Term | None = None
-    # True when the access sits inside the scf.for body: it executes once
+    # True when the access sits inside an scf.for body: it executes once
     # per iteration — and NOT AT ALL when the launch's trip count is zero,
     # which consumers must model (a zero-trip loop has no footprint).
     in_loop: bool = False
@@ -478,13 +544,17 @@ class AccessEvent:
     # to the access's own block (one block per region the access sits in).
     # () only in a hand-built graph, where it reads as the function body.
     block_path: tuple[int, ...] = ()
+    # The enclosing scf.for loops (LoopInfo.loop_ssa), outermost first;
+    # ``in_loop == bool(loops)`` (a hand-built graph may leave it empty).
+    loops: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class Fence:
     """A ``ttg.barrier`` (what ``tl.debug_barrier()`` prints), at its place
     among the accesses: after ``position + 0.5`` of them. ``path``,
-    ``guarded``, ``in_loop`` and ``block_path`` read as an access's do."""
+    ``guarded``, ``in_loop``, ``block_path`` and ``loops`` read as an
+    access's do."""
 
     position: float
     op: str
@@ -497,6 +567,7 @@ class Fence:
     block_path: tuple[int, ...]
     line_no: int
     loc: SourceLoc | None
+    loops: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -539,6 +610,8 @@ class IterArgInfo:
 
 @dataclass(frozen=True)
 class LoopInfo:
+    # "%loop" for the first scf.for to open, "%loop<n>" for the n-th after
+    # it (parse_ttir(multipath=True) reads several)
     loop_ssa: str
     lower: Term
     upper: Term
@@ -557,7 +630,7 @@ class AccessGraph:
     kernel_name: str
     func_args: tuple[FuncArg, ...]
     accesses: tuple[AccessEvent, ...]
-    loop: LoopInfo | None
+    loop: LoopInfo | None  # the scf.for when there is exactly one
     # Loop-carried pointers, indexed by arg_id (``iter_args[k].arg_id == k``),
     # expanded tiles of them included (see IterArgInfo).
     iter_args: tuple[IterArgInfo, ...] = ()
@@ -567,17 +640,31 @@ class AccessGraph:
     pid_axes: frozenset[int] = frozenset()
     fences: tuple[Fence, ...] = ()
     whiles: tuple[WhileRegion, ...] = ()  # only under while_regions=True
+    # Every scf.for in opening order (outer before inner); more than one
+    # only under multipath=True. A graph built with only ``loop`` gets
+    # ``loops == (loop,)``, and one built with a single entry in ``loops``
+    # gets it as ``loop``.
+    loops: tuple[LoopInfo, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "pid_axes", frozenset(self.pid_axes))
-        for name in ("func_args", "accesses", "iter_args", "fences", "whiles"):
+        names = ("func_args", "accesses", "iter_args", "fences", "whiles", "loops")
+        for name in names:
             object.__setattr__(self, name, tuple(getattr(self, name)))
+        if not self.loops and self.loop is not None:
+            object.__setattr__(self, "loops", (self.loop,))
+        elif self.loop is None and len(self.loops) == 1:
+            object.__setattr__(self, "loop", self.loops[0])
 
     def arg(self, name: str) -> FuncArg | None:
         for a in self.func_args:
             if a.name == name:
                 return a
         return None
+
+    def loop_info(self, loop_ssa: str) -> LoopInfo | None:
+        """The LoopInfo named ``loop_ssa``, or None."""
+        return next((lp for lp in self.loops if lp.loop_ssa == loop_ssa), None)
 
 
 # ─────────────────────────── width obligations ───────────────────────────
@@ -603,7 +690,7 @@ def width_obligations(
 ) -> tuple[WidthObligation, ...]:
     """The conditions under which the unbounded-integer reading of
     ``access`` (its offset, mask and path, loop-carried pointers resolved,
-    and the loop of an access in the loop) equals the IR's fixed-width
+    and each loop enclosing the access) equals the IR's fixed-width
     arithmetic:
 
     * every integer ``Bin`` result fits its width, signed;
@@ -613,24 +700,28 @@ def width_obligations(
     * a ``trunci`` operand fits the destination width (to i1: is 0 or 1);
     * an ``extui`` operand is non-negative;
     * the bounds of an ``unsigned`` loop are non-negative;
-    * the loop's increment does not wrap: ``upper - 1 + step``, which
+    * each loop's increment does not wrap: ``upper - 1 + step``, which
       bounds the last iterate plus ``step``, fits the induction variable
       (sufficient, not necessary).
 
-    ``role`` says where an obligation comes from: ``"loop"`` (the loop's
-    bounds and increment), ``"path"``, ``"mask"`` or ``"offset"``. A term
-    node several parts share is listed once, under the first role in that
-    order, and the order is also the discipline for discharging them: an
-    ``offset`` obligation only matters where the access executes (path and
-    mask hold), a ``mask`` one only where the path holds, and ``path`` and
-    ``loop`` ones hold unconditionally (the increment's only when the loop
-    runs at least once). Both arms of a ``Select`` are listed, without its
-    condition, so checking an arm unconditionally may report an overflow in
-    the arm the launch does not take.
+    ``role`` says where an obligation comes from: ``"loop"`` (the loops'
+    bounds and increments, outermost loop first), ``"path"``, ``"mask"`` or
+    ``"offset"``. A term node several parts share is listed once, under the
+    first role in that order, and the order is also the discipline for
+    discharging them: an ``offset`` obligation only matters where the
+    access executes (path and mask hold), a ``mask`` one only where the path
+    holds, ``path`` ones hold unconditionally and ``loop`` ones wherever the
+    loop is reached (the increment's only when it runs at least once), which
+    is everywhere unless a multipath graph nests the loop under a branch;
+    the access's own path implies that its loops are reached, so it guards
+    their obligations soundly. Both arms of a ``Select`` are listed, without
+    its condition, so checking an arm unconditionally may report an overflow
+    in the arm the launch does not take. Likewise a :class:`Loaded`'s
+    ``offset``, ``mask`` and ``other`` are listed under the role of the term
+    that reads it, without the load's mask.
 
     Mechanism only: listed role by role in walk order, each (term node,
     width, signedness) once; nothing is evaluated."""
-    loop = graph.loop if access.in_loop else None
     out: list[WidthObligation] = []
     seen: set[tuple[int, int, bool]] = set()
 
@@ -650,7 +741,7 @@ def width_obligations(
             )
 
     groups: list[tuple[str, tuple[object, ...]]] = []
-    if loop is not None:
+    for loop in _enclosing_loops(graph, access):
         if loop.bits is not None:
             if loop.unsigned:
                 for bound in (loop.lower, loop.upper, loop.step):
@@ -691,16 +782,53 @@ def width_obligations(
     return tuple(out)
 
 
+def _enclosing_loops(graph: AccessGraph, access: AccessEvent) -> list[LoopInfo]:
+    """The LoopInfos of ``access.loops``, outermost first (``graph.loop`` for
+    an in-loop access of a hand-built single-loop graph that names none)."""
+    if not access.loops:
+        return [graph.loop] if access.in_loop and graph.loop is not None else []
+    found = [graph.loop_info(name) for name in access.loops]
+    if None in found:
+        raise ValueError(
+            f"kernel {graph.kernel_name!r}: unknown loop in {access.loops}"
+        )
+    return found  # type: ignore[return-value]
+
+
 # ─────────────────────────── the reader ───────────────────────────
 
 
-def parse_ttir(text: str, *, while_regions: bool = False) -> AccessGraph:
-    """Read one TTIR module into an AccessGraph (single-path model: at most
-    one scf.for, structured scf.if only).
+def parse_ttir(
+    text: str, *, while_regions: bool = False, multipath: bool = False
+) -> AccessGraph:
+    """Read one TTIR module into an AccessGraph (by default the single-path
+    model: at most one scf.for, structured scf.if only).
 
     ``while_regions=True`` reads each ``scf.while`` too (a ``WhileRegion`` in
     ``graph.whiles``) instead of refusing it as control flow; a kernel
     without one reads the same either way.
+
+    ``multipath=True`` reads four more facts:
+
+    * several ``scf.for`` loops, sequential, nested or under a branch, each
+      with its own LoopInfo (``graph.loops``) and induction variable, and
+      each access's enclosing loops (``AccessEvent.loops``); ``graph.loop``
+      is set only for a single loop;
+    * the unstructured blocks Triton prints for an ``if`` that holds a
+      ``return`` (``cf.br`` / ``cf.cond_br`` / ``tt.return``): a block's
+      predicate, the disjunction of its incoming edges (the predecessor's
+      predicate and the branch condition, negated on the false edge), is
+      the outermost conjunct of the path of every access in it, and a block
+      argument is a Select over its incoming edges' operands; an edge whose
+      condition is not modelable keeps only the predecessor's predicate and
+      leaves the block ``guarded`` with its arguments DataDep;
+    * an integer ``tt.load`` result whose mask is modeled as
+      :class:`Loaded` instead of DataDep;
+    * a mask that is an ``and`` of modelable and unmodelable values as its
+      modelable conjuncts (``DataDep.keep``), still ``mask_dropped``.
+
+    Each starts at a refusal of the default model (a second loop, a cf
+    block) or a DataDep, so a kernel without them reads the same either way.
 
     Raises :class:`UnsupportedTTIR` for anything the graph cannot represent:
     a text the walk layer cannot align (``READER_MISALIGNMENT``) or does not
@@ -722,7 +850,7 @@ def parse_ttir(text: str, *, while_regions: bool = False) -> AccessGraph:
         raise UnsupportedTTIR(
             TTIRKind.UNPARSABLE, e.diagnostic, line_no=e.line_no
         ) from e
-    return _Builder(module, while_regions).build()
+    return _Builder(module, while_regions, multipath).build()
 
 
 # Memory ops outside the modeled vocabulary (TMA descriptors, ...: targets
@@ -771,10 +899,11 @@ _ELEMENTWISE = _OPAQUE | {
 # Structured-region nesting the reader follows (deeper refuses, instead of
 # exhausting Python's recursion limit).
 _MAX_DEPTH = 200
-_LOOP_SSA = "%loop"  # the single-path model has at most one loop
+_LOOP_SSA = "%loop"  # the first loop's name (LoopInfo.loop_ssa)
 # The DataDep reason of a value carried by the loop that is not a pointer:
 # in an address it makes the address loop-variant.
 _LOOP_CARRIED = "loop accumulator"
+_EARLY_ARG = "argument of a block entered early"
 _RE_ADDR_SPACE = re.compile(r", (\d+)>$")
 
 
@@ -793,8 +922,30 @@ class _IfFrame:
     branch: str = "then"
 
 
+@dataclass
 class _ForFrame:
     """Marks the scf.for body being read."""
+
+    loop_ssa: str
+
+
+@dataclass
+class _Block:
+    """Walker state for one block of a function body with several blocks
+    (multipath=True). ``edges`` are its incoming edges recorded at the
+    predecessors' branches, (path, exact, operand values): ``exact`` is
+    False when the branch condition could not be modeled. A block entered
+    before all its predecessors' branches were read is not ``resolved``: its
+    predicate is unknown, so an access, fence or branch in it refuses, and
+    so does an address made from one of its arguments (MLIR's block merging
+    can print a shared tail, a return-only one or not, before one of its
+    predecessors)."""
+
+    n_preds: int
+    edges: list[tuple[Term | None, bool, list[object]]] = field(default_factory=list)
+    pred: Term | None = None
+    guarded: bool = False
+    resolved: bool = True
 
 
 @dataclass
@@ -825,16 +976,18 @@ def _pointee_bits(pointee: str | None) -> int:
 
 
 class _Builder:
-    def __init__(self, module: Module, while_regions: bool = False) -> None:
+    def __init__(
+        self, module: Module, while_regions: bool = False, multipath: bool = False
+    ) -> None:
         self.m = module
         self.while_regions = while_regions
+        self.multipath = multipath
         # value index -> Term (int/bool), PtrValue, or DataDep
         self.env: dict[int, object] = {}
         self.func_args: list[FuncArg] = []
         self.accesses: list[AccessEvent] = []
         self.iter_args: list[IterArgInfo] = []
-        self.loop: LoopInfo | None = None
-        self.loops_opened = 0
+        self.loops: list[LoopInfo | None] = []  # in opening order, set on closing
         self.fences: list[Fence] = []
         self.whiles: list[WhileRegion | None] = []
         self.frames: list[_IfFrame | _ForFrame | _WhileFrame] = []
@@ -848,6 +1001,12 @@ class _Builder:
         # it reads lane for lane (see positional)
         self.access_op: dict[int, int] = {}
         self.prov: dict[int, frozenset[int]] = {}
+        # the block being read of a function body with several blocks, and
+        # all of them by block index
+        self.cf: _Block | None = None
+        self.cf_table: dict[int, _Block] = {}
+        # id(term) -> (term, whether it reaches a Loaded), see reads_loaded
+        self.loaded_memo: dict[int, tuple[object, bool]] = {}
 
     # ── helpers ──
     def refuse(self, kind: TTIRKind, message: str, op: Op | None) -> NoReturn:
@@ -870,6 +1029,21 @@ class _Builder:
         for r in op.results:
             self.env[r] = value
 
+    def reads_loaded(self, x: object) -> bool:
+        """True when the term ``x`` reaches a Loaded (multipath only): such a
+        value derives from memory, as its DataDep would by default."""
+        if not self.multipath or isinstance(x, (DataDep, PtrValue)):
+            return False
+        hit = self.loaded_memo.get(id(x))
+        if hit is None or hit[0] is not x:
+            reach = any(isinstance(n, Loaded) for n in _nodes((x,), None))
+            hit = self.loaded_memo[id(x)] = (x, reach)
+        return hit[1]
+
+    def data_dep(self, operands: Iterable[object], why: str) -> DataDep:
+        """_data_dep, a term that reads a Loaded counted as memory-derived."""
+        return _data_dep(operands, why, self.reads_loaded)
+
     def as_term(self, v: object, ctx: str, op: Op) -> Term:
         if isinstance(v, DataDep):
             self.refuse(TTIRKind.OTHER, f"{ctx}: data-dependent ({v.why})", op)
@@ -880,17 +1054,19 @@ class _Builder:
     def int_bits(self, v: int) -> int | None:
         return parse_type(parse_type(self.m.values[v].type).elem).int_bits
 
-    def branch_state(self) -> tuple[bool, Term | None, bool]:
-        """(guarded, path, in_loop) for an access under the open frames:
-        ``guarded`` if any enclosing condition is unmodeled; ``path`` is the
-        conjunction of the modeled ones (else-regions negated), outermost
-        first; ``in_loop`` when the scf.for body encloses the access."""
+    def branch_state(self, op: Op) -> tuple[bool, Term | None, tuple[str, ...]]:
+        """(guarded, path, loops) for an access (or fence) ``op`` under the
+        open frames: ``guarded`` if any enclosing condition is unmodeled;
+        ``path`` is the conjunction of the modeled ones (else-regions
+        negated), outermost first, after the predicate of the cf block
+        holding them; ``loops`` the enclosing scf.for loops, outermost
+        first."""
         guarded = False
         path: Term | None = None
-        in_loop = False
+        loops: list[str] = []
         for f in self.frames:
             if isinstance(f, _ForFrame):
-                in_loop = True
+                loops.append(f.loop_ssa)
                 continue
             if isinstance(f, _WhileFrame):
                 continue
@@ -898,8 +1074,19 @@ class _Builder:
                 guarded = True
                 continue
             c: Term = f.cond if f.branch == "then" else Not(f.cond)
-            path = c if path is None else BoolBin("and", path, c)
-        return guarded, path, in_loop
+            path = _conj(path, c)
+        blk = self.cf
+        if blk is not None:
+            if not blk.resolved:
+                self.refuse(
+                    TTIRKind.CONTROL_FLOW,
+                    f"{op.name} in a block entered before its predecessors",
+                    op,
+                )
+            guarded = guarded or blk.guarded
+            if blk.pred is not None:
+                path = blk.pred if path is None else BoolBin("and", blk.pred, path)
+        return guarded, path, tuple(loops)
 
     def arg(self, name: str) -> FuncArg | None:
         return next((a for a in self.func_args if a.name == name), None)
@@ -953,18 +1140,22 @@ class _Builder:
         for fa in func.args:
             self.bind_arg(fa, fop)
         body = fop.regions[0]
-        self.block(body[0])
-        if len(body) > 1:
+        if self.multipath and len(body) > 1:
+            self.cf_blocks(body)
+        else:
+            self.block(body[0])
+        if len(body) > 1 and not self.multipath:
             self.refuse(
                 TTIRKind.CONTROL_FLOW,
                 f"tt.func {func.sym_name!r} has {len(body)} blocks",
                 fop,
             )
+        loops = tuple(self.loops)
         return AccessGraph(
             kernel_name=func.sym_name,
             func_args=tuple(self.func_args),
             accesses=tuple(self.accesses),
-            loop=self.loop,
+            loop=loops[0] if len(loops) == 1 else None,  # type: ignore[arg-type]
             iter_args=tuple(self.iter_args),
             pid_axes=frozenset(
                 op.attrs["axis"]
@@ -973,6 +1164,7 @@ class _Builder:
             ),
             fences=tuple(self.fences),
             whiles=tuple(self.whiles),  # type: ignore[arg-type]
+            loops=loops,  # type: ignore[arg-type]
         )
 
     def bind_arg(self, fa, fop: Op) -> None:
@@ -1072,7 +1264,7 @@ class _Builder:
             aid = len(self.iter_args)
             offset0 = _expand_dims(src.offset0, axis)
             self.iter_args.append(
-                IterArgInfo(aid, src.base_param, offset0, Const(0), _LOOP_SSA)  # type: ignore[arg-type]
+                IterArgInfo(aid, src.base_param, offset0, Const(0), src.loop_ssa)  # type: ignore[arg-type]
             )
             self.expanded[key] = aid
         return IterArgOffset(aid)
@@ -1080,6 +1272,9 @@ class _Builder:
     def op_cast(self, op: Op) -> None:
         x = self.val(op.operands[0])
         if isinstance(x, (DataDep, PtrValue)):
+            # a cast of an i1 widens it: its keep (an i1 fact) stays behind
+            if isinstance(x, DataDep) and x.keep is not None:
+                x = DataDep(x.why)
             self.bind(op, x)
             return
         kind = op.name.split(".", 1)[1]
@@ -1126,9 +1321,9 @@ class _Builder:
         a, b = self.val(op.operands[0]), self.val(op.operands[1])
         bits = self.int_bits(op.results[0])
         if isinstance(a, DataDep) or isinstance(b, DataDep):
-            self.bind(op, _data_dep((a, b), "arith over loaded data"))
+            self.bind(op, self.data_dep((a, b), "arith over loaded data"))
         elif bits == 1:
-            self.bind(op, DataDep(f"{op.name} on i1"))
+            self.bind(op, self.data_dep((a, b), f"{op.name} on i1"))
         else:
             self.bind(
                 op,
@@ -1147,10 +1342,10 @@ class _Builder:
         pred = op.attrs["predicate"]
         bits = self.int_bits(op.operands[0])
         if isinstance(a, DataDep) or isinstance(b, DataDep):
-            self.bind(op, _data_dep((a, b), "cmpi over loaded data"))
+            self.bind(op, self.data_dep((a, b), "cmpi over loaded data"))
         elif bits == 1 and pred in _SIGNED_PREDICATES:
             # a signed i1 reads true as -1; the boolean model reads it as 1
-            self.bind(op, DataDep("signed comparison of i1 values"))
+            self.bind(op, self.data_dep((a, b), "signed comparison of i1 values"))
         else:
             self.bind(
                 op,
@@ -1177,8 +1372,15 @@ class _Builder:
         a, b = self.val(op.operands[0]), self.val(op.operands[1])
         is_and = op.name == "arith.andi"
         if isinstance(a, DataDep) or isinstance(b, DataDep):
-            why = _data_dep((a, b), "bool op over loaded data").why
-            self.bind(op, DataDep(why))
+            why = self.data_dep((a, b), "bool op over loaded data").why
+            keep: Term | None = None
+            if is_and and self.multipath:
+                # ``modelable and unmodelable`` implies ``modelable``
+                for x in (a, b):
+                    part = x.keep if isinstance(x, DataDep) else x
+                    if part is not None:
+                        keep = _conj(keep, part)  # type: ignore[arg-type]
+            self.bind(op, DataDep(why, keep))
             return
         self.bind(
             op,
@@ -1201,7 +1403,7 @@ class _Builder:
             or isinstance(t, DataDep)
             or (isinstance(f, DataDep))
         ):
-            return _data_dep((c, t, f), "select over loaded data")
+            return self.data_dep((c, t, f), "select over loaded data")
         if isinstance(t, PtrValue) and isinstance(f, PtrValue):
             if t.base_param != f.base_param:
                 return DataDep(f"{what} of pointers with different bases")
@@ -1223,7 +1425,9 @@ class _Builder:
             else:
                 self.bind(op, DataDep("pointer bitcast changes the element width"))
             return
-        self.bind(op, _data_dep((x,), f"unmodeled op {op.name} at line {op.line_no}"))
+        self.bind(
+            op, self.data_dep((x,), f"unmodeled op {op.name} at line {op.line_no}")
+        )
 
     # ── accesses ──
     def access(
@@ -1259,14 +1463,16 @@ class _Builder:
             mv = self.val(mask_v)
             if isinstance(mv, DataDep):
                 # Mask derived from loaded data: over-approximate it as free
-                # (any lane may be active) instead of failing the kernel.
-                # See AccessEvent.mask_dropped for the soundness discipline.
+                # (any lane may be active), or as its modelable conjuncts,
+                # instead of failing the kernel. See AccessEvent.mask_dropped
+                # for the soundness discipline.
                 mask_dropped = True
+                mask = mv.keep
             elif isinstance(mv, PtrValue):
                 self.refuse(TTIRKind.OTHER, "pointer as mask", op)
             else:
                 mask = mv  # type: ignore[assignment]
-        guarded, path, in_loop = self.branch_state()
+        guarded, path, loops = self.branch_state(op)
         assert op.line_no is not None
         # the value operands: a store's value and mask, an atomic_rmw's val
         # and mask, an atomic_cas's cmp and val (ODS order, after the pointer)
@@ -1283,7 +1489,7 @@ class _Builder:
                 line_no=op.line_no,
                 guarded=guarded,
                 path=path,
-                in_loop=in_loop,
+                in_loop=bool(loops),
                 mask_dropped=mask_dropped,
                 atomic=atomic,
                 atomic_val=atomic_val,
@@ -1293,6 +1499,7 @@ class _Builder:
                 and parse_type(pointee).pointee is None,
                 deps=deps,
                 block_path=op.path,
+                loops=loops,
             )
         )
 
@@ -1366,8 +1573,22 @@ class _Builder:
         if any(isinstance(f, _WhileFrame) and f.stage == "before" for f in self.frames):
             # a poll: what the loop's condition reads
             self.bind(op, self.observed_binding(op, "loaded value"))
+        elif self.multipath:
+            self.bind(op, self.loaded_binding(op, mask_v))
         else:
             self.bind(op, DataDep("loaded value"))
+
+    def loaded_binding(self, op: Op, mask_v: int | None) -> object:
+        """The value of the just-recorded load: Loaded for an integer-typed
+        result whose mask is modeled, DataDep otherwise (see Loaded)."""
+        index = len(self.accesses) - 1
+        acc = self.accesses[index]
+        if acc.mask_dropped or self.int_bits(op.results[0]) is None:
+            return DataDep("loaded value")
+        other = None  # ODS (ptr, mask?, other?): other follows a mask
+        if mask_v is not None and len(op.operands) == 3:
+            other = _operand_term(self.val(op.operands[2]))
+        return Loaded(index, acc.offset, acc.mask, other)
 
     def op_store(self, op: Op) -> None:
         # ODS operands (ptr, value, mask?)
@@ -1401,8 +1622,10 @@ class _Builder:
         # The single-path model has one induction variable: a second loop
         # (sequential or nested) cannot be represented, and a loop under an
         # scf.if runs a branch-dependent iteration count — a control-flow
-        # limitation, not one more induction variable.
-        if self.loops_opened or self.frames:
+        # limitation, not one more induction variable. Multipath reads each
+        # loop with its own, except inside an scf.while.
+        in_while = any(isinstance(f, _WhileFrame) for f in self.frames)
+        if (self.loops or self.frames) and (not self.multipath or in_while):
             self.refuse(
                 TTIRKind.CONTROL_FLOW
                 if any(isinstance(f, _IfFrame) for f in self.frames)
@@ -1410,7 +1633,9 @@ class _Builder:
                 "multiple/nested loops",
                 op,
             )
-        self.loops_opened += 1
+        index = len(self.loops)
+        loop_ssa = f"{_LOOP_SSA}{index}" if index else _LOOP_SSA
+        self.loops.append(None)  # set on closing, after the nested ones
         bounds: dict[str, Term] = {}
         for label, v in zip(("lower", "upper", "step"), op.operands[:3]):
             bv = self.val(v)
@@ -1434,22 +1659,22 @@ class _Builder:
             bounds[label] = self.as_term(bv, f"loop {label}", op)
         body = self.m.blocks[op.regions[0][0]]
         iv, carried = body.args[0], body.args[1:]
-        self.env[iv] = LoopVar(_LOOP_SSA)
+        self.env[iv] = LoopVar(loop_ssa)
         ptr_args: list[tuple[int, int]] = []  # (iter_arg position, arg_id)
         for k, (arg_v, init_v) in enumerate(zip(carried, op.operands[3:])):
             init = self.val(init_v)
             if isinstance(init, PtrValue):
                 aid = len(self.iter_args)
                 self.iter_args.append(
-                    IterArgInfo(aid, init.base_param, init.offset, Const(0), _LOOP_SSA)
+                    IterArgInfo(aid, init.base_param, init.offset, Const(0), loop_ssa)
                 )
                 self.env[arg_v] = PtrValue(init.base_param, IterArgOffset(aid))
                 ptr_args.append((k, aid))
             elif isinstance(init, DataDep):
                 self.env[arg_v] = DataDep(init.why)
             else:
-                self.env[arg_v] = DataDep(_LOOP_CARRIED)
-        self.frames.append(_ForFrame())
+                self.env[arg_v] = self.data_dep((init,), _LOOP_CARRIED)
+        self.frames.append(_ForFrame(loop_ssa))
         self.block(op.regions[0][0])
         self.frames.pop()
         yield_op = self.m.ops[body.ops[-1]]
@@ -1459,6 +1684,8 @@ class _Builder:
         # Expanded tiles advance by their source's delta, expanded alike (a
         # source precedes the tiles expanded from it).
         for (src, axis), aid in self.expanded.items():
+            if self.iter_args[src].loop_ssa != loop_ssa:
+                continue
             source = self.iter_args[src].delta
             if any(
                 isinstance(n, Observed) and n.access_index in self.lane_observed
@@ -1472,8 +1699,8 @@ class _Builder:
                 )
             expanded = _expand_dims(source, axis)
             self.iter_args[aid] = replace(self.iter_args[aid], delta=expanded)  # type: ignore[arg-type]
-        self.loop = LoopInfo(
-            loop_ssa=_LOOP_SSA,
+        self.loops[index] = LoopInfo(
+            loop_ssa=loop_ssa,
             lower=bounds["lower"],
             upper=bounds["upper"],
             step=bounds["step"],
@@ -1490,6 +1717,7 @@ class _Builder:
         same base: the model reads iteration k's offset as
         ``offset0 + k * delta``."""
         info = self.iter_args[aid]
+        loop = info.loop_ssa
         if not isinstance(y, PtrValue) or y.base_param != info.base_param:
             self.refuse(
                 TTIRKind.LOOP_VARIANT_ADVANCE,
@@ -1505,11 +1733,17 @@ class _Builder:
                 "its own previous value",
                 op,
             )
+        # variant in this loop: its induction variable, one of its carried
+        # pointers, or a value an access inside it read (an enclosing
+        # loop's are invariant here)
         for n in _nodes((delta,), None):
             if (
-                isinstance(n, (LoopVar, IterArgOffset))
-                or isinstance(n, Observed)
-                and self.accesses[n.access_index].in_loop
+                isinstance(n, LoopVar)
+                and n.loop_ssa == loop
+                or isinstance(n, IterArgOffset)
+                and self.iter_args[n.arg_id].loop_ssa == loop
+                or isinstance(n, (Observed, Loaded))
+                and loop in self.accesses[n.access_index].loops
             ):
                 self.refuse(
                     TTIRKind.LOOP_VARIANT_ADVANCE,
@@ -1540,7 +1774,7 @@ class _Builder:
             self.refuse(TTIRKind.OTHER, "scf.if with results but no else region", op)
         for k, r in enumerate(op.results):
             if cond is None:
-                self.env[r] = _data_dep((cv,), "select over loaded data")
+                self.env[r] = self.data_dep((cv,), "select over loaded data")
             else:
                 self.env[r] = self.merge(cond, yields[0][k], yields[1][k], "scf.if")
 
@@ -1589,7 +1823,7 @@ class _Builder:
         frame.stage, frame.split = "after", len(self.accesses)
 
     def op_barrier(self, op: Op) -> None:
-        guarded, path, in_loop = self.branch_state()
+        guarded, path, loops = self.branch_state(op)
         assert op.line_no is not None
         self.fences.append(
             Fence(
@@ -1598,12 +1832,84 @@ class _Builder:
                 addr_space=op.attrs["addr_space"],
                 path=path,
                 guarded=guarded,
-                in_loop=in_loop,
+                in_loop=bool(loops),
                 block_path=op.path,
                 line_no=op.line_no,
                 loc=op.loc,
+                loops=loops,
             )
         )
+
+    # ── the blocks of an if that holds a return (multipath) ──
+    def cf_blocks(self, body: Sequence[int]) -> None:
+        """Read a function body with several blocks in printed order (see
+        parse_ttir). Triton places a block after its predecessors, except a
+        shared tail that MLIR's block merging may print before one of them,
+        and never branches back: the first block of a cycle is entered
+        before a predecessor, so its branch refuses. A terminator other than
+        a custom-form cf.br / cf.cond_br or tt.return refuses before any
+        block is read, so it is reported ahead of an earlier refusal."""
+        n_preds = dict.fromkeys(body, 0)
+        for b in body:
+            term = self.m.ops[self.m.blocks[b].ops[-1]]
+            if term.name in ("cf.br", "cf.cond_br") and "successors" in term.attrs:
+                for d in term.attrs["successors"]:
+                    n_preds[d] += 1
+            elif term.name != "tt.return":
+                self.op_control_flow(term)  # cf.switch, a generic-form branch
+        self.cf_table = {b: _Block(n_preds[b]) for b in body}
+        for b in body:
+            blk = self.cf = self.cf_table[b]
+            args = self.m.blocks[b].args if b != body[0] else ()
+            if len(blk.edges) < blk.n_preds:
+                blk.resolved = False
+                for v in args:
+                    self.env[v] = DataDep(_EARLY_ARG)
+            elif b != body[0]:
+                pred: Term | None = Cmp("ne", Const(0), Const(0))  # unreachable
+                for i, (path, _, _) in enumerate(blk.edges):
+                    pred = path if i == 0 else _disj(pred, path)
+                blk.pred = pred
+                blk.guarded = not all(exact for _, exact, _ in blk.edges)
+                for k, v in enumerate(args):
+                    self.env[v] = (
+                        DataDep("block argument")
+                        if blk.guarded
+                        else _merge_block_arg(blk.edges, k)
+                    )
+            self.block(b)
+        self.cf = None
+
+    def op_branch(self, op: Op) -> None:
+        """cf.br / cf.cond_br at the end of a block being read: its targets'
+        incoming edges."""
+        blk = self.cf
+        if blk is None or self.frames:
+            self.op_control_flow(op)
+        if not blk.resolved:
+            self.refuse(
+                TTIRKind.CONTROL_FLOW,
+                f"{op.name} in a block entered before its predecessors",
+                op,
+            )
+        operands = list(op.operands)
+        edges: list[tuple[Term | None, bool]] = [(blk.pred, not blk.guarded)]
+        if op.name == "cf.cond_br":
+            c = self.val(operands.pop(0))
+            if isinstance(c, (DataDep, PtrValue)):
+                # both targets stay reachable under the predecessor's
+                # predicate alone (a widening)
+                edges = [(blk.pred, False)] * 2
+            else:
+                ct: Term = c  # type: ignore[assignment]
+                edges = [
+                    (_conj(blk.pred, ct), not blk.guarded),
+                    (_conj(blk.pred, Not(ct)), not blk.guarded),
+                ]
+        for d, (path, exact) in zip(op.attrs["successors"], edges):
+            n = len(self.m.blocks[d].args)
+            passed, operands = operands[:n], operands[n:]
+            self.cf_table[d].edges.append((path, exact, [self.val(v) for v in passed]))
 
     # ── everything else ──
     def op_control_flow(self, op: Op) -> NoReturn:
@@ -1647,6 +1953,16 @@ class _Builder:
                 assert value.block is not None
                 src = m.ops[m.blocks[value.block].op]
                 if src.name == "tt.func":
+                    # an argument of a later block (multipath): what each
+                    # branch into it passes at its position
+                    k = m.blocks[value.block].args.index(v)
+                    for b in src.regions[0]:
+                        term = m.ops[m.blocks[b].ops[-1]]
+                        rest = term.operands[term.name == "cf.cond_br" :]
+                        for d in term.attrs.get("successors", ()):
+                            if d == value.block:
+                                stack.append(rest[k])
+                            rest = rest[len(m.blocks[d].args) :]
                     continue
             stack += src.operands
             for region in src.regions:
@@ -1660,7 +1976,7 @@ class _Builder:
         hazard = self.opaque_hazard(op)
         if hazard is not None:
             self.refuse(TTIRKind.INLINE_ASM, f"inline asm with {hazard}", op)
-        self.bind(op, _data_dep(map(self.val, op.operands), "unmodeled inline asm"))
+        self.bind(op, self.data_dep(map(self.val, op.operands), "unmodeled inline asm"))
 
     def op_extern(self, op: Op) -> None:
         hazard = self.opaque_hazard(op)
@@ -1689,7 +2005,7 @@ class _Builder:
         # when an operand is.
         self.bind(
             op,
-            _data_dep(
+            self.data_dep(
                 map(self.val, op.operands), f"unmodeled op {name} at line {op.line_no}"
             ),
         )
@@ -1724,14 +2040,19 @@ class _Builder:
                 stack.extend(b for region in inner.regions for b in region)
 
 
-def _data_dep(operands: Iterable[object], why: str) -> DataDep:
+def _data_dep(
+    operands: Iterable[object],
+    why: str,
+    reads_loaded: Callable[[object], bool] | None = None,
+) -> DataDep:
     """The DataDep of an op the reader cannot model over ``operands``: a
-    memory-derived reason when any operand derives from memory (``why``
+    memory-derived reason when any operand derives from memory (a
+    memory-derived DataDep, or a term ``reads_loaded`` holds for; ``why``
     itself when it is one), else the first unmodelable operand's own reason
     (a modeling gap stays a modeling gap), else ``why``."""
     first: DataDep | None = None
     for x in operands:
-        if _from_memory(x):
+        if _from_memory(x) or (reads_loaded is not None and reads_loaded(x)):
             return DataDep(
                 why
                 if why.startswith(_MEMORY_WHYS)
@@ -1740,6 +2061,39 @@ def _data_dep(operands: Iterable[object], why: str) -> DataDep:
         if first is None and isinstance(x, DataDep):
             first = x
     return DataDep(first.why) if first is not None else DataDep(why)
+
+
+def _conj(a: Term | None, b: Term) -> Term:
+    return b if a is None else BoolBin("and", a, b)
+
+
+def _disj(a: Term | None, b: Term | None) -> Term | None:
+    return None if a is None or b is None else BoolBin("or", a, b)
+
+
+def _merge_block_arg(edges: Sequence[tuple[Term | None, bool, list]], k: int) -> object:
+    """Block argument ``k`` as a Select over the incoming edges (all exact):
+    the last edge's operand is the fallback, each earlier one is selected
+    under its own path. Pointers of one base select their offsets; anything
+    else unmodelable is DataDep."""
+    if not edges:
+        return DataDep("argument of an unreachable block")
+    vals = [e[2][k] for e in edges]
+    if all(isinstance(v, PtrValue) for v in vals):
+        if len({v.base_param for v in vals}) != 1:  # type: ignore[union-attr]
+            return DataDep("block argument merging different bases")
+        offsets = [v.offset for v in vals]  # type: ignore[union-attr]
+        return PtrValue(vals[0].base_param, _select_chain(edges, offsets))  # type: ignore[union-attr]
+    if any(isinstance(v, (DataDep, PtrValue)) for v in vals):
+        return DataDep("block argument")
+    return _select_chain(edges, vals)
+
+
+def _select_chain(edges: Sequence[tuple[Term | None, bool, list]], vals: list) -> Term:
+    term = vals[-1]
+    for (path, _, _), v in reversed(list(zip(edges[:-1], vals[:-1]))):
+        term = v if path is None else Select(path, v, term)
+    return term
 
 
 def _why(v: object) -> str:
@@ -1753,6 +2107,8 @@ def _address_kind(v: object) -> TTIRKind:
         return TTIRKind.INDIRECT_ADDRESS
     if isinstance(v, DataDep) and v.why == _LOOP_CARRIED:
         return TTIRKind.LOOP_VARIANT_ADVANCE
+    if isinstance(v, DataDep) and v.why == _EARLY_ARG:
+        return TTIRKind.CONTROL_FLOW
     return TTIRKind.OTHER
 
 
@@ -1770,6 +2126,16 @@ def _with_children(t: object, kids: tuple) -> object:
         return replace(t, a=kids[0])
     if isinstance(t, IntCast):
         return replace(t, x=kids[0])
+    if isinstance(t, Loaded):
+        it = iter(kids)
+        return Loaded(
+            t.access_index,
+            next(it),
+            None if t.mask is None else next(it),
+            None if t.other is None else next(it),
+        )
+    if isinstance(t, DataDep):
+        return replace(t, keep=kids[0])
     raise TypeError(type(t).__name__)
 
 
@@ -1859,6 +2225,8 @@ _HANDLERS = {
     "tt.store": _Builder.op_store,
     "tt.atomic_rmw": _Builder.op_atomic_rmw,
     "tt.atomic_cas": _Builder.op_atomic_cas,
+    "cf.br": _Builder.op_branch,
+    "cf.cond_br": _Builder.op_branch,
     "scf.for": _Builder.op_for,
     "scf.if": _Builder.op_if,
     "scf.while": _Builder.op_while,

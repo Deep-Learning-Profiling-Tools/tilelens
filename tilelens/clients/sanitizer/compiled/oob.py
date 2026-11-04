@@ -107,6 +107,7 @@ from ....ir.ttir_reader import (
     Arange,
     Bin,
     DataDep,
+    Loaded,
     LoopInfo,
     LoopVar,
     NumPrograms,
@@ -451,6 +452,10 @@ class _Env:
 
     def data_dep(self, t: DataDep) -> NoReturn:
         raise _Refused(SanitizerKind.UNMODELED_VALUE, f"an unmodeled value ({t.why})")
+
+    def loaded(self, t: Loaded) -> NoReturn:
+        # what a default parse reads as DataDep("loaded value")
+        self.data_dep(DataDep("loaded value"))
 
     # ── the loop ──
 

@@ -15,8 +15,9 @@ and every lifetime hazard of those bindings stays here.
 2. A line scan of the text rebuilds the op tree for what the bindings cannot
    reach: each op's line, the loc of an op without results (the bindings read
    locs off values only), a region op's closing line, block labels,
-   ``scf.for``'s ``unsigned`` keyword (a unit attribute no getter reads) and
-   a generic-form ``tt.load``'s operand segments.
+   ``scf.for``'s ``unsigned`` keyword (a unit attribute no getter reads), a
+   generic-form ``tt.load``'s operand segments and a branch's successors
+   (the bindings have no successor getter).
 
 The two trees are zipped in pre-order and must agree on every op: name,
 result / region / block / op counts, and the printed loc of every op with
@@ -143,7 +144,8 @@ class Op:
     # their printed keyword ("slt"), program-id axes 0-2, a barrier's
     # address spaces their bits;
     # arith.constant "value" is an int (sign-extended) / bool for i1, else
-    # ("float", None) / ("dense", None); scf.for "unsignedCmp" is a bool.
+    # ("float", None) / ("dense", None); scf.for "unsignedCmp" is a bool;
+    # cf.br / cf.cond_br "successors" are the target block indices.
     attrs: Mapping[str, Any]
     regions: tuple[tuple[int, ...], ...]  # block indices, per walked region
     # block indices from the module body down to the parent block; () for
@@ -706,7 +708,27 @@ def _text_attrs(t: _TOp, name: str) -> dict[str, Any]:
         if m is None:
             raise ValueError("generic tt.load without operandSegmentSizes")
         return {"operandSegmentSizes": tuple(int(x) for x in m.group(1).split(","))}
+    if name in ("cf.br", "cf.cond_br") and not t.generic:
+        return {"successors": _successor_labels(t)}
     return {}
+
+
+# A branch's successors: Triton 3.8's bindings have no successor getter, so
+# they are the labels the branch prints, each with the number of operands it
+# passes (`^bb5(%a, %b : i32, i32)`); the aligner resolves them to blocks.
+_RE_SUCCESSOR = re.compile(r"\^[-\w.$]+")
+_RE_USE = re.compile(r"%[-\w.$]+(?:#\d+)?")
+
+
+def _successor_labels(t: _TOp) -> tuple[tuple[str, int], ...]:
+    s = t.masked
+    out = []
+    for m in _RE_SUCCESSOR.finditer(s, t.name_end):
+        n, j = 0, m.end()
+        if s.startswith("(", j):
+            n = len(_RE_USE.findall(s[j : _match_close(s, j)].partition(":")[0]))
+        out.append((m.group(0), n))
+    return tuple(out)
 
 
 # A block-pointer type anywhere in a text: `ptr<tensor` in any spelling the
@@ -1302,6 +1324,37 @@ class _Aligner:
             return None
         return self.locp.parse(raw[span[0] : span[1]])
 
+    def successors(
+        self,
+        labels: tuple[tuple[str, int], ...],
+        block: int,
+        n_operands: int,
+        cond: bool,
+    ) -> tuple[int, ...]:
+        """The block indices a branch in ``block`` names (its region's
+        blocks are all built before its ops are visited), each passed as
+        many operands as it has arguments; a cf.cond_br also takes its
+        condition. Raises ValueError otherwise."""
+        parent = self.blocks[block]
+        by_label = {
+            b.label: i
+            for i, b in enumerate(self.blocks)
+            if b.op == parent.op and b.region == parent.region
+        }
+        if len(labels) != (2 if cond else 1):
+            raise ValueError(f"{len(labels)} successors printed")
+        out = []
+        for label, n in labels:
+            dest = by_label.get(label)
+            if dest is None:
+                raise ValueError(f"unknown successor {label}")
+            if n != len(self.blocks[dest].args):
+                raise ValueError(f"{label}: {n} operands for its arguments")
+            out.append(dest)
+        if n_operands != cond + sum(n for _, n in labels):
+            raise ValueError(f"{n_operands} operands for its successors")
+        return tuple(out)
+
     # ── traversal ──
     def run(self) -> Module:
         root_w = [i for i, b in enumerate(self.bw.ops) if b.block_id is None]
@@ -1413,6 +1466,15 @@ class _Aligner:
                 self.bad(line, f"{b.name}: {p}")
             try:
                 attrs.update(_text_attrs(t, b.name))
+                if "successors" in attrs:
+                    if block is None:
+                        raise ValueError("a branch outside a block")
+                    attrs["successors"] = self.successors(
+                        attrs["successors"],
+                        block,
+                        len(b.operands),
+                        b.name == "cf.cond_br",
+                    )
             except ValueError as e:
                 self.bad(line, f"{b.name}: {e}")
             self.stats["attrs"] += len(attrs)
