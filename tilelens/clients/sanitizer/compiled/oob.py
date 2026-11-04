@@ -61,17 +61,20 @@ run on several host threads at once (one Z3 context is not thread-safe). A
 Ctrl+C that Z3 caught during a query is raised as ``KeyboardInterrupt``,
 never taken for an unknown.
 
-Terms can be deeper than Python's recursion limit and their generated
-``==`` / ``hash`` recurse, so lowering is iterative and memoized by term
-identity.
+Terms are lowered by the shared ``tilelens.ir.lowering`` (the reader's
+operator semantics) with ``_Env`` as its leaves: the launch's constants, and
+the free variables above with their range premises. Terms can be deeper
+than Python's recursion limit and their generated ``==`` / ``hash``
+recurse, so the walks over them are iterative and keyed by term identity.
 """
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Hashable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 from z3 import (
     And,
@@ -80,7 +83,6 @@ from z3 import (
     BoolVal,
     Context,
     Exists,
-    If,
     Implies,
     Int,
     IntVal,
@@ -88,7 +90,6 @@ from z3 import (
     Or,
     Solver,
     Sum,
-    is_bool,
     is_false,
     is_int_value,
     sat,
@@ -99,20 +100,15 @@ from z3 import (
 from z3 import Not as Z3Not
 
 from ....ir.launch import LaunchBinding, TensorFacts
+from ....ir.lowering import Lowerer, children
 from ....ir.ttir_reader import (
     AccessEvent,
     AccessGraph,
     Arange,
     Bin,
-    BoolBin,
-    Cmp,
-    Const,
     DataDep,
-    IntCast,
-    IterArgOffset,
     LoopInfo,
     LoopVar,
-    Not,
     NumPrograms,
     Observed,
     Param,
@@ -306,81 +302,13 @@ class _Refused(Exception):
         return self
 
 
-def _as_bool(e: Any) -> BoolRef:
-    """An i1 value in a boolean position: i1 constants (e.g. the dense<true>
-    mask of an unmasked atomic, Const(1)) lower to Int."""
-    return e if is_bool(e) else e != 0
-
-
-def _as_int(e: Any) -> ArithRef:
-    """An i1 value in an integer position (an extui of a compare, ...)."""
-    return If(e, IntVal(1, e.ctx), IntVal(0, e.ctx)) if is_bool(e) else e
-
-
-def _trunc_div(a: ArithRef, b: ArithRef) -> ArithRef:
-    """arith.divsi rounds toward zero, but Z3's Int ``/`` is Euclidean
-    (floor for a positive divisor): they disagree on negative dividends.
-    Divide the magnitudes, where the two agree, and re-apply the sign."""
-    aa = If(a >= 0, a, -a)
-    ab = If(b >= 0, b, -b)
-    q = aa / ab
-    return If((a >= 0) == (b >= 0), q, -q)
-
-
-def _bin(op: str, a: ArithRef, b: ArithRef) -> ArithRef:
-    # The unsigned ops read their operands unsigned; their width
-    # obligations make both non-negative, where they equal the signed ones.
-    if op == "+":
-        return a + b
-    if op == "-":
-        return a - b
-    if op == "*":
-        return a * b
-    if op in ("//", "u//"):
-        return _trunc_div(a, b)
-    if op in ("%", "u%"):
-        # arith.remsi: the remainder carries the dividend's sign
-        return a - b * _trunc_div(a, b)
-    if op in ("min", "umin"):
-        return If(a <= b, a, b)
-    if op in ("max", "umax"):
-        return If(a >= b, a, b)
-    raise ValueError(f"unknown integer op {op!r}")
-
-
-# Unsigned predicates read their operands unsigned; their width obligations
-# make both non-negative, where they equal the signed ones.
-_SIGNED_PRED = {"ult": "slt", "ule": "sle", "ugt": "sgt", "uge": "sge"}
-
-
-def _cmp(pred: str, a: Any, b: Any) -> BoolRef:
-    if is_bool(a) or is_bool(b):  # i1 operands, as 0/1
-        a, b = _as_int(a), _as_int(b)
-    table = {
-        "slt": a < b, "sle": a <= b, "sgt": a > b,
-        "sge": a >= b, "eq": a == b, "ne": a != b,
-    }  # fmt: skip
-    try:
-        return table[_SIGNED_PRED.get(pred, pred)]
-    except KeyError:
-        raise ValueError(f"unknown cmpi predicate {pred!r}") from None
-
-
-def _kids(t: object, graph: AccessGraph) -> tuple:
-    """The terms ``t`` is computed from; a loop-carried pointer's offset
-    is computed from its IterArgInfo's ``offset0`` and ``delta``."""
-    if isinstance(t, (Bin, Cmp, BoolBin)):
-        return (t.a, t.b)
-    if isinstance(t, Select):
-        return (t.cond, t.t, t.f)
-    if isinstance(t, Not):
-        return (t.a,)
-    if isinstance(t, IntCast):
-        return (t.x,)
-    if isinstance(t, IterArgOffset):
-        info = graph.iter_args[t.arg_id]
-        return (info.offset0, info.delta)
-    return ()
+def _operands(t: object, graph: AccessGraph) -> tuple:
+    """The nodes the checks' walks descend to from ``t``: the lowering's
+    ``children``, but none of a LoopVar. The loop's bounds belong to the
+    loop's family (checked there unguarded, assumed by every access in the
+    loop, kept out of its accesses' divisions by ``loop_ids``), so a bound
+    node an access reads through a Select arm keeps that arm's guard."""
+    return () if isinstance(t, LoopVar) else children(t, graph)
 
 
 def _walk(
@@ -395,7 +323,7 @@ def _walk(
             continue
         seen.add(id(t))
         yield t
-        stack.extend(reversed(_kids(t, graph)))
+        stack.extend(reversed(_operands(t, graph)))
 
 
 _DIVISIONS = frozenset({"//", "%", "u//", "u%"})
@@ -429,7 +357,8 @@ def _lane_name(t: Arange) -> str:
 
 class _Env:
     """The Z3 variables of one family of queries (one access, or the
-    loop's own checks), their range premises, and the lowering memo."""
+    loop's own checks), their range premises, and the family's lowering:
+    the env is its leaves (``tilelens.ir.lowering.TermLeaves``)."""
 
     def __init__(
         self,
@@ -447,30 +376,41 @@ class _Env:
         self.pids = tuple(Int(f"pid_{axis}", ctx) for axis in range(3))
         for pid, size in zip(self.pids, grid):
             self.premises += [pid >= 0, pid < size]
-        # (dim, extent) -> the lane's position along that dim (see lane).
+        # (dim, extent) -> the lane's position along that dim (see arange).
         self.positions: dict[tuple[int, int], ArithRef] = {}
         # witness name -> the arange's value at the lane
         self.lanes: dict[str, ArithRef] = {}
-        self.iteration: ArithRef | None = None
+        self.k: ArithRef | None = None  # the loop's iteration index, once used
         self._observed: dict[int, ArithRef] = {}
-        # id(term) -> (term, lowered): holding the term keeps its id unique.
-        self._memo: dict[int, tuple[object, Any]] = {}
+        # The lowering reaches its leaves through a proxy: a strong
+        # reference back would be a cycle, keeping the check's Z3 context
+        # and terms alive until the cyclic GC frees them, on whichever host
+        # thread it runs, inside that thread's own Z3 call.
+        self.lowering = Lowerer(graph, weakref.proxy(self))
 
     # ── leaves ──
 
-    def param(self, name: str) -> int:
-        try:
-            value = self.binding.params[name]
-        except KeyError:
+    def param(self, t: Param) -> ArithRef:
+        if t.name not in self.binding.params:
+            # Raised outside an except block: a context exception's traceback
+            # would reach the frames holding this env (see check_loop).
             raise _Refused(
                 SanitizerKind.MISSING_BINDING,
-                f"scalar argument {name!r} has no launch binding"
+                f"scalar argument {t.name!r} has no launch binding"
                 + _binding_error(self.binding),
-            ) from None
-        arg = self.graph.arg(name)
-        return _signed(value, arg.int_bits if arg is not None else 0)
+            )
+        value = self.binding.params[t.name]
+        arg = self.graph.arg(t.name)
+        bits = arg.int_bits if arg is not None else 0
+        return IntVal(_signed(value, bits), self.ctx)
 
-    def lane(self, t: Arange) -> ArithRef:
+    def pid(self, t: Pid) -> ArithRef:
+        return self.pids[t.axis]
+
+    def num_programs(self, t: NumPrograms) -> ArithRef:
+        return IntVal(self.grid[t.axis], self.ctx)
+
+    def arange(self, t: Arange) -> ArithRef:
         """``t``'s value at the access's lane: its start plus the lane's
         position along its dim, one position per dim and extent (see the
         module docstring)."""
@@ -485,8 +425,20 @@ class _Env:
         self.lanes.setdefault(_lane_name(t), value)
         return value
 
-    def observed(self, index: int) -> ArithRef:
+    def iteration(self, loop_ssa: str) -> ArithRef:
+        """``k`` of the graph's loop (it has at most one): see
+        ``loop_iteration``."""
+        loop = self._loop()
+        if loop_ssa != loop.loop_ssa:
+            raise ValueError(
+                f"kernel {self.graph.kernel_name!r}: loop {loop_ssa!r} is not "
+                f"the graph's loop {loop.loop_ssa!r}"
+            )
+        return self.loop_iteration()
+
+    def observed(self, t: Observed) -> ArithRef:
         """An atomic observation: a free value of the atomic's width."""
+        index = t.access_index
         v = self._observed.get(index)
         if v is None:
             v = Int(f"observed_{index}", self.ctx)
@@ -497,6 +449,11 @@ class _Env:
                 self.premises += [v >= -half, v < half]
         return v
 
+    def data_dep(self, t: DataDep) -> NoReturn:
+        raise _Refused(SanitizerKind.UNMODELED_VALUE, f"an unmodeled value ({t.why})")
+
+    # ── the loop ──
+
     def bounds(self) -> tuple[ArithRef, ArithRef, ArithRef]:
         loop = self._loop()
         return self.value(loop.lower), self.value(loop.upper), self.value(loop.step)
@@ -505,13 +462,13 @@ class _Env:
         """The loop's 0-based iteration index ``k``, with its premise ``k >=
         0 and lower + k*step < upper``: only iterations that run, and none
         when the launch's trip count is zero."""
-        if self.iteration is None:
+        if self.k is None:
             loop = self._loop()
             lower, upper, step = self.bounds()
             k = Int(f"iter_{loop.loop_ssa.strip('%')}", self.ctx)
             self.premises += [k >= 0, lower + k * step < upper]
-            self.iteration = k
-        return self.iteration
+            self.k = k
+        return self.k
 
     def _loop(self) -> LoopInfo:
         loop = self.graph.loop
@@ -524,67 +481,10 @@ class _Env:
     # ── terms ──
 
     def value(self, term: object) -> ArithRef:
-        return _as_int(self.lower(term))
+        return self.lowering.value(term)
 
     def cond(self, term: object) -> BoolRef:
-        return _as_bool(self.lower(term))
-
-    def lower(self, root: object) -> Any:
-        """``root`` as a Z3 expression (Int, or Bool for a compare)."""
-        memo = self._memo
-        stack: list[tuple[object, bool]] = [(root, False)]
-        while stack:
-            t, ready = stack.pop()
-            if id(t) in memo:
-                continue
-            kids = _kids(t, self.graph)
-            if kids and not ready:
-                stack.append((t, True))
-                stack.extend((k, False) for k in reversed(kids) if id(k) not in memo)
-                continue
-            memo[id(t)] = (t, self._apply(t, [memo[id(k)][1] for k in kids]))
-        return memo[id(root)][1]
-
-    def _apply(self, t: object, kids: Sequence[Any]) -> Any:
-        if isinstance(t, Const):
-            return IntVal(t.value, self.ctx)
-        if isinstance(t, Param):
-            return IntVal(self.param(t.name), self.ctx)
-        if isinstance(t, Pid):
-            return self.pids[t.axis]
-        if isinstance(t, NumPrograms):
-            return IntVal(self.grid[t.axis], self.ctx)
-        if isinstance(t, Arange):
-            return self.lane(t)
-        if isinstance(t, LoopVar):
-            lower, _upper, step = self.bounds()
-            return lower + self.loop_iteration() * step
-        if isinstance(t, IterArgOffset):
-            return _as_int(kids[0]) + self.loop_iteration() * _as_int(kids[1])
-        if isinstance(t, Bin):
-            return _bin(t.op, _as_int(kids[0]), _as_int(kids[1]))
-        if isinstance(t, Cmp):
-            return _cmp(t.pred, kids[0], kids[1])
-        if isinstance(t, BoolBin):
-            a, b = _as_bool(kids[0]), _as_bool(kids[1])
-            return And(a, b) if t.op == "and" else Or(a, b)
-        if isinstance(t, Select):
-            a, b = kids[1], kids[2]
-            if is_bool(a) != is_bool(b):
-                a, b = _as_int(a), _as_int(b)
-            return If(_as_bool(kids[0]), a, b)
-        if isinstance(t, Not):
-            return Z3Not(_as_bool(kids[0]))
-        if isinstance(t, IntCast):
-            # Its value is the operand's while its width obligation holds.
-            return _as_int(kids[0])
-        if isinstance(t, Observed):
-            return self.observed(t.access_index)
-        if isinstance(t, DataDep):
-            raise _Refused(
-                SanitizerKind.UNMODELED_VALUE, f"an unmodeled value ({t.why})"
-            )
-        raise TypeError(f"unknown term {type(t).__name__}")
+        return self.lowering.cond(term)
 
 
 class _Dag:
@@ -611,7 +511,9 @@ class _Dag:
                 continue
             stack.append((t, True))
             stack.extend(
-                (k, False) for k in reversed(_kids(t, graph)) if id(k) not in self.order
+                (k, False)
+                for k in reversed(_operands(t, graph))
+                if id(k) not in self.order
             )
         self.guards: dict[int, BoolRef] = {}
         if env is None:
@@ -631,7 +533,7 @@ class _Dag:
                 for arm, taken in ((t.t, c), (t.f, Z3Not(c))):
                     edges.append((arm, taken if guard is None else And(guard, taken)))
             else:
-                edges = [(k, guard) for k in _kids(t, graph)]
+                edges = [(k, guard) for k in _operands(t, graph)]
             for kid, kid_guard in edges:
                 if kid_guard is None:
                     direct.add(id(kid))
@@ -646,7 +548,9 @@ class _Dag:
         if index is not None:
             return index
         kids = [
-            self.order[id(k)] for k in _kids(term, self.graph) if id(k) in self.order
+            self.order[id(k)]
+            for k in _operands(term, self.graph)
+            if id(k) in self.order
         ]
         return max(kids) + 0.5 if kids else len(self.order)
 
@@ -869,7 +773,10 @@ class _Check:
             _lower, _upper, step = env.bounds()
             refusal = self.step_refusal(env, step)
         except _Refused as r:
-            refusal = r
+            # A copy that was never raised: keeping ``r`` would keep its
+            # traceback, which reaches this frame and so ``env``, a cycle
+            # leaving the check's Z3 context to the cyclic GC (see _Env).
+            refusal = _Refused(r.kind, r.message, r.line_no, r.loc)
         if refusal is not None:
             return refusal.at(loop.line_no, loop.loc)
         roots = (loop.lower, loop.upper, loop.step)
@@ -1220,8 +1127,8 @@ class _Check:
         out = {f"pid_{axis}": val(pid) for axis, pid in enumerate(env.pids)}
         for name, lane in env.lanes.items():
             out[name] = val(lane)
-        if env.iteration is not None:
-            out[str(env.iteration)] = val(env.iteration)
+        if env.k is not None:
+            out[str(env.k)] = val(env.k)
         return out
 
     def solve(self, formulas: list[Any]) -> tuple[Any, ModelRef | None, str | None]:
