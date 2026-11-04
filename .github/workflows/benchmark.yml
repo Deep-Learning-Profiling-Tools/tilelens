@@ -16,6 +16,10 @@ concurrency:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
+    env:
+      # Keep `uv run` from re-syncing the environment to the lockfile, which
+      # would undo the Triton 3.8 pin installed with `uv pip install`.
+      UV_NO_SYNC: "1"
 
     steps:
     - name: Checkout PR branch
@@ -44,15 +48,15 @@ jobs:
       run: |
         cd main-branch
         uv sync --extra test
-        uv pip install --pre -U triton
-        uv pip install "git+https://github.com/triton-lang/triton.git#subdirectory=python/triton_kernels"
+        uv pip install triton==3.8.0
+        uv pip install "git+https://github.com/triton-lang/triton.git@v3.8.0#subdirectory=python/triton_kernels"
 
     - name: Install PR dependencies
       run: |
         cd pr-branch
         uv sync --extra test
-        uv pip install --pre -U triton
-        uv pip install "git+https://github.com/triton-lang/triton.git#subdirectory=python/triton_kernels"
+        uv pip install triton==3.8.0
+        uv pip install "git+https://github.com/triton-lang/triton.git@v3.8.0#subdirectory=python/triton_kernels"
 
     - name: Run interleaved A/B benchmarks
       run: |
