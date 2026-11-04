@@ -385,6 +385,7 @@ class TwoCopySymbolicHBSolver:
         # second.program_seq``. None: no fence orders any pair.
         self.fence_between = fence_between
         self._fence_cache: dict[tuple[int, int], bool] = {}
+        self._uses_arange_cache: dict[int, bool] = {}
         self.timeout_ms = self.TIMEOUT_MS if timeout_ms is None else int(timeout_ms)
         if self.timeout_ms <= 0:
             # Z3 reads timeout=0 as "no limit".
@@ -637,7 +638,8 @@ class TwoCopySymbolicHBSolver:
         detail = solver.reason_unknown()
         raise UnsupportedSymbolicRaceQuery(
             "Z3 could not decide the feasibility query"
-            + (f" ({detail})" if detail else "")
+            + (f" ({detail})" if detail else ""),
+            reason_unknown=detail,
         )
 
     def _enum_pid_cases(
@@ -822,7 +824,8 @@ class TwoCopySymbolicHBSolver:
         detail = solver.reason_unknown()
         raise UnsupportedSymbolicRaceQuery(
             f"Z3 could not decide the race query for {a.name} vs {b.name}"
-            + (f" ({detail})" if detail else "")
+            + (f" ({detail})" if detail else ""),
+            reason_unknown=detail,
         )
 
     def _find_intra_instance_candidates(
@@ -1085,7 +1088,21 @@ class TwoCopySymbolicHBSolver:
         """Constraint that the a-copy lane of ``a`` and the b-copy lane of
         ``b`` are DIFFERENT positions, over the arange vars either event
         uses; ``None`` when neither has a lane (scalar accesses: one
-        position, dependency-ordered, never queried)."""
+        position, dependency-ordered, never queried).
+
+        When both records carry a ``lane_position`` of one rank, the
+        positions are compared dimension by dimension instead: each access
+        may index its block with its own aranges (every block-pointer
+        access does), and then some variable always differs, whatever the
+        two lanes' positions."""
+        pos_a, pos_b = a.record.lane_position, b.record.lane_position
+        if pos_a and pos_b and len(pos_a) == len(pos_b):
+            sub_a = self.ctx_a.arange_substitutions
+            sub_b = self.ctx_b.arange_substitutions
+            dims = [
+                apply_sub(p, sub_a) != apply_sub(q, sub_b) for p, q in zip(pos_a, pos_b)
+            ]
+            return dims[0] if len(dims) == 1 else Or(*dims)
         occurring = _collect_z3_var_keys((a.addr, a.active, b.addr, b.active))
         diffs = [
             var_a != var_b
@@ -1410,15 +1427,57 @@ class TwoCopySymbolicHBSolver:
             return BoolVal(False)
         if not self._fence_orders(e1, e2):
             if (e1.event_id, e2.event_id) in self.dep_pairs:
-                # Dependency order: within one copy the two records share
-                # their position variables, so this is the same-position
-                # edge (cross-position pairs are the intra-instance
-                # query's business).
-                return And(e1.active, e2.active)
+                # Dependency order: a lane of the dependent is ordered after
+                # the anchor's lane at its OWN block position only
+                # (cross-position pairs are the intra-instance query's
+                # business).
+                same = self._same_position(e1, e2)
+                if same is None:
+                    return BoolVal(False)
+                return And(e1.active, e2.active, same)
             # Fence-ordered semantics: source order alone carries no
             # happens-before between distinct operations of one instance.
             return BoolVal(False)
         return And(e1.active, e2.active)  # active-gated
+
+    def _same_position(
+        self, e1: SymbolicMemoryEvent, e2: SymbolicMemoryEvent
+    ) -> BoolRef | None:
+        """Constraint that two events of one copy are lanes at the SAME
+        block position, or ``None`` when that cannot be told (then the
+        dependency gives no edge, which is conservative).
+
+        Both records must carry a ``lane_position`` of one rank, compared
+        dimension by dimension: the two accesses may index their blocks
+        with separate aranges (every block-pointer access does), whose
+        variables are independent within a copy, and a shared arange
+        variable is no position either once an op moves elements (a
+        transposed pointer keeps the variables of the untransposed one).
+        Without positions, two events on the same lane that use no arange
+        variable are taken to be at the same position. That holds for a
+        rank-0 anchor (one position) but not for a block on one address
+        (``z + tl.zeros([B])``: B positions, no arange), so the caller must
+        not list such a block anchor in ``dep_pairs``; SymbolicRaceDetector
+        anchors no dependency on a block record without a position."""
+        pos1, pos2 = e1.record.lane_position, e2.record.lane_position
+        if pos1 and pos2 and len(pos1) == len(pos2):
+            sub = (self.ctx_a if e1.copy == "a" else self.ctx_b).arange_substitutions
+            dims = [apply_sub(p, sub) == apply_sub(q, sub) for p, q in zip(pos1, pos2)]
+            return dims[0] if len(dims) == 1 else And(*dims)
+        if e1.lane != e2.lane or self._uses_arange(e1) or self._uses_arange(e2):
+            return None
+        return BoolVal(True)
+
+    def _uses_arange(self, e: SymbolicMemoryEvent) -> bool:
+        """Whether an arange variable of the event's copy occurs in it."""
+        used = self._uses_arange_cache.get(e.idx)
+        if used is None:
+            ctx = self.ctx_a if e.copy == "a" else self.ctx_b
+            occurring = _collect_z3_var_keys((e.addr, e.active))
+            used = self._uses_arange_cache[e.idx] = any(
+                _z3_var_key(var) in occurring for _, var in ctx.arange_substitutions
+            )
+        return used
 
     @staticmethod
     def _exact_atomic_addr(w: SymbolicMemoryEvent, r: SymbolicMemoryEvent) -> BoolRef:
@@ -2610,6 +2669,7 @@ class TwoCopySymbolicHBSolver:
             reason=reason,
             race_type_value=race_type,
             witness_addr=int(witness_addr),
+            witness_addrs=(addr_a_val, addr_b_val),
             witness_grid_a=witness_grid_a,
             witness_grid_b=witness_grid_b,
         )

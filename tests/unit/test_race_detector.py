@@ -1,11 +1,17 @@
+import pytest
+import torch
 import triton
 import triton.language as tl
+from z3 import substitute
 
 import tilelens
 from tilelens.clients import RaceDetector
 from tilelens.clients.race_detector.race_detector import (
     SymbolicRaceDetector,
     NullRaceDetector,
+)
+from tilelens.clients.race_detector.two_copy_symbolic_hb_solver import (
+    TwoCopySymbolicHBSolver,
 )
 from tilelens.core.config import config as cfg
 
@@ -23,6 +29,13 @@ def test_race_detector_factory_toggle():
         assert isinstance(RaceDetector(), NullRaceDetector)
     finally:
         cfg.enable_race_detector = saved
+
+
+def test_compile_mode_is_not_available_yet(monkeypatch):
+    monkeypatch.setattr(cfg, "enable_race_detector", True)
+    for make in (RaceDetector, SymbolicRaceDetector):
+        with pytest.raises(NotImplementedError, match="compiled race detector"):
+            make(compile=True)
 
 
 @triton.jit
@@ -76,3 +89,26 @@ def test_flag_off_returns_raw_kernel_for_factory_instance():
         assert traced is _dispatch_kernel
     finally:
         cfg.enable_race_detector = saved
+
+
+# ======== Solver Contract ========
+
+
+@triton.jit
+def _pid_store_kernel(x_ptr):
+    tl.store(x_ptr + tl.program_id(0), 1)
+
+
+def test_solver_renames_the_captured_pid_per_copy():
+    """The two-copy solver renames SymbolicExpr's pid vars per copy; a
+    captured pid-dependent address must change under that rename, or both
+    copies would be one program and every cross-program race would be
+    missed."""
+    detector = SymbolicRaceDetector()
+    tilelens.trace(client=detector)(_pid_store_kernel)[(2,)](torch.zeros(2))
+    (record,) = detector.records
+    solver = TwoCopySymbolicHBSolver(detector.records, grid=(2, 1, 1))
+    for ctx in (solver.ctx_a, solver.ctx_b):
+        renamed = substitute(record.addr_expr, *ctx.pid_substitutions)
+        assert not renamed.eq(record.addr_expr)
+        assert f"pid_{ctx.label}_0" in str(renamed)
