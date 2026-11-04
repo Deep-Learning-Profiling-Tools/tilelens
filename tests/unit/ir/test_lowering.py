@@ -15,7 +15,7 @@ import sys
 import pytest
 import z3
 
-from tilelens.ir.lowering import Lowerer, children, fold
+from tilelens.ir.lowering import GuardDag, Lowerer, children, fold
 from tilelens.ir.ttir_reader import (
     AccessGraph,
     Arange,
@@ -379,3 +379,23 @@ def test_a_loop_term_without_a_loop_is_a_bug(term):
     graph = _graph(None, (IterArgInfo(0, "p", Const(0), Const(1)),))
     with pytest.raises(ValueError, match="without a loop"):
         Lowerer(graph, _Leaves()).lower(term)
+
+
+def test_guard_dag_guards_the_terms_read_through_select_arms():
+    """A term read only through an arm is guarded by the arm's condition;
+    one also read directly (or the condition itself) is not."""
+    graph = _graph()
+    cond, wide, other = Cmp("slt", X, Y), Bin("*", X, Y), Bin("-", Y, X)
+    root = Bin("+", Select(cond, wide, other), Y)
+    lowerer = Lowerer(graph, _Leaves())
+    dag = GuardDag((root,), graph, lowerer.cond)
+    c = lowerer.cond(cond)
+    assert _proved(dag.guards[id(wide)] == c)
+    assert _proved(dag.guards[id(other)] == z3.Not(c))
+    assert {id(cond), id(X), id(Y)}.isdisjoint(dag.guards)
+    holds = z3.Bool("holds")
+    assert _proved(dag.premise(wide, holds) == z3.Implies(c, holds))
+    assert dag.premise(cond, holds) is holds
+    assert dag.rank(cond) < dag.rank(wide) < dag.rank(root)
+    # Without ``cond``: the ranks only.
+    assert GuardDag((root,), graph).guards == {}

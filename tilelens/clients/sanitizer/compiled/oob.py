@@ -83,7 +83,6 @@ from z3 import (
     BoolVal,
     Context,
     Exists,
-    Implies,
     Int,
     IntVal,
     ModelRef,
@@ -99,8 +98,9 @@ from z3 import (
 )
 from z3 import Not as Z3Not
 
+from ....ir import failures
 from ....ir.launch import LaunchBinding, TensorFacts
-from ....ir.lowering import Lowerer, children
+from ....ir.lowering import GuardDag, Lowerer, children
 from ....ir.ttir_reader import (
     AccessEvent,
     AccessGraph,
@@ -114,7 +114,6 @@ from ....ir.ttir_reader import (
     Observed,
     Param,
     Pid,
-    Select,
     WidthObligation,
     mentions_observed,
     width_obligations,
@@ -145,17 +144,18 @@ class SanitizerKind(str, Enum):
     # A term the reader marked unmodelable (DataDep) reached a lowered
     # address, mask, path or loop bound; the reader never lets it.
     UNMODELED_VALUE = "unmodeled-value"
-    # The client's own (compiled/client.py): the launch compiled nothing to
-    # read (no JITFunction, or none of its configs was delivered); a config
-    # failed to compile for the IR target with an error that need not hold
-    # for another target, or its call does not bind the kernel's parameters,
-    # or no config compiled at all; a compiled kernel holds no TTIR; the host
-    # compile could not run for a config; the analysis itself failed (a bug,
-    # contained).
+    # The client's (compiled/client.py, which classifies a failed compile
+    # with tilelens.ir.failures, whose two kinds these are): the launch
+    # compiled nothing to read (no JITFunction, or none of its configs was
+    # delivered); a config failed to compile for the IR target with an error
+    # that need not hold for another target, or its call does not bind the
+    # kernel's parameters, or no config compiled at all; a compiled kernel
+    # holds no TTIR; the host compile could not run for a config; the
+    # analysis itself failed (a bug, contained).
     NO_COMPILED_KERNEL = "no-compiled-kernel"
-    COMPILE_FAILED = "compile-failed"
+    COMPILE_FAILED = failures.COMPILE_FAILED
     NO_TTIR = "no-ttir"
-    HOST_COMPILE_UNAVAILABLE = "host-compile-unavailable"
+    HOST_COMPILE_UNAVAILABLE = failures.HOST_COMPILE_UNAVAILABLE
     INTERNAL_ERROR = "internal-error"
 
     def __str__(self) -> str:
@@ -492,74 +492,6 @@ class _Env:
         return self.lowering.cond(term)
 
 
-class _Dag:
-    """The nodes one family of queries reads from ``roots``: each one's
-    rank (children before parents) and, when built with the family's env
-    (whose memo holds the lowered roots), its guard: the condition under
-    which its value reaches a root through the arms of Selects (a node
-    without one reaches a root directly). Iterative, keyed by identity."""
-
-    def __init__(
-        self, roots: Sequence[object], graph: AccessGraph, env: _Env | None = None
-    ) -> None:
-        self.graph = graph
-        self.order: dict[int, int] = {}
-        nodes: list[object] = []
-        stack = [(r, False) for r in reversed(roots) if r is not None]
-        while stack:
-            t, done = stack.pop()
-            if id(t) in self.order:
-                continue
-            if done:
-                self.order[id(t)] = len(nodes)
-                nodes.append(t)
-                continue
-            stack.append((t, True))
-            stack.extend(
-                (k, False)
-                for k in reversed(_operands(t, graph))
-                if id(k) not in self.order
-            )
-        self.guards: dict[int, BoolRef] = {}
-        if env is None:
-            return
-        direct = {id(r) for r in roots if r is not None}
-        shares: dict[int, list[BoolRef]] = {}
-        for t in reversed(nodes):  # every parent before its children
-            parts = shares.pop(id(t), [])
-            guard = None
-            if id(t) not in direct:
-                guard = parts[0] if len(parts) == 1 else Or(parts)
-                self.guards[id(t)] = guard
-            edges: list[tuple[object, BoolRef | None]]
-            if isinstance(t, Select):
-                c = env.cond(t.cond)
-                edges = [(t.cond, guard)]
-                for arm, taken in ((t.t, c), (t.f, Z3Not(c))):
-                    edges.append((arm, taken if guard is None else And(guard, taken)))
-            else:
-                edges = [(k, guard) for k in _operands(t, graph)]
-            for kid, kid_guard in edges:
-                if kid_guard is None:
-                    direct.add(id(kid))
-                elif id(kid) not in direct:
-                    shares.setdefault(id(kid), []).append(kid_guard)
-
-    def rank(self, term: object) -> float:
-        """Children first, and a Select's condition before its arms; a term
-        the walk does not hold (an obligation's own, e.g. a remainder's
-        quotient) right after its children."""
-        index = self.order.get(id(term))
-        if index is not None:
-            return index
-        kids = [
-            self.order[id(k)]
-            for k in _operands(term, self.graph)
-            if id(k) in self.order
-        ]
-        return max(kids) + 0.5 if kids else len(self.order)
-
-
 # ─────────────────────────── view footprint ───────────────────────────
 
 
@@ -785,7 +717,7 @@ class _Check:
         if refusal is not None:
             return refusal.at(loop.line_no, loop.loc)
         roots = (loop.lower, loop.upper, loop.step)
-        dag = _Dag(roots, graph)
+        dag = GuardDag(roots, graph, operands=_operands)
         self.loop_ids = {id(n) for n in _walk(roots, graph, set())}
         self.loop_divs = tuple(_divisions(roots, graph, set()))
         self.loop_obs = tuple(
@@ -872,7 +804,9 @@ class _Check:
         # One DAG over the three roles: a node's guard covers every root it
         # reaches, so a node one role reads through a Select arm and another
         # directly is checked wherever it is read.
-        dag = _Dag((access.path, access.mask, access.offset), graph, env)
+        dag = GuardDag(
+            (access.path, access.mask, access.offset), graph, env.cond, _operands
+        )
         obs: dict[str, list[WidthObligation]] = {"path": [], "mask": [], "offset": []}
         for ob in width_obligations(graph, access):
             if ob.role != "loop":
@@ -920,7 +854,7 @@ class _Check:
         divs: Sequence[Bin],
         assumed: list[BoolRef],
         uncertain: SanitizerKind | None,
-        dag: _Dag,
+        dag: GuardDag,
     ) -> list[BoolRef]:
         """Discharge one role's width obligations and divisions under
         ``assumed`` (the earlier roles' safety) in one joint query: some
@@ -933,12 +867,11 @@ class _Check:
         conds: list[_Condition] = []
         for i, ob in enumerate(obs):
             fits = _fits(env.value(ob.term), ob.bits, ob.signed)
-            guard = None if _undefined_when_wide(ob) else dag.guards.get(id(ob.term))
             conds.append(
                 _Condition(
                     "integer-overflow",
                     ob,
-                    fits if guard is None else Implies(guard, fits),
+                    fits if _undefined_when_wide(ob) else dag.premise(ob.term, fits),
                     # Children first (a select's condition before its arms),
                     # and on one term the op's own result before the reads
                     # of the ops that read it.

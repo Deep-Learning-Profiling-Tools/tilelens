@@ -28,6 +28,11 @@ Operator semantics, the reader's integer model (see ``ttir_reader``):
   ``IterArgOffset`` is ``offset0 + k * delta``, with ``k`` the client's
   iteration of that loop.
 
+Select guards: ``GuardDag`` says, for the terms read from some roots, the
+condition under which each one's value reaches a root through the arms of
+Selects, so a client can assume or discharge a fact about a term (e.g. its
+width obligation) only where the IR's result depends on it.
+
 Z3 context: the lowering never creates one. Constants are made in
 ``leaves.ctx`` (None: Z3's main context) and every other term in its
 operands' context, so all of a client's terms share the context of its
@@ -43,7 +48,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
-from z3 import And, ArithRef, BoolRef, Context, If, IntVal, Or, is_bool
+from z3 import And, ArithRef, BoolRef, Context, If, Implies, IntVal, Or, is_bool
 from z3 import Not as Z3Not
 
 from .ttir_reader import (
@@ -298,3 +303,87 @@ class Lowerer:
         if isinstance(t, DataDep):
             return leaves.data_dep(t)
         raise TypeError(f"unknown term {type(t).__name__}")
+
+
+class GuardDag:
+    """The terms read from ``roots``: each one's rank (children before
+    parents) and, given ``cond`` (a client's lowering of a term to a Bool,
+    e.g. ``Lowerer.cond``), its guard: the condition under which its value
+    reaches a root through the arms of Selects (a term without one reaches a
+    root directly). ``operands`` is the walk's edges (by default
+    ``children``; a client may stop at some terms). Iterative, keyed by
+    identity. Raises only what ``operands`` raises for a malformed graph;
+    an exception from the client's ``cond`` or ``operands`` propagates
+    unchanged."""
+
+    def __init__(
+        self,
+        roots: Sequence[object],
+        graph: AccessGraph,
+        cond: Callable[[object], BoolRef] | None = None,
+        operands: Callable[[object, AccessGraph], tuple] = children,
+    ) -> None:
+        self.graph = graph
+        self.operands = operands
+        self.order: dict[int, int] = {}
+        nodes: list[object] = []
+        stack = [(r, False) for r in reversed(roots) if r is not None]
+        while stack:
+            t, done = stack.pop()
+            if id(t) in self.order:
+                continue
+            if done:
+                self.order[id(t)] = len(nodes)
+                nodes.append(t)
+                continue
+            stack.append((t, True))
+            stack.extend(
+                (k, False)
+                for k in reversed(operands(t, graph))
+                if id(k) not in self.order
+            )
+        self.guards: dict[int, BoolRef] = {}
+        if cond is None:
+            return
+        direct = {id(r) for r in roots if r is not None}
+        shares: dict[int, list[BoolRef]] = {}
+        for t in reversed(nodes):  # every parent before its children
+            parts = shares.pop(id(t), [])
+            guard = None
+            if id(t) not in direct:
+                guard = parts[0] if len(parts) == 1 else Or(parts)
+                self.guards[id(t)] = guard
+            edges: list[tuple[object, BoolRef | None]]
+            if isinstance(t, Select):
+                c = cond(t.cond)
+                edges = [(t.cond, guard)]
+                for arm, taken in ((t.t, c), (t.f, Z3Not(c))):
+                    edges.append((arm, taken if guard is None else And(guard, taken)))
+            else:
+                edges = [(k, guard) for k in operands(t, graph)]
+            for kid, kid_guard in edges:
+                if kid_guard is None:
+                    direct.add(id(kid))
+                elif id(kid) not in direct:
+                    shares.setdefault(id(kid), []).append(kid_guard)
+
+    def premise(self, term: object, holds: BoolRef) -> BoolRef:
+        """``holds`` where ``term``'s value reaches a root: implied by its
+        guard (``holds`` itself for a term read directly, or one the walk
+        does not hold)."""
+        guard = self.guards.get(id(term))
+        return holds if guard is None else Implies(guard, holds)
+
+    def rank(self, term: object) -> float:
+        """Children first, and a Select's condition before its arms; a term
+        the walk does not hold (e.g. a remainder's quotient) right after its
+        children."""
+        index = self.order.get(id(term))
+        if index is not None:
+            return index
+        kids = [
+            self.order[id(k)]
+            for k in self.operands(term, self.graph)
+            if id(k) in self.order
+        ]
+        return max(kids) + 0.5 if kids else len(self.order)

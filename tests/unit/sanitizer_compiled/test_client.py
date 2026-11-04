@@ -877,10 +877,10 @@ def test_analysis_bugs_are_contained_per_config(quiet, monkeypatch):
 
 
 def test_a_bug_outside_the_configs_is_an_internal_error(quiet, monkeypatch):
-    def broken(failure):
+    def broken(failure, retarget):
         raise RuntimeError("note bug")
 
-    monkeypatch.setattr(client_module, "_failure_refusal", broken)
+    monkeypatch.setattr(client_module, "failure_refusal", broken)
     failure = _failed(ADD, _add_args(), {"BLOCK_SIZE": 2048}, RuntimeError("bad"))
     launch = _launch(quiet, compiled=[_oob_event()], failures=[failure])
 
