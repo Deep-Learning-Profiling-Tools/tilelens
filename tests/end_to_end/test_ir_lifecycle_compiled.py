@@ -284,9 +284,12 @@ def test_a_relaunch_reuses_the_traces_host_compile(monkeypatch):
     compiles = []
     compile = HostCompiler._compile_source
 
-    def counting(*args, **kwargs):
-        compiles.append(1)
-        return compile(*args, **kwargs)
+    def counting(api, src, *args, **kwargs):
+        # A process's first compile for a target also host-compiles the
+        # built-in self-test kernel (once, cached); count this kernel only.
+        if src.name != "_self_test_kernel":
+            compiles.append(1)
+        return compile(api, src, *args, **kwargs)
 
     monkeypatch.setattr(HostCompiler, "_compile_source", staticmethod(counting))
     ir = _SkipIRClient()
