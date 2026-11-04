@@ -286,14 +286,17 @@ class DataDep:
 
 @dataclass(frozen=True)
 class Observed:
-    """The OLD value observed by the atomic at ``graph.accesses[access_index]``:
+    """The value the access at ``graph.accesses[access_index]`` observed (an
+    atomic's OLD value, or a while condition's load):
     a fresh per-program-instance symbol, NOT a function of other leaves. The
     reader binds an INTEGER-typed ``tt.atomic_rmw`` / ``tt.atomic_cas``
     result to this instead of ``DataDep`` so downstream masks and branch
-    conditions stay modelable; float-typed atomic results keep the DataDep
-    fallback. What an observation means (a free variable, a modeled value,
-    a refusal in an address) is each consumer's policy; find them with the
-    graph-aware :func:`mentions_observed`.
+    conditions stay modelable, and an integer ``tt.load`` result of an
+    ``scf.while`` condition region too (while_regions=True); float-typed
+    results keep the DataDep fallback. What an observation means (a free
+    variable, a modeled value, a refusal in an address) is each consumer's
+    policy; find them with the graph-aware :func:`mentions_observed` and
+    :func:`observed_indices`.
 
     A tensor atomic observes one old value per lane, and the symbol stands
     for the value at the lane the surrounding term is read at. It has no
@@ -365,6 +368,16 @@ def mentions_observed(term: object, graph: "AccessGraph") -> bool:
     return any(isinstance(n, Observed) for n in _nodes((term,), graph.iter_args))
 
 
+def observed_indices(term: object, graph: "AccessGraph") -> frozenset[int]:
+    """The access indices of every :class:`Observed` leaf ``term`` reaches
+    (see :func:`mentions_observed`)."""
+    return frozenset(
+        n.access_index
+        for n in _nodes((term,), graph.iter_args)
+        if isinstance(n, Observed)
+    )
+
+
 # DataDep is also the generic unknown-value top (loop accumulators,
 # unmodeled ops, ...). Only these ``why`` prefixes mean the value truly
 # derives from MEMORY CONTENTS — refusals classify just those as
@@ -406,6 +419,17 @@ class FuncArg:
 
 
 @dataclass(frozen=True)
+class AtomicInfo:
+    """An atomic's attributes, in the keywords the printer prints."""
+
+    # tt.atomic_rmw's op: "and", "or", "xor", "add", "fadd", "max", "min",
+    # "umax", "umin", "exch"; None for tt.atomic_cas
+    rmw_op: str | None
+    sem: str  # "relaxed", "acquire", "release", "acq_rel"
+    scope: str  # "gpu", "cta", "sys"
+
+
+@dataclass(frozen=True)
 class AccessEvent:
     kind: str  # "load" | "store" | "atomic_rmw" | "atomic_cas"
     base_param: str
@@ -432,6 +456,71 @@ class AccessEvent:
     # widens the modeled footprint, so UNSAT stays a sound proof — but a SAT
     # model may pick a lane the real mask disables.
     mask_dropped: bool = False
+    # Set iff the access is an atomic.
+    atomic: AtomicInfo | None = None
+    # An atomic's value operand (tt.atomic_rmw val, tt.atomic_cas val) and a
+    # CAS's compare operand as Terms; None when the operand is not modelable
+    # (loaded data, a float, a pointer) or absent.
+    atomic_val: Term | None = None
+    atomic_cmp: Term | None = None
+    # The accessed pointer's pointee is neither an integer nor a pointer.
+    elem_float: bool = False
+    # The earlier load and atomic accesses (indices into graph.accesses)
+    # whose result reaches this access's value operands lane for lane: a
+    # store's value and mask, an atomic_rmw's val and mask, an atomic_cas's
+    # cmp and val, united. Element-wise ops keep their operands' lanes,
+    # tt.dot its accumulator's, arith.select its condition's and those both
+    # arms share; any other op, a region result or a block argument keeps
+    # none (see _Builder.positional). Exact or fewer, never more; () for a
+    # load.
+    deps: tuple[int, ...] = ()
+    # Op.path of the access op: the block indices from the module body down
+    # to the access's own block (one block per region the access sits in).
+    # () only in a hand-built graph, where it reads as the function body.
+    block_path: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class Fence:
+    """A ``ttg.barrier`` (what ``tl.debug_barrier()`` prints), at its place
+    among the accesses: after ``position + 0.5`` of them. ``path``,
+    ``guarded``, ``in_loop`` and ``block_path`` read as an access's do."""
+
+    position: float
+    op: str
+    # the barrier's addrSpace bits: local 1, global_read 2, global_write 4,
+    # tensor_read 8, tensor_write 16 (`all` is 31)
+    addr_space: int
+    path: Term | None
+    guarded: bool
+    in_loop: bool
+    block_path: tuple[int, ...]
+    line_no: int
+    loc: SourceLoc | None
+
+
+@dataclass(frozen=True)
+class WhileRegion:
+    """One ``scf.while``, read under ``parse_ttir(while_regions=True)``:
+    its condition ("before") region's accesses and ``scf.condition``, its
+    body ("after") region's ops and accesses. The accesses are entries of
+    ``graph.accesses`` like any other (``in_loop`` stays the scf.for's);
+    an integer ``tt.load`` result of the before region reads as Observed,
+    like an atomic's. Nested regions' accesses count in their enclosing
+    region's too."""
+
+    line_no: int
+    loc: SourceLoc | None
+    before: tuple[int, ...]  # access indices
+    cond: Term | None  # None when not modelable (loaded data, ...)
+    after_ops: tuple[str, ...]  # op names of the body block, its scf.yield included
+    after: tuple[int, ...]  # access indices
+    carries: bool  # the loop has iter args or results
+    parent: int | None  # index of the enclosing WhileRegion
+    block_path: tuple[int, ...]  # Op.path of the scf.while
+    # its before and after blocks: an op inside it has a path that extends
+    # block_path with one of them
+    blocks: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -472,9 +561,16 @@ class AccessGraph:
     # Loop-carried pointers, indexed by arg_id (``iter_args[k].arg_id == k``),
     # expanded tiles of them included (see IterArgInfo).
     iter_args: tuple[IterArgInfo, ...] = ()
+    # Every program-id axis a tt.get_program_id / tt.get_num_programs reads,
+    # whether or not its value reaches a modeled term (in a combine region
+    # too).
+    pid_axes: frozenset[int] = frozenset()
+    fences: tuple[Fence, ...] = ()
+    whiles: tuple[WhileRegion, ...] = ()  # only under while_regions=True
 
     def __post_init__(self) -> None:
-        for name in ("func_args", "accesses", "iter_args"):
+        object.__setattr__(self, "pid_axes", frozenset(self.pid_axes))
+        for name in ("func_args", "accesses", "iter_args", "fences", "whiles"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
 
     def arg(self, name: str) -> FuncArg | None:
@@ -598,9 +694,13 @@ def width_obligations(
 # ─────────────────────────── the reader ───────────────────────────
 
 
-def parse_ttir(text: str) -> AccessGraph:
+def parse_ttir(text: str, *, while_regions: bool = False) -> AccessGraph:
     """Read one TTIR module into an AccessGraph (single-path model: at most
     one scf.for, structured scf.if only).
+
+    ``while_regions=True`` reads each ``scf.while`` too (a ``WhileRegion`` in
+    ``graph.whiles``) instead of refusing it as control flow; a kernel
+    without one reads the same either way.
 
     Raises :class:`UnsupportedTTIR` for anything the graph cannot represent:
     a text the walk layer cannot align (``READER_MISALIGNMENT``) or does not
@@ -622,7 +722,7 @@ def parse_ttir(text: str) -> AccessGraph:
         raise UnsupportedTTIR(
             TTIRKind.UNPARSABLE, e.diagnostic, line_no=e.line_no
         ) from e
-    return _Builder(module).build()
+    return _Builder(module, while_regions).build()
 
 
 # Memory ops outside the modeled vocabulary (TMA descriptors, ...: targets
@@ -636,9 +736,10 @@ _DIALECTS = frozenset({"tt", "arith", "math", "scf", "cf", "ub"})
 
 
 # Result-free ops without memory effects the reader skips (a barrier orders
-# memory, it addresses none). tl.debug_barrier() is `ttg.barrier all`: the
-# one ttg op accepted, not the dialect. gpu.barrier, which the frontend
-# never emits, is not (the bindings still parse it).
+# memory, it addresses none: it becomes a Fence, except inside a combine
+# region). tl.debug_barrier() is `ttg.barrier all`: the one ttg op accepted,
+# not the dialect. gpu.barrier, which the frontend never emits, is not (the
+# bindings still parse it).
 _INERT = frozenset(
     {
         "tt.return",
@@ -654,6 +755,19 @@ _INERT = frozenset(
 # Ops that hand the reader values it cannot see into (their operands must
 # carry no address, not even as an integer).
 _OPAQUE = frozenset({"tt.elementwise_inline_asm", "tt.extern_elementwise"})
+# Element-wise ops: lane i of the result reads lane i of each operand
+# (AccessEvent.deps). A packed inline asm reads its whole pack, which one
+# thread holds, so a lane stays in the thread that holds it.
+_ELEMENTWISE_PREFIXES = ("arith.", "math.", "tt.precise_")
+_ELEMENTWISE = _OPAQUE | {
+    "tt.addptr",
+    "tt.bitcast",
+    "tt.fp_to_fp",
+    "tt.int_to_ptr",
+    "tt.ptr_to_int",
+    "tt.clampf",
+    "tt.mulhiui",
+}
 # Structured-region nesting the reader follows (deeper refuses, instead of
 # exhausting Python's recursion limit).
 _MAX_DEPTH = 200
@@ -683,6 +797,25 @@ class _ForFrame:
     """Marks the scf.for body being read."""
 
 
+@dataclass
+class _WhileFrame:
+    """Walker state for one scf.while being read (while_regions=True)."""
+
+    index: int  # into _Builder.whiles
+    stage: str = "before"  # "after" once its scf.condition is read
+    cond: object = None  # the scf.condition's value
+    split: int = 0  # len(accesses) at the scf.condition
+
+
+def _positional_operands(op: Op) -> tuple[int, ...]:
+    """The operands whose lane i reaches lane i of ``op``'s results."""
+    if op.name == "tt.dot":  # (a, b, c): only the accumulator keeps its lanes
+        return op.operands[2:3]
+    if op.name.startswith(_ELEMENTWISE_PREFIXES) or op.name in _ELEMENTWISE:
+        return op.operands
+    return ()
+
+
 def _pointee_bits(pointee: str | None) -> int:
     if pointee is None:
         return 0
@@ -692,8 +825,9 @@ def _pointee_bits(pointee: str | None) -> int:
 
 
 class _Builder:
-    def __init__(self, module: Module) -> None:
+    def __init__(self, module: Module, while_regions: bool = False) -> None:
         self.m = module
+        self.while_regions = while_regions
         # value index -> Term (int/bool), PtrValue, or DataDep
         self.env: dict[int, object] = {}
         self.func_args: list[FuncArg] = []
@@ -701,13 +835,19 @@ class _Builder:
         self.iter_args: list[IterArgInfo] = []
         self.loop: LoopInfo | None = None
         self.loops_opened = 0
-        self.frames: list[_IfFrame | _ForFrame] = []
+        self.fences: list[Fence] = []
+        self.whiles: list[WhileRegion | None] = []
+        self.frames: list[_IfFrame | _ForFrame | _WhileFrame] = []
         self.depth = 0
         # (arg_id, axis) -> the arg_id of that iter_arg's tile expanded at
         # axis inside the loop (its delta is filled in when the loop closes)
         self.expanded: dict[tuple[int, int], int] = {}
-        # access indices of the tensor atomics (one observation per lane)
+        # access indices of the tensor observations (one per lane)
         self.lane_observed: set[int] = set()
+        # access op index -> access index, and value index -> the accesses
+        # it reads lane for lane (see positional)
+        self.access_op: dict[int, int] = {}
+        self.prov: dict[int, frozenset[int]] = {}
 
     # ── helpers ──
     def refuse(self, kind: TTIRKind, message: str, op: Op | None) -> NoReturn:
@@ -751,6 +891,8 @@ class _Builder:
         for f in self.frames:
             if isinstance(f, _ForFrame):
                 in_loop = True
+                continue
+            if isinstance(f, _WhileFrame):
                 continue
             if f.cond is None:
                 guarded = True
@@ -824,6 +966,13 @@ class _Builder:
             accesses=tuple(self.accesses),
             loop=self.loop,
             iter_args=tuple(self.iter_args),
+            pid_axes=frozenset(
+                op.attrs["axis"]
+                for op in self.m.ops
+                if op.name in ("tt.get_program_id", "tt.get_num_programs")
+            ),
+            fences=tuple(self.fences),
+            whiles=tuple(self.whiles),  # type: ignore[arg-type]
         )
 
     def bind_arg(self, fa, fop: Op) -> None:
@@ -866,12 +1015,10 @@ class _Builder:
             )
         name = op.name
         self.global_pointers(op.operand_types + op.result_types, op)
-        if name in _INERT:
-            return
         handler = _HANDLERS.get(name)
         if handler is not None:
             handler(self, op)
-        else:
+        elif name not in _INERT:
             self.op_other(op)
 
     # ── value ops ──
@@ -1084,6 +1231,9 @@ class _Builder:
         op: Op,
         kind: str,
         mask_v: int | None,
+        atomic: AtomicInfo | None = None,
+        atomic_val: Term | None = None,
+        atomic_cmp: Term | None = None,
     ) -> None:
         ptr_v = op.operands[0]
         ptr = self.val(ptr_v)
@@ -1118,6 +1268,10 @@ class _Builder:
                 mask = mv  # type: ignore[assignment]
         guarded, path, in_loop = self.branch_state()
         assert op.line_no is not None
+        # the value operands: a store's value and mask, an atomic_rmw's val
+        # and mask, an atomic_cas's cmp and val (ODS order, after the pointer)
+        deps = self.positional(op.operands[1:]) if kind != "load" else ()
+        self.access_op[op.index] = len(self.accesses)
         self.accesses.append(
             AccessEvent(
                 kind=kind,
@@ -1131,8 +1285,50 @@ class _Builder:
                 path=path,
                 in_loop=in_loop,
                 mask_dropped=mask_dropped,
+                atomic=atomic,
+                atomic_val=atomic_val,
+                atomic_cmp=atomic_cmp,
+                elem_float=pointee is not None
+                and parse_type(pointee).int_bits is None
+                and parse_type(pointee).pointee is None,
+                deps=deps,
+                block_path=op.path,
             )
         )
+
+    def positional(self, values: Iterable[int]) -> tuple[int, ...]:
+        """The accesses whose result reaches ``values`` lane for lane: a
+        load's or atomic's result is its own access's; an element-wise op
+        (_ELEMENTWISE) keeps its operands' and tt.dot its accumulator's; an
+        arith.select keeps its condition's and those both arms share; any
+        other op (a shape change, a reduction, a region's result) and a
+        block argument keep none. ``values`` unite: the access reads each of
+        them at the lane. Memoized per value, iterative."""
+        memo = self.prov
+        roots = list(values)
+        stack = [(v, False) for v in roots]
+        while stack:
+            v, ready = stack.pop()
+            if v in memo:
+                continue
+            src = self.m.values[v].op
+            if src is None:
+                memo[v] = frozenset()
+                continue
+            if src in self.access_op:
+                memo[v] = frozenset((self.access_op[src],))
+                continue
+            op = self.m.ops[src]
+            ins = _positional_operands(op)
+            if not ready and any(x not in memo for x in ins):
+                stack.append((v, True))
+                stack.extend((x, False) for x in ins if x not in memo)
+            elif op.name == "arith.select":
+                c, t, f = (memo[x] for x in ins)
+                memo[v] = c | (t & f)
+            else:
+                memo[v] = frozenset().union(*(memo[x] for x in ins))
+        return tuple(sorted(frozenset().union(*(memo[v] for v in roots))))
 
     def mask_operand(self, op: Op, index: int) -> int | None:
         if len(op.operands) <= index:
@@ -1142,16 +1338,16 @@ class _Builder:
             self.refuse(TTIRKind.OTHER, f"{op.name} operand {index} is not a mask", op)
         return v
 
-    def observed_binding(self, op: Op) -> object:
-        """The value of the just-recorded atomic's result: Observed for an
-        integer-typed result, DataDep otherwise (floats stay outside the Int
-        model)."""
+    def observed_binding(self, op: Op, why: str = "atomic result") -> object:
+        """The value of the just-recorded access's result: Observed for an
+        integer-typed result, DataDep(``why``) otherwise (floats stay
+        outside the Int model)."""
         if op.results and self.int_bits(op.results[0]) is not None:
             index = len(self.accesses) - 1
             if parse_type(self.m.values[op.results[0]].type).shape:
                 self.lane_observed.add(index)
             return Observed(index)
-        return DataDep("atomic result")
+        return DataDep(why)
 
     def op_load(self, op: Op) -> None:
         # ODS operands (ptr, mask?, other?). Both are optional, so the
@@ -1167,7 +1363,11 @@ class _Builder:
         else:
             mask_v = self.mask_operand(op, 1) if segments[1] else None
         self.access(op, "load", mask_v)
-        self.bind(op, DataDep("loaded value"))
+        if any(isinstance(f, _WhileFrame) and f.stage == "before" for f in self.frames):
+            # a poll: what the loop's condition reads
+            self.bind(op, self.observed_binding(op, "loaded value"))
+        else:
+            self.bind(op, DataDep("loaded value"))
 
     def op_store(self, op: Op) -> None:
         # ODS operands (ptr, value, mask?)
@@ -1179,6 +1379,8 @@ class _Builder:
             op,
             "atomic_rmw",
             self.mask_operand(op, 2),
+            atomic=AtomicInfo(op.attrs["rmw_op"], op.attrs["sem"], op.attrs["scope"]),
+            atomic_val=_operand_term(self.val(op.operands[1])),
         )
         self.bind(op, self.observed_binding(op))
 
@@ -1188,6 +1390,9 @@ class _Builder:
             op,
             "atomic_cas",
             None,
+            atomic=AtomicInfo(None, op.attrs["sem"], op.attrs["scope"]),
+            atomic_val=_operand_term(self.val(op.operands[2])),
+            atomic_cmp=_operand_term(self.val(op.operands[1])),
         )
         self.bind(op, self.observed_binding(op))
 
@@ -1339,8 +1544,69 @@ class _Builder:
             else:
                 self.env[r] = self.merge(cond, yields[0][k], yields[1][k], "scf.if")
 
+    def op_while(self, op: Op) -> None:
+        """An scf.while: a WhileRegion under while_regions=True, else
+        refused. Its region arguments and results are loop-carried values
+        (DataDep)."""
+        if not self.while_regions or [len(r) for r in op.regions] != [1, 1]:
+            self.op_control_flow(op)
+        before, after = (self.m.blocks[r[0]] for r in op.regions)
+        for v in before.args + after.args:
+            self.env[v] = DataDep(_LOOP_CARRIED)
+        parent = next(
+            (f.index for f in reversed(self.frames) if isinstance(f, _WhileFrame)),
+            None,
+        )
+        frame = _WhileFrame(len(self.whiles))
+        self.whiles.append(None)  # filled in below, after the nested ones
+        first = len(self.accesses)
+        self.frames.append(frame)
+        self.block(before.index)  # ends with the scf.condition (op_condition)
+        self.block(after.index)
+        self.frames.pop()
+        cond = frame.cond
+        assert op.line_no is not None
+        self.whiles[frame.index] = WhileRegion(
+            line_no=op.line_no,
+            loc=op.loc,
+            before=tuple(range(first, frame.split)),
+            cond=None if isinstance(cond, (DataDep, PtrValue)) else cond,  # type: ignore[arg-type]
+            after_ops=tuple(self.m.ops[oi].name for oi in after.ops),
+            after=tuple(range(frame.split, len(self.accesses))),
+            carries=bool(op.operands or op.results),
+            parent=parent,
+            block_path=op.path,
+            blocks=(before.index, after.index),
+        )
+        self.bind(op, DataDep("loop result"))
+
+    def op_condition(self, op: Op) -> None:
+        # the terminator of the before region of the scf.while being read
+        frame = self.frames[-1] if self.frames else None
+        if not (isinstance(frame, _WhileFrame) and frame.stage == "before"):
+            self.op_control_flow(op)
+        frame.cond = self.val(op.operands[0])
+        frame.stage, frame.split = "after", len(self.accesses)
+
+    def op_barrier(self, op: Op) -> None:
+        guarded, path, in_loop = self.branch_state()
+        assert op.line_no is not None
+        self.fences.append(
+            Fence(
+                position=len(self.accesses) - 0.5,
+                op=op.name,
+                addr_space=op.attrs["addr_space"],
+                path=path,
+                guarded=guarded,
+                in_loop=in_loop,
+                block_path=op.path,
+                line_no=op.line_no,
+                loc=op.loc,
+            )
+        )
+
     # ── everything else ──
-    def op_control_flow(self, op: Op) -> None:
+    def op_control_flow(self, op: Op) -> NoReturn:
         self.refuse(TTIRKind.CONTROL_FLOW, f"control flow {op.name} is unsupported", op)
 
     def op_call(self, op: Op) -> None:
@@ -1490,6 +1756,11 @@ def _address_kind(v: object) -> TTIRKind:
     return TTIRKind.OTHER
 
 
+def _operand_term(v: object) -> Term | None:
+    """An atomic's cmp / val operand as a Term, or None when unmodelable."""
+    return None if isinstance(v, (DataDep, PtrValue)) else v  # type: ignore[return-value]
+
+
 def _with_children(t: object, kids: tuple) -> object:
     if isinstance(t, (Bin, Cmp, BoolBin)):
         return replace(t, a=kids[0], b=kids[1])
@@ -1590,6 +1861,9 @@ _HANDLERS = {
     "tt.atomic_cas": _Builder.op_atomic_cas,
     "scf.for": _Builder.op_for,
     "scf.if": _Builder.op_if,
+    "scf.while": _Builder.op_while,
+    "scf.condition": _Builder.op_condition,
+    "ttg.barrier": _Builder.op_barrier,
     "tt.call": _Builder.op_call,
     "tt.elementwise_inline_asm": _Builder.op_inline_asm,
     "tt.extern_elementwise": _Builder.op_extern,

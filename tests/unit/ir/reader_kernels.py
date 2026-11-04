@@ -246,6 +246,121 @@ def observed_lanes(cnt_ptr, x_ptr, N: tl.constexpr):
     tl.store(x_ptr + c[:, None] - c[None, :], 1.0)
 
 
+# ── facts for the race detector ──
+@triton.jit
+def atomic_attrs(p_ptr, u_ptr, f_ptr, lock_ptr):
+    # every tt.atomic_rmw op, sem and scope, and a tt.atomic_cas
+    pid = tl.program_id(0)
+    tl.atomic_and(p_ptr, 1, sem="relaxed", scope="gpu")
+    tl.atomic_or(p_ptr, 1, sem="acquire", scope="cta")
+    tl.atomic_xor(p_ptr, 1, sem="release", scope="sys")
+    tl.atomic_add(p_ptr, pid, sem="acq_rel")
+    tl.atomic_add(f_ptr, 1.0)
+    tl.atomic_max(p_ptr, 1)
+    tl.atomic_min(p_ptr, 1)
+    tl.atomic_max(u_ptr, 1)
+    tl.atomic_min(u_ptr, 1)
+    tl.atomic_xchg(p_ptr, tl.load(p_ptr + 1))
+    tl.atomic_cas(lock_ptr, pid, 1, sem="release", scope="sys")
+
+
+@triton.jit
+def deps_rules(x_ptr, y_ptr, m_ptr, out_ptr, n, B: tl.constexpr):
+    # which loads reach each store lane for lane
+    offs = tl.arange(0, B)
+    x = tl.load(x_ptr + offs)
+    y = tl.load(y_ptr + offs)
+    m = tl.load(m_ptr + offs)
+    tl.store(out_ptr + offs, x * 2 + 1, mask=m > 0)  # element-wise: x, m
+    tl.store(out_ptr + offs, tl.where(m > 0, x, y))  # the condition's: m
+    tl.store(out_ptr + offs, tl.where(offs < n, x, x + 1))  # both arms': x
+    tl.store(out_ptr + offs, tl.where(offs < n, x, y))  # one arm each: none
+    tl.store(out_ptr + offs, tl.sum(x, 0) + y)  # a splat of a scalar sum drops x
+    v = x
+    if n > 0:
+        v = x + 1
+    tl.store(out_ptr + offs, v)  # an scf.if result: none
+    e = tl.exp(x).to(tl.int32, bitcast=True).to(tl.float32, bitcast=True)
+    tl.store(out_ptr + offs, e)  # math.exp, tt.bitcast: x
+    x2 = tl.load(x_ptr + offs[:, None] * B + offs[None, :])
+    tl.store(out_ptr + offs, tl.sum(x2, 1))  # a reduction: none
+    z = tl.load(y_ptr + offs, mask=m > 0)  # a load: none, though masked by m
+    tl.store(out_ptr + offs, z)
+    tl.store(out_ptr + offs, x, mask=tl.sum(x, 0) > 0)  # operands unite: x
+    acc = x
+    for i in range(0, n):
+        acc = acc + 1
+        tl.store(out_ptr + offs, acc)  # a loop-carried value: none
+
+
+@triton.jit
+def deps_dot(a_ptr, b_ptr, c_ptr, out_ptr):
+    # tt.dot keeps only its accumulator's lanes
+    r = tl.arange(0, 16)
+    t = r[:, None] * 16 + r[None, :]
+    a = tl.load(a_ptr + t)
+    b = tl.load(b_ptr + t)
+    c = tl.load(c_ptr + t)
+    tl.store(out_ptr + t, tl.dot(a, b, c))
+
+
+@triton.jit
+def deps_atomics(x_ptr, m_ptr, cnt_ptr, lock_ptr, B: tl.constexpr):
+    offs = tl.arange(0, B)
+    x = tl.load(x_ptr + offs)
+    m = tl.load(m_ptr + offs)
+    old = tl.atomic_add(cnt_ptr + offs, x, mask=m > 0)  # val and mask
+    c = tl.load(x_ptr)
+    v = tl.load(m_ptr)
+    tl.atomic_cas(lock_ptr, c, v)  # cmp and val
+    tl.store(x_ptr + offs, old)  # an atomic's result
+
+
+@triton.jit
+def fences(x_ptr, n):
+    pid = tl.program_id(0)
+    tl.store(x_ptr + pid, 1)
+    tl.debug_barrier()
+    v = tl.load(x_ptr)
+    if pid < n:
+        tl.debug_barrier()
+        tl.store(x_ptr + 1, v)
+    if v > 0:
+        tl.debug_barrier()
+    for i in range(0, n):
+        tl.debug_barrier()
+        tl.store(x_ptr + i, 2)
+    tl.store(x_ptr + 2, tl.program_id(1) + tl.num_programs(2))
+
+
+@triton.jit
+def _pid_combine(a, b):
+    tl.debug_barrier()
+    return a + b * tl.program_id(1)
+
+
+@triton.jit
+def pid_in_combine(x_ptr, o_ptr, B: tl.constexpr):
+    # a program id and a barrier only inside a combine region
+    s = tl.reduce(tl.load(x_ptr + tl.arange(0, B)), 0, _pid_combine)
+    tl.store(o_ptr + tl.program_id(0), s)
+
+
+@triton.jit
+def poll_while(flag_ptr, out_ptr, n):
+    # a volatile poll, a poll under a modeled branch, and one nested in another
+    while tl.load(flag_ptr, volatile=True) == 0:
+        pass
+    pid = tl.program_id(0)
+    if pid < n:
+        while tl.load(flag_ptr + pid, volatile=True) != n:
+            pass
+    while tl.atomic_add(flag_ptr + 1, 0) == 0:
+        while tl.load(flag_ptr + 2, volatile=True) == 0:
+            pass
+    tl.store(out_ptr + pid, 1)
+
+
 _F32 = "*fp32"
 # corpus name (reader_ttir/<name>.ttir, the kernel of that name) ->
 # (signature, constexprs), compiled for sm80 with the default options
@@ -278,4 +393,36 @@ SPECS: dict[str, tuple[dict[str, str], dict[str, Any]]] = {
     "iv_wrap": ({"x_ptr": _F32, "lo": "i32", "n": "i32"}, {}),
     "pure_asm_int_addr": ({"x_ptr": "*i32"}, {}),
     "observed_lanes": ({"cnt_ptr": "*i32", "x_ptr": _F32, "N": "constexpr"}, {"N": 4}),
+    "atomic_attrs": (
+        {"p_ptr": "*i32", "u_ptr": "*u32", "f_ptr": _F32, "lock_ptr": "*i32"},
+        {},
+    ),
+    "deps_rules": (
+        {
+            "x_ptr": _F32,
+            "y_ptr": _F32,
+            "m_ptr": "*i32",
+            "out_ptr": _F32,
+            "n": "i32",
+            "B": "constexpr",
+        },
+        {"B": 8},
+    ),
+    "deps_dot": (
+        {"a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": _F32, "out_ptr": _F32},
+        {},
+    ),
+    "deps_atomics": (
+        {
+            "x_ptr": "*i32",
+            "m_ptr": "*i32",
+            "cnt_ptr": "*i32",
+            "lock_ptr": "*i32",
+            "B": "constexpr",
+        },
+        {"B": 8},
+    ),
+    "fences": ({"x_ptr": "*i32", "n": "i32"}, {}),
+    "pid_in_combine": ({"x_ptr": "*i32", "o_ptr": "*i32", "B": "constexpr"}, {"B": 8}),
+    "poll_while": ({"flag_ptr": "*i32", "out_ptr": "*i32", "n": "i32"}, {}),
 }
