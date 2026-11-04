@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Callable, Iterable, Iterator
 
 from z3 import And, BoolSort, BoolVal, Not, Or, is_false, is_true, simplify, substitute
 from z3.z3 import BoolRef, IntNumRef
+
+# Z3's main context, where the race detectors build and solve their
+# records, is shared and not thread-safe: a race detector holds this lock
+# around its solve (and the compiled one around building its records too),
+# and drops every term it made before releasing it.
+MAIN_CONTEXT_LOCK = threading.RLock()
 
 
 class UnsupportedSymbolicRaceQuery(Exception):

@@ -119,6 +119,7 @@ from ....ir.ttir_reader import (
     width_obligations,
 )
 from ....ir.verdict import Refusal, SourceLocation
+from ...pids import PID_AXES, pid_name, pid_var
 from ..data import CompiledFindingKind
 
 
@@ -374,7 +375,7 @@ class _Env:
         self.ctx = ctx
         # Range premises of the variables created so far.
         self.premises: list[BoolRef] = []
-        self.pids = tuple(Int(f"pid_{axis}", ctx) for axis in range(3))
+        self.pids = tuple(pid_var(axis, ctx) for axis in PID_AXES)
         for pid, size in zip(self.pids, grid):
             self.premises += [pid >= 0, pid < size]
         # (dim, extent) -> the lane's position along that dim (see arange).
@@ -1062,7 +1063,7 @@ class _Check:
         def val(v: ArithRef) -> int:
             return model.eval(v, model_completion=True).as_long()
 
-        out = {f"pid_{axis}": val(pid) for axis, pid in enumerate(env.pids)}
+        out = {pid_name(axis): val(pid) for axis, pid in enumerate(env.pids)}
         for name, lane in env.lanes.items():
             out[name] = val(lane)
         if env.k is not None:

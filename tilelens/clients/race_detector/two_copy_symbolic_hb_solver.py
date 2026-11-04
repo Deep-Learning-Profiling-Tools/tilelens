@@ -44,7 +44,8 @@ Address-domain invariant:
 Z3 context:
   Every term lives in Z3's main context. Records must be lowered there (a
   term from another context fails with Z3's "Context mismatch"), and since
-  that context is shared and not thread-safe, the caller serializes solves.
+  that context is shared and not thread-safe, the caller serializes solves
+  (``hb_common.MAIN_CONTEXT_LOCK``).
 
 Intra-instance duplicate lanes:
   Cross-copy queries assert ``different_blocks``, so they can never witness
@@ -152,6 +153,7 @@ from z3 import (
 )
 from z3.z3 import BoolRef, IntNumRef, ModelRef
 
+from .. import pids
 from .conflict_simplification import (
     _PureSelectExpressionCache,
     conflict_impossible,
@@ -258,11 +260,8 @@ class SymbolicMemoryEvent:
     causal_inputs: tuple[Any, ...] = ()
 
 
-def _import_symbolic_expr_pids():
-    # Local import: SymbolicExpr is a heavy module; keep tests cheap.
-    from ..symbolic_engine import SymbolicExpr
-
-    return (SymbolicExpr.PID0, SymbolicExpr.PID1, SymbolicExpr.PID2)
+def _main_context_pids():
+    return (pids.PID0, pids.PID1, pids.PID2)
 
 
 def _is_symbolic_dim(d: Any) -> bool:
@@ -1412,7 +1411,7 @@ class TwoCopySymbolicHBSolver:
 
     @staticmethod
     def _make_pid_subs(pid_a, pid_b):
-        orig = _import_symbolic_expr_pids()
+        orig = _main_context_pids()
         sub_a = tuple((orig[i], pid_a[i]) for i in range(3))
         sub_b = tuple((orig[i], pid_b[i]) for i in range(3))
         return sub_a, sub_b
@@ -2145,7 +2144,7 @@ class TwoCopySymbolicHBSolver:
         ctx = CopyContext(
             label=tag,
             pid=pid,
-            pid_substitutions=tuple(zip(_import_symbolic_expr_pids(), pid)),
+            pid_substitutions=tuple(zip(_main_context_pids(), pid)),
             arange_substitutions=tuple(arange_subs),
             arange_constraints=(),
             copy_local_substitutions=copy_local,

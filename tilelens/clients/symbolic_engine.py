@@ -106,6 +106,7 @@ from ..core.symbolic_metadata import (
     type_spec,
     unpack_type_spec,
 )
+from . import pids
 from .utils import (
     check_storage_contiguous,
     get_physical_addr_from_tensor_slice,
@@ -457,9 +458,9 @@ class SymbolicExpr:
     )
     SUPPORTED_OP_SET: ClassVar[frozenset[str]] = frozenset(SUPPORTED_OPS)
 
-    PID0: ClassVar[ArithRef] = Int("pid_0")
-    PID1: ClassVar[ArithRef] = Int("pid_1")
-    PID2: ClassVar[ArithRef] = Int("pid_2")
+    PID0: ClassVar[ArithRef] = pids.PID0
+    PID1: ClassVar[ArithRef] = pids.PID1
+    PID2: ClassVar[ArithRef] = pids.PID2
 
     ARANGE_DICT: ClassVar[
         dict[tuple[Any, ...], tuple[ArithRef, ConstraintConjunction]]
@@ -1055,8 +1056,7 @@ class PidSymbolicExpr(SymbolicExpr):
         self.dtype = INT32
 
     def _node_label_core(self) -> str:
-        axis_val = self.axis.to_py()
-        return f"pid_{axis_val}"
+        return pids.pid_name(self.axis.to_py())
 
     def _to_z3_impl(self) -> tuple[Z3Expr, ConstraintConjunction]:
         axis_val = self.axis.to_py()

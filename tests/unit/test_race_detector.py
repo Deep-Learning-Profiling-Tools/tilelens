@@ -5,7 +5,7 @@ import triton.language as tl
 from z3 import substitute
 
 import tilelens
-from tilelens.clients import RaceDetector
+from tilelens.clients import CompiledRaceDetector, RaceDetector
 from tilelens.clients.race_detector.race_detector import (
     SymbolicRaceDetector,
     NullRaceDetector,
@@ -31,11 +31,15 @@ def test_race_detector_factory_toggle():
         cfg.enable_race_detector = saved
 
 
-def test_compile_mode_is_not_available_yet(monkeypatch):
+def test_compile_mode_is_the_compiled_race_detector(monkeypatch):
     monkeypatch.setattr(cfg, "enable_race_detector", True)
-    for make in (RaceDetector, SymbolicRaceDetector):
-        with pytest.raises(NotImplementedError, match="compiled race detector"):
-            make(compile=True)
+    det = RaceDetector(compile=True, target="cuda:90")
+    assert type(det) is CompiledRaceDetector and isinstance(det, RaceDetector)
+    assert (det.ir_target.arch, det.LAUNCH, det.IR_STAGES) == (90, "skip", {"ttir"})
+    with pytest.raises(TypeError, match=r"RaceDetector\(compile=True\)"):
+        SymbolicRaceDetector(compile=True)
+    monkeypatch.setattr(cfg, "enable_race_detector", False)
+    assert isinstance(RaceDetector(compile=True), NullRaceDetector)
 
 
 @triton.jit

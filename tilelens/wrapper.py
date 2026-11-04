@@ -14,8 +14,8 @@ SANITIZER_COMMAND = "tile-sanitizer"
 PROFILER_COMMAND = "tile-profiler"
 RACE_DETECTOR_COMMAND = "tile-race"
 
-# tile-sanitizer's flag for the compiled sanitizer, given before the script
-# name.
+# tile-sanitizer's and tile-race's flag for their compiled mode, given before
+# the script name.
 COMPILE_FLAG = "--compile"
 COMPILE_NOTE = (
     f"[{COMPILE_FLAG}] kernel launches are compiled and checked, not run: "
@@ -61,6 +61,11 @@ def profiler_wrapper(kernel, *, frontend: str = "triton"):
 
 def race_detector_wrapper(kernel, *, frontend: str = "triton"):
     tracer = tilelens.trace(client=RaceDetector(), frontend=frontend)
+    return tracer(kernel)
+
+
+def compiled_race_detector_wrapper(kernel, *, frontend: str = "triton"):
+    tracer = tilelens.trace(client=RaceDetector(compile=True), frontend=frontend)
     return tracer(kernel)
 
 
@@ -205,10 +210,18 @@ def apply_profiler():
 
 def apply_race_detector():
     """
-    Apply the race detector wrapper to triton.jit and run the user script.
+    Apply the race detector wrapper to triton.jit and run the user script; with
+    ``--compile`` before the script, the compiled race detector's.
     """
     _apply_wrapper(
         race_detector_wrapper,
         RACE_DETECTOR_COMMAND,
-        f"Usage: {RACE_DETECTOR_COMMAND} <script.py> [args...]",
+        f"Usage: {RACE_DETECTOR_COMMAND} [{COMPILE_FLAG}] <script.py> [args...]\n"
+        f"  {COMPILE_FLAG}  analyze each launch's compiled kernel "
+        "(RaceDetector(compile=True)) instead of interpreting it; kernels are "
+        "not run, so their outputs are never written. Kernels are compiled on "
+        "the host (no GPU needed) for TILELENS_IR_TARGET, by default cuda:89; "
+        "a config that fails to compile for it is reported as not analyzed, "
+        "and the script goes on.",
+        compile_wrapper=compiled_race_detector_wrapper,
     )

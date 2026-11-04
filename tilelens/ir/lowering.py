@@ -16,7 +16,9 @@ Operator semantics, the reader's integer model (see ``ttir_reader``):
 
 * ``+ - *`` are unbounded Int arithmetic; ``//`` and ``%`` truncate toward
   zero (``arith.divsi`` / ``remsi``: the remainder takes the dividend's
-  sign); ``min`` / ``max`` pick an operand;
+  sign), encoded for any signs unless the client gives the Lowerer its own
+  ``divrem`` (an equal value it can encode more cheaply); ``min`` /
+  ``max`` pick an operand;
 * the unsigned ops (``u//``, ``u%``, ``umin``, ``umax``) and predicates
   (``ult``, ...) read as their signed twins, and an ``IntCast`` as its
   operand: exact only where the access's ``width_obligations`` hold, which
@@ -137,6 +139,21 @@ def _divrem_ir(op: str, a: ArithRef, b: ArithRef) -> ArithRef:
     return q if op in ("//", "u//") else a - b * q
 
 
+DIVREM_OPS = frozenset({"//", "u//", "%", "u%"})
+
+# A client's encoding of a quotient or remainder (a Bin whose op is in
+# DIVREM_OPS): (the term, its lowered dividend, its lowered divisor) -> a
+# value equal to the IR's truncating one wherever the client's queries
+# read it.
+DivRem = Callable[[Bin, ArithRef, ArithRef], ArithRef]
+
+
+def truncating_divrem(t: Bin, a: ArithRef, b: ArithRef) -> ArithRef:
+    """The default DivRem: the IR's truncating quotient or remainder,
+    encoded for any signs of ``a`` and ``b``."""
+    return _divrem_ir(t.op, a, b)
+
+
 def _bin(op: str, a: ArithRef, b: ArithRef) -> ArithRef:
     # The unsigned ops read their operands unsigned; their width
     # obligations make both non-negative, where they equal the signed ones.
@@ -146,8 +163,6 @@ def _bin(op: str, a: ArithRef, b: ArithRef) -> ArithRef:
         return a - b
     if op == "*":
         return a * b
-    if op in ("//", "u//", "%", "u%"):
-        return _divrem_ir(op, a, b)
     if op in ("min", "umin"):
         return If(a <= b, a, b)
     if op in ("max", "umax"):
@@ -238,11 +253,18 @@ def fold(
 
 class Lowerer:
     """The lowering of one family of a client's queries: bound to one graph
-    and one leaves object (so one Z3 context), with one memo."""
+    and one leaves object (so one Z3 context), with one memo; ``divrem``
+    encodes ``//`` and ``%`` (by default for any signs)."""
 
-    def __init__(self, graph: AccessGraph, leaves: TermLeaves) -> None:
+    def __init__(
+        self,
+        graph: AccessGraph,
+        leaves: TermLeaves,
+        divrem: DivRem = truncating_divrem,
+    ) -> None:
         self.graph = graph
         self.leaves = leaves
+        self._divrem = divrem
         self._memo: dict[int, tuple[object, Any]] = {}
 
     def lower(self, term: object) -> Any:
@@ -276,7 +298,10 @@ class Lowerer:
             k = leaves.iteration(loop_ssa or _loop(self.graph, t, "").loop_ssa)
             return as_int(kids[0]) + k * as_int(kids[1])
         if isinstance(t, Bin):
-            return _bin(t.op, as_int(kids[0]), as_int(kids[1]))
+            a, b = as_int(kids[0]), as_int(kids[1])
+            if t.op in DIVREM_OPS:
+                return self._divrem(t, a, b)
+            return _bin(t.op, a, b)
         if isinstance(t, Cmp):
             return _cmp(t.pred, kids[0], kids[1])
         if isinstance(t, BoolBin):

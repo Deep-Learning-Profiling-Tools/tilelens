@@ -12,6 +12,19 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "RaceType": ("tilelens.clients.race_detector.data", "RaceType"),
     "RaceRecord": ("tilelens.clients.race_detector.data", "RaceRecord"),
     "RaceAccess": ("tilelens.clients.race_detector.data", "RaceAccess"),
+    "CompiledRaceDetector": (
+        "tilelens.clients.race_detector.compiled.client",
+        "CompiledRaceDetector",
+    ),
+    "CompiledRaceRecord": (
+        "tilelens.clients.race_detector.data",
+        "CompiledRaceRecord",
+    ),
+    "RaceVerdict": ("tilelens.clients.race_detector.data", "RaceVerdict"),
+    "RaceConfigVerdict": (
+        "tilelens.clients.race_detector.data",
+        "RaceConfigVerdict",
+    ),
     "Sanitizer": ("tilelens.clients.sanitizer.sanitizer", "Sanitizer"),
     "CompiledSanitizer": (
         "tilelens.clients.sanitizer.compiled.client",

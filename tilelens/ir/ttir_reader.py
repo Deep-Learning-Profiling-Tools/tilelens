@@ -547,6 +547,12 @@ class AccessEvent:
     # The enclosing scf.for loops (LoopInfo.loop_ssa), outermost first;
     # ``in_loop == bool(loops)`` (a hand-built graph may leave it empty).
     loops: tuple[str, ...] = ()
+    # The tile shape of the access: the pointer operand's tensor type
+    # (``tensor<16x16x!tt.ptr<i32>>`` is (16, 16)); () for a scalar pointer
+    # and in a hand-built graph. The lanes of a dimension the offset does not
+    # vary along (a broadcast pointer, ``p + tl.zeros([B])``) share an
+    # address.
+    shape: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1500,6 +1506,7 @@ class _Builder:
                 deps=deps,
                 block_path=op.path,
                 loops=loops,
+                shape=parse_type(self.m.values[ptr_v].type).shape,
             )
         )
 

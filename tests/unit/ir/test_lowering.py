@@ -313,6 +313,18 @@ def test_division_truncates_toward_zero(a, b, quotient, remainder):
     assert _eval(Bin("%", Const(a), Const(b), 32)) == remainder
 
 
+def test_a_client_divrem_encodes_quotients_and_remainders():
+    seen = []
+
+    def divrem(t, a, b):
+        seen.append(t.op)
+        return a + b
+
+    term = Bin("u//", Param("x"), Bin("%", Param("x"), Const(3)))
+    lowered = Lowerer(_graph(), _Leaves(), divrem=divrem).lower(term)
+    assert seen == ["%", "u//"] and _proved(lowered == _v("x") + _v("x") + 3)
+
+
 def test_loop_terms_read_the_clients_iteration():
     """LoopVar is lower + k * step, IterArgOffset offset0 + k * delta, with
     k the leaves' iteration of that loop: an IterArgInfo without a loop_ssa

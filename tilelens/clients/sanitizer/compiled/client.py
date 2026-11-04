@@ -83,7 +83,7 @@ from __future__ import annotations
 
 import sys
 from collections import OrderedDict
-from collections.abc import Hashable, Mapping
+from collections.abc import Hashable
 from dataclasses import replace
 from typing import Any, ClassVar
 
@@ -91,7 +91,13 @@ from ....core.client import LaunchCall
 from ....core.config import config as cfg
 from ....core.data import Load, Store
 from ....core.host_compile import parse_ir_target
-from ....ir.capture import ArtifactLog, CompiledSpecialization, ParseCache
+from ....ir.capture import (
+    ArtifactLog,
+    CompiledSpecialization,
+    ParseCache,
+    configs_of,
+    saveable_config,
+)
 from ....ir.client import IRClient
 from ....ir.failures import (
     compiles_nowhere,
@@ -100,7 +106,7 @@ from ....ir.failures import (
     nothing_compiled,
     nowhere_note,
 )
-from ....ir.launch import LaunchBinding, TensorFacts, tensor_facts
+from ....ir.launch import LaunchBinding
 from ....ir.verdict import ConfigVerdict, IRVerdict, Refusal
 from ....utils.traceback_utils import location_to_traceback_info
 from ..data import CompiledSanitizerRecord
@@ -200,12 +206,12 @@ class CompiledSanitizer(IRClient):
         notes: list[str] = []
         for failure in log.failures:
             if compiles_nowhere(failure.error):
-                notes.append(nowhere_note(failure, _saveable(failure.config)))
+                notes.append(nowhere_note(failure, saveable_config(failure.config)))
             else:
                 failed.append(
                     ConfigVerdict(
                         None,
-                        _saveable(failure.config),
+                        saveable_config(failure.config),
                         "unsupported",
                         failure_refusal(failure, _NAME_A_TARGET),
                     )
@@ -255,9 +261,9 @@ class CompiledSanitizer(IRClient):
         self, spec: CompiledSpecialization
     ) -> list[tuple[list[CompiledSanitizerRecord], ConfigVerdict]]:
         """One (records, ConfigVerdict) per config among ``spec``'s
-        bindings, in the order first seen (see _configs_of): each config is
+        bindings, in the order first seen (see configs_of): each config is
         checked against its own bindings only."""
-        configs = _configs_of(spec)
+        configs = configs_of(spec)
         try:
             graph = self._graph_of(spec)
         except Exception as exc:
@@ -360,83 +366,6 @@ class CompiledSanitizer(IRClient):
 
 def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
-
-
-_PLAIN = (str, int, float, bool, type(None))
-
-
-def _tensor_of(value: Any) -> TensorFacts | None:
-    """``value``'s tensor facts, None if it is no (readable) tensor."""
-    if not hasattr(value, "data_ptr"):
-        return None
-    try:
-        return tensor_facts(value)
-    except Exception:
-        return None
-
-
-def _saveable(config: Mapping[str, Any]) -> dict[str, Any]:
-    """The config kwargs, each value a saved trace cannot hold put as text:
-    a tensor (e.g. a heuristic's view) described by its facts, never its
-    data, anything else (e.g. a heuristic's tl.dtype) as its repr."""
-
-    def describe(value: Any) -> Any:
-        if isinstance(value, _PLAIN):
-            return value
-        facts = _tensor_of(value)
-        if facts is None:
-            return repr(value)
-        return (
-            f"<tensor data_ptr={facts.data_ptr:#x} shape={facts.shape} "
-            f"strides={facts.strides} dtype={facts.dtype}>"
-        )
-
-    return {name: describe(value) for name, value in config.items()}
-
-
-def _config_key(config: Mapping[str, Any]) -> Hashable:
-    """What tells two bindings' config kwargs apart: a plain value by type
-    and value, a tuple item by item, a tensor by its data_ptr, shape,
-    strides and dtype (never its data), any other hashable value by type
-    and equality, anything else by identity (the bindings hold the values
-    while the keys are compared)."""
-
-    def key(value: Any) -> Hashable:
-        if isinstance(value, float):
-            return (float, value.hex())  # -0.0 apart from 0.0, NaN equal
-        if isinstance(value, _PLAIN):
-            return (type(value), value)
-        if isinstance(value, tuple):
-            return (type(value), tuple(key(item) for item in value))
-        facts = _tensor_of(value)
-        if facts is not None:
-            return ("tensor", facts.data_ptr, facts.shape, facts.strides, facts.dtype)
-        try:
-            hash(value)
-        except Exception:
-            return ("id", id(value))
-        return (type(value), value)
-
-    return tuple(sorted((name, key(value)) for name, value in config.items()))
-
-
-def _configs_of(
-    spec: CompiledSpecialization,
-) -> list[tuple[dict[str, Any], list[LaunchBinding]]]:
-    """``spec``'s bindings grouped by their config kwargs (see _config_key),
-    each group with its saveable config, in the order first seen, so the
-    first group's config is ``spec.config``. Configs that compile to one
-    kernel (e.g. differing only in a runtime int kwarg) share a
-    specialization but not their bindings."""
-    groups: dict[Hashable, tuple[dict[str, Any], list[LaunchBinding]]] = {}
-    for binding in spec.bindings:
-        key = _config_key(binding.config)
-        group = groups.get(key)
-        if group is None:
-            groups[key] = (_saveable(binding.config), [binding])
-        else:
-            group[1].append(binding)
-    return list(groups.values()) or [(_saveable(spec.config), [])]
 
 
 def _record(
