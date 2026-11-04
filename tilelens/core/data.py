@@ -304,6 +304,44 @@ class AtomicRMW(Op):
 
 
 @dataclass
+class Barrier(Op):
+    """``tl.debug_barrier``: no accesses of its own; it orders the accesses of
+    one program before it against those after it."""
+
+    name: ClassVar[str] = "barrier"
+
+
+@dataclass
+class InterpreterDivergence(Op):
+    """The interpreted run just computed something compiled Triton does not.
+
+    Delivered with ``(kind, source_location)``: ``source_location`` is the
+    ``(filename, lineno, func_name)`` of the kernel code involved, and
+    DESCRIPTIONS says what each kind means.
+    """
+
+    name: ClassVar[str] = "interpreter_divergence"
+
+    DESCRIPTIONS: ClassVar[dict[str, str]] = {
+        "block-truthiness": (
+            "takes the truth value of a block tensor of more than one element "
+            "(Python and/or/not/if/while or a conditional expression). The "
+            "Triton interpreter evaluates this differently from compiled "
+            "Triton: it treats any such tensor as True, where compiled Triton "
+            "combines the lanes elementwise or rejects the code. Use &, |, ~ "
+            "or tl.where for elementwise logic; if/while need a scalar. This "
+            "is an upstream Triton interpreter bug, see "
+            "https://github.com/triton-lang/triton/pull/12150"
+        ),
+    }
+
+    @classmethod
+    def describe(cls, kind: str, source_location: tuple[str, int, str]) -> str:
+        filename, lineno, func_name = source_location
+        return f"{func_name} at {filename}:{lineno} {cls.DESCRIPTIONS[kind]}"
+
+
+@dataclass
 class Tensor:
     ptr: int
     dtype: str

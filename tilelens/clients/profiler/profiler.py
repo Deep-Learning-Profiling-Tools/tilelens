@@ -1,8 +1,9 @@
 from collections.abc import Callable
+import warnings
 
 from ...core.client import Client
 from ...core.callbacks import OpCallbacks, ForLoopCallbacks
-from ...core.data import Op, Load, Store, AddPtr, Dot
+from ...core.data import Op, Load, Store, AddPtr, Dot, InterpreterDivergence
 from ...core.config import config as cfg
 from ...core.patch import LoopSite
 from .data import LoadStoreBytes
@@ -93,6 +94,8 @@ class Profiler(Client):
         # Config has enable_load_store_skipping, but profiler uses disable_load_store_skipping
         self.disable_load_store_skipping = not cfg.profiler_enable_load_store_skipping
 
+        self._divergence_noticed = False
+
     def pre_run_callback(self, fn: Callable) -> bool:
         # If block sampling is enabled, check if current block is selected
         if self.block_sampling and self.sampled_blocks is not None:
@@ -135,6 +138,7 @@ class Profiler(Client):
         self._set_thread_local("current_grid_idx", grid_idx)
 
     def grid_callback(self, grid: tuple[int, ...]):
+        self._divergence_noticed = False
         # If block sampling is enabled, determine which blocks to sample
         if self.block_sampling:
             # Generate all possible indices
@@ -305,6 +309,23 @@ class Profiler(Client):
             if not self.disable_buffer_load_check:
                 self._check_32bit_range(byte_offset, element_bytewidth, offset_data)
 
+        @self.lock_fn
+        def pre_interpreter_divergence_callback(kind, source_location):
+            if self._divergence_noticed:
+                return
+            self._divergence_noticed = True
+            # Not a registry-keyed warnings.warn, which the default filter
+            # would show only once per process for the same message.
+            filename, lineno, _ = source_location
+            warnings.warn_explicit(
+                "[Profiler] "
+                + InterpreterDivergence.describe(kind, source_location)
+                + ". This profile may not match the compiled kernel.",
+                RuntimeWarning,
+                filename,
+                lineno,
+            )
+
         if op_type is Load:
             if self.disable_load_store_skipping:
                 return OpCallbacks(before_callback=pre_load_callback)
@@ -326,6 +347,8 @@ class Profiler(Client):
                 return OpCallbacks(op_overrider=dot_overrider)
         elif op_type is AddPtr:
             return OpCallbacks(before_callback=pre_addptr_callback)
+        elif op_type is InterpreterDivergence:
+            return OpCallbacks(before_callback=pre_interpreter_divergence_callback)
 
         return OpCallbacks()
 

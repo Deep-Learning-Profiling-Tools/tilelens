@@ -40,6 +40,7 @@ from tilelens.core.symbolic_metadata import (
     block_type,
     pointer_type,
 )
+from tilelens.utils.traceback_utils import _triton_frame_dirs
 from z3.z3 import ArithRef, BoolRef, IntNumRef
 from z3 import Solver, Int, sat
 
@@ -208,15 +209,33 @@ def test_basic_expr_pid_eval(axis, expected_pid):
 
 @pytest.mark.parametrize("start,end", [(4, 8), (0, 4)])
 def test_basic_expr_arange_eval(start, end):
-    # Test that arange expr produces a named symbolic variable with range constraints.
+    # Test that arange expr produces a named symbolic variable with range
+    # constraints; the name is suffixed with the creation site.
     arange_expr = SymbolicExpr.create("arange", INT32, start, end)
     result, constraints = arange_expr.eval(simplify_constraints=False)
     result = cast(ArithRef, result)
-    assert result.decl().name() == f"arange_{start}_{end}"
+    assert result.decl().name().startswith(f"arange_{start}_{end}_l")
     assert constraints is not None
     constraints_str = str(constraints)
     assert f"{result} >= {start}" in constraints_str
     assert f"{result} < {end}" in constraints_str
+
+
+def test_arange_interned_by_creation_site():
+    # A square tile's row and column aranges must not share one var; one
+    # line re-executed (a loop) keeps reusing its var.
+    rows = SymbolicExpr.create("arange", INT32, 0, 4)
+    cols = SymbolicExpr.create("arange", INT32, 0, 4)
+    looped = [SymbolicExpr.create("arange", INT32, 0, 4) for _ in range(2)]
+    names = [str(e.eval()[0]) for e in (rows, cols, *looped)]
+    assert names[0] != names[1] and names[2] == names[3]
+
+
+def test_cumsum_overrider_defaults_axis_like_tl_cumsum():
+    # A bare tl.cumsum(x) reaches the overrider with one positional arg.
+    client = _LoopSiteSymbolicClient()
+    x = SymbolicExpr.create("const", np.array([1, 0, 1]), block_type(INT32, [3]))
+    assert int(client._op_cumsum_overrider(x).axis.to_py()) == 0
 
 
 # ======== Unary Symbolic Expr Operations Tests =========
@@ -766,14 +785,81 @@ def test_load_dtype_block_of_pointers():
 
 
 def test_store_dtype_block_of_pointers():
-    """tl.store on a block of pointers should not derive a dtype (store returns None).
+    """tl.store on a block of pointers derives the pointee dtype and shape.
 
     ptr dtype: block_type(pointer<fp32>, [1, 16])
-    expected store dtype: None
+    expected store dtype: fp32
     """
     ptr = ConstSymbolicExpr(
         "const", value=0, dtype=block_type(pointer_type(FLOAT32), [1, 16])
     )
     value = ConstSymbolicExpr("const", value=0, dtype=block_type(FLOAT32, [1, 16]))
     store = StoreSymbolicExpr("store", ptr, value)
-    assert store.dtype is None, f"Expected None, got {store.dtype}"
+    assert store.dtype == FLOAT32, f"Expected FLOAT32, got {store.dtype}"
+    assert store.shape == (1, 16), f"Expected shape (1, 16), got {store.shape}"
+
+
+# ======== Truthiness and Hook Slot Tests ===========
+
+
+def test_frontend_plumbing_truthiness_is_object_truthiness():
+    # semantic.py's `other.handle if other else None` must keep a falsy
+    # user-provided other=0; kernel code still branches on the value.
+    falsy = ConstSymbolicExpr("const", value=0, dtype=INT32).data
+    for plumbing_file in _triton_frame_dirs()[2]:
+        namespace: dict = {}
+        probe = compile("def probe(x):\n    return bool(x)\n", plumbing_file, "exec")
+        exec(probe, namespace)
+        assert namespace["probe"](falsy) is True
+    assert bool(falsy) is False
+
+
+def test_scalar_concretize_observer_sees_every_scalar_read(monkeypatch):
+    seen: list = []
+    monkeypatch.setattr(SymbolicExpr, "_scalar_concretize_observer", seen.append)
+    data = ConstSymbolicExpr("const", value=3, dtype=INT32).data
+    assert (int(data), int(data.squeeze()), int(data[0]), bool(data)) == (3, 3, 3, True)
+    assert seen == [data.symbolic_expr] * 4
+
+
+def test_value_providers_dispatch(monkeypatch):
+    ptr = SymbolicExpr.create("const", 0, pointer_type(INT32))
+    one = SymbolicExpr.create("const", 1, INT32)
+
+    def exprs():
+        return (
+            SymbolicExpr.create("load", ptr),
+            SymbolicExpr.create("atomic_cas", ptr, one, one),
+            SymbolicExpr.create("atomic_rmw", ptr, one, None),
+        )
+
+    load, cas, rmw = exprs()
+    assert load._to_z3() == (0, None)  # legacy pointer-as-value
+    for atomic in (cas, rmw):
+        with pytest.raises(NotImplementedError):
+            atomic._to_z3()
+    value, old = Int("value"), Int("old")
+    monkeypatch.setattr(SymbolicExpr, "_load_value_provider", lambda e: (value, None))
+    monkeypatch.setattr(SymbolicExpr, "_atomic_value_provider", lambda e: (old, None))
+    load, cas, rmw = exprs()
+    assert [e._to_z3()[0] for e in (load, cas, rmw)] == [value, old, old]
+
+
+def test_hook_slot_reclaim(monkeypatch):
+    client = _LoopSiteSymbolicClient()
+    slots = SymbolicExpr._HOOK_SLOTS
+
+    def install():
+        client.loop_stack.append(object())  # a dead launch's loop context
+        for slot, owner in zip(slots, (id(client), id(client), id(object()))):
+            monkeypatch.setattr(SymbolicExpr, slot, print)
+            monkeypatch.setattr(SymbolicExpr, f"{slot}_owner", owner)
+
+    install()
+    client.abort_launch(RuntimeError())  # only the aborting client's slots
+    assert [getattr(SymbolicExpr, s) for s in slots] == [None, None, print]
+    install()
+    client.grid_callback((1, 1, 1))  # every slot, whoever installed it
+    assert client.loop_stack == []
+    assert {getattr(SymbolicExpr, s) for s in slots} == {None}
+    assert {getattr(SymbolicExpr, f"{s}_owner") for s in slots} == {None}

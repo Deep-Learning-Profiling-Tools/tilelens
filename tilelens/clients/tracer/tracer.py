@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import warnings
 
 from ...core.client import Client
 from ...core.callbacks import OpCallbacks, ForLoopCallbacks
@@ -11,6 +12,7 @@ from ...core.data import (
     Dot,
     Grid,
     Allocate,
+    InterpreterDivergence,
 )
 from ...utils.traceback_utils import extract_user_frames
 from tilelens.core.masked_load_store import masked_load
@@ -43,6 +45,7 @@ class Tracer(Client):
         self.records: list = []
         self.tensors: list = []
         self.sample = True
+        self._divergence_noticed = False
 
     def _get_tensor(self, data_ptr):
         # From a give ptr, get where the original tensor is stored
@@ -82,6 +85,7 @@ class Tracer(Client):
 
     def grid_callback(self, grid: tuple[int, ...]):
         self.tensors = sorted(self.tensors, key=lambda x: x.data_ptr())
+        self._divergence_noticed = False
 
     def register_op_callback(self, op_type: type[Op]) -> OpCallbacks:
         def post_allocate_callback(ret):
@@ -206,6 +210,23 @@ class Tracer(Client):
             rec.call_path = extract_user_frames(num_frames=1)
             self.records.append(rec)
 
+        @self.lock_fn
+        def pre_interpreter_divergence_callback(kind, source_location):
+            if self._divergence_noticed:
+                return
+            self._divergence_noticed = True
+            # Not a registry-keyed warnings.warn, which the default filter
+            # would show only once per process for the same message.
+            filename, lineno, _ = source_location
+            warnings.warn_explicit(
+                "[Tracer] "
+                + InterpreterDivergence.describe(kind, source_location)
+                + ". This trace may not show what the compiled kernel does.",
+                RuntimeWarning,
+                filename,
+                lineno,
+            )
+
         callbacks = {
             Allocate: OpCallbacks(after_callback=post_allocate_callback),
             Load: OpCallbacks(before_callback=pre_load_callback),
@@ -213,6 +234,9 @@ class Tracer(Client):
             Transfer: OpCallbacks(before_callback=pre_transfer_callback),
             ReduceSum: OpCallbacks(after_callback=post_reduce_sum_callback),
             Dot: OpCallbacks(after_callback=post_dot_callback),
+            InterpreterDivergence: OpCallbacks(
+                before_callback=pre_interpreter_divergence_callback
+            ),
         }
         return callbacks.get(op_type, OpCallbacks())
 

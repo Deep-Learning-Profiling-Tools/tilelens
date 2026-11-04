@@ -56,6 +56,114 @@ def _is_framework_frame(frame: FrameType) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Truthiness-initiator classification (package-boundary walks)
+# ---------------------------------------------------------------------------
+
+# Triton's own frontend does truthiness on tensors as None-guard plumbing
+# (e.g. semantic.py's ``if mask and mask.type.is_block():``), which must not
+# be confused with value-level control flow like ``if pid == 0:``.
+# These walks run on hot paths (every tensor truthiness, every arange), so
+# unlike _get_framework_roots they compare raw co_filename prefixes instead of
+# realpath-ing each frame; that holds because co_filename and the packages'
+# __file__ come from the same import path.
+_TILELENS_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
+_TRITON_FRAME_DIRS: tuple[str, str, frozenset[str]] | None = None
+
+
+def _triton_frame_dirs() -> tuple[str, str, frozenset[str]]:
+    """(triton package dir, triton interpreter file, frontend plumbing
+    files), resolved lazily.
+
+    The plumbing files are the frontend's canonicalization layer — the
+    modules that in compiled Triton execute at compile time, where
+    ``bool(tensor)`` is plain object truthiness. @jit modules that also
+    live under the triton package (language/standard.py, language/random.py,
+    tools/...) are deliberately NOT in this set: their ``if`` statements
+    compile to control flow on the value.
+    """
+    global _TRITON_FRAME_DIRS
+    if _TRITON_FRAME_DIRS is None:
+        import triton
+
+        pkg_dir = os.path.dirname(os.path.abspath(triton.__file__)) + os.sep
+        _TRITON_FRAME_DIRS = (
+            pkg_dir,
+            os.path.join(pkg_dir, "runtime", "interpreter.py"),
+            frozenset(
+                (
+                    os.path.join(pkg_dir, "language", "semantic.py"),
+                    os.path.join(pkg_dir, "language", "core.py"),
+                )
+            ),
+        )
+    return _TRITON_FRAME_DIRS
+
+
+def innermost_user_site() -> tuple[str, int] | None:
+    """(filename, lineno) of the nearest frame outside triton/tilelens.
+
+    Unlike the CODE_KEYS-based extraction below, this is a plain
+    package-boundary walk, so it identifies the user call line regardless of
+    how the executing kernel's code object was recompiled (a kernel defined
+    inside a function executes with qualname ``kernel``, not
+    ``outer.<locals>.kernel``, which defeats code-key matching). Used for
+    stable per-callsite identities (e.g. arange interning), not for
+    user-facing tracebacks.
+    """
+    triton_pkg_dir, _, _ = _triton_frame_dirs()
+    frame: FrameType | None = sys._getframe(1)
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        if filename.startswith(_TILELENS_PKG_DIR) or filename.startswith(
+            triton_pkg_dir
+        ):
+            frame = frame.f_back
+            continue
+        return (filename, frame.f_lineno)
+    return None
+
+
+def truthiness_initiator() -> tuple[str, int, str] | None:
+    """``(filename, lineno, func_name)`` of the kernel-level code that
+    initiated the in-flight tensor truthiness, or None when Triton's
+    frontend plumbing initiated it.
+
+    Walk outward from the caller, skipping tilelens frames (wrapper and
+    client mechanics) and triton's interpreter (pure truthiness plumbing:
+    ``_get_bool`` and its lambdas sit between any initiator and
+    ``__bool__``). The first remaining frame is the initiator. Only the
+    frontend's canonicalization modules (see ``_triton_frame_dirs``) count
+    as internal: there ``if mask and ...`` None-guards must see "present"
+    — compiled Triton runs them at compile time with object truthiness.
+    Everything else, INCLUDING @jit code that happens to live under the
+    triton package tree, is kernel code whose branches compile to control
+    flow on the value.
+    """
+    _, triton_interpreter_file, plumbing_files = _triton_frame_dirs()
+    frame: FrameType | None = sys._getframe(1)
+    while frame is not None:
+        code = frame.f_code
+        filename = code.co_filename
+        if (
+            filename.startswith(_TILELENS_PKG_DIR)
+            or filename == triton_interpreter_file
+        ):
+            frame = frame.f_back
+            continue
+        if filename in plumbing_files:
+            return None
+        return (filename, frame.f_lineno, code.co_name)
+    return None
+
+
+def scalar_truthiness_from_user_code() -> bool:
+    """True when the in-flight scalar truthiness/read was initiated by
+    kernel-level code rather than the triton frontend's plumbing (see
+    ``truthiness_initiator``)."""
+    return truthiness_initiator() is not None
+
+
+# ---------------------------------------------------------------------------
 # Frame extraction
 # ---------------------------------------------------------------------------
 

@@ -1615,3 +1615,80 @@ def test_strided_view_warns_on_large_numel(_isolate_per_element_threshold):
 
     # Warning path must not change correctness -- no OOB with correct mask.
     assert len(strided_view_sanitizer.records) == 0
+
+
+# ======== Eager Coverage and Abort Tests ===========
+
+
+@triton.jit
+def _square_tile_kernel(x, out):
+    rows = tl.arange(0, 4)
+    cols = tl.arange(0, 4)
+    offs = rows[:, None] - cols[None, :]  # in bounds on the diagonal only
+    tl.store(out + offs * 0, tl.load(x + offs))
+
+
+def test_square_tile_off_diagonal_oob():
+    # rows and cols used to share one Z3 var, so only the diagonal was checked
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    traced = tilelens.trace(client=sanitizer)(_square_tile_kernel)
+    traced[(1,)](torch.zeros(1), torch.zeros(1))
+    assert len(sanitizer.records) == 1
+
+
+@triton.jit
+def _clamp_propagate_nan_kernel(x, out):
+    offs = tl.arange(0, 8)
+    v = tl.clamp(tl.load(x + offs), 0.0, 1.0, propagate_nan=tl.PropagateNan.ALL)
+    tl.store(out + offs, v)
+
+
+@triton.jit
+def _bare_cumsum_kernel(x, out):
+    offs = tl.arange(0, 8)
+    tl.store(out + offs, tl.load(x + tl.cumsum(offs) % 8))
+
+
+@triton.jit
+def _static_range_constexpr_kernel(x, out):
+    for i in tl.static_range(1, 3):
+        offs = tl.arange(0, 4 * i)  # i must be a concrete constexpr
+        tl.store(out + offs, tl.load(x + offs))
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [_clamp_propagate_nan_kernel, _bare_cumsum_kernel, _static_range_constexpr_kernel],
+)
+def test_sanitizer_runs_kernel(kernel):
+    # Each raised before: np.clip had no ternary overrider, a bare
+    # tl.cumsum(x) missed axis, tl.static_range got a symbolic iterator.
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    tilelens.trace(client=sanitizer)(kernel)[(1,)](torch.zeros(8), torch.zeros(8))
+    assert sanitizer.records == []
+
+
+class _HookSlotSanitizer(SymbolicSanitizer):
+    def grid_callback(self, grid):
+        super().grid_callback(grid)
+        for slot in SymbolicExpr._HOOK_SLOTS:  # as a race detector would
+            setattr(SymbolicExpr, slot, lambda *_: None)
+            setattr(SymbolicExpr, f"{slot}_owner", id(self))
+
+
+def test_abort_launch_reclaims_loop_stack_and_hook_slots(monkeypatch):
+    for slot in SymbolicExpr._HOOK_SLOTS:  # restored even if the reclaim fails
+        monkeypatch.setattr(SymbolicExpr, slot, None)
+        monkeypatch.setattr(SymbolicExpr, f"{slot}_owner", None)
+    sanitizer = _HookSlotSanitizer(abort_on_error=False)
+
+    @triton.jit
+    def raising_loop_kernel(out, n):
+        for i in range(0, n):
+            tl.store(out + i, 1.0)
+            1 // 0
+
+    with pytest.raises(ZeroDivisionError):
+        tilelens.trace(client=sanitizer)(raising_loop_kernel)[(1,)](torch.zeros(4), 2)
+    assert sanitizer.loop_stack == []
+    assert all(getattr(SymbolicExpr, s) is None for s in SymbolicExpr._HOOK_SLOTS)
