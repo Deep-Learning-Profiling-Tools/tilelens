@@ -173,9 +173,6 @@ TRITON_NAMESPACES: dict[Any, dict[str, type[Op]]] = {
         "xor_sum": ReduceXor,
         "reduce_or": ReduceOr,
     },
-    tl.math: {
-        "umulhi": Umulhi,
-    },
 }
 
 
@@ -260,10 +257,8 @@ class TritonFrontend(Frontend):
         self._triton_extra_modules = self._triton_extra_builtin_modules()
         self._triton_builtin_attr_cache: dict[int, tuple[str, ...]] = {}
         # Most patched ops are interpreter-builder ops and can call overriders
-        # directly. Cache the smaller frontend-wrapped sets for quick routing.
-        self._math_op_types = frozenset(self.namespaces[tl.math].values())
-        self._tl_op_types = frozenset(self.namespaces[tl].values())
-        self._frontend_wrapped_op_types = self._math_op_types | self._tl_op_types
+        # directly. Cache the smaller frontend-wrapped set for quick routing.
+        self._frontend_wrapped_op_types = frozenset(self.namespaces[tl].values())
         self._bind_interpreter_builder_thread_state()
 
     def _bind_interpreter_builder_thread_state(self) -> None:
@@ -854,8 +849,6 @@ class TritonFrontend(Frontend):
         # namespace ops need Triton tensor <-> handle conversion around clients.
         if op_type not in self._frontend_wrapped_op_types:
             return op_overrider(*args, **kwargs)
-        if op_type in self._math_op_types:
-            raise NotImplementedError("Patching math ops not yet supported")
 
         # see triton.runtime.interpreter:ReduceOps.sum
         # First, convert input from tl.tensor to TensorHandle. Here, input tensor is args[0]
