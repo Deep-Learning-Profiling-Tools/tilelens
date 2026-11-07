@@ -1209,6 +1209,28 @@ def test_sanitizer_supports_data_dependent_cumsum_index():
     assert len(cumsum_sanitizer.records) == 0
 
 
+rand_sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+
+@tilelens.trace(client=rand_sanitizer)
+@triton.jit
+def rand_store_kernel(out_ptr, seed, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr + offs, tl.rand(seed, offs))
+
+
+def test_sanitizer_supports_tl_rand():
+    """tl.rand's Philox rounds call tl.math.umulhi, which must reach the
+    interpreter builder's create_umulhi like any other builder op."""
+    rand_sanitizer.records.clear()
+
+    out = torch.empty((8,), dtype=torch.float32)
+
+    rand_store_kernel[(1,)](out, 123, BLOCK=out.numel())
+
+    assert len(rand_sanitizer.records) == 0
+
+
 ashr_index_sanitizer = SymbolicSanitizer(abort_on_error=False)
 
 
