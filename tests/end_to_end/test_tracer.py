@@ -1,3 +1,4 @@
+import pytest
 import torch
 import triton
 import triton.language as tl
@@ -223,3 +224,51 @@ def test_kernel_cache_autotune_with_dummy_benchmarker():
         assert (
             bench_fn is not None and bench_fn.__name__ == "dummy_benchmarker"
         ), f"Expected dummy_benchmarker, got: {bench_fn}"
+
+
+@triton.jit
+def logical_ops_kernel(X, Y, SCALAR: tl.constexpr, MODE: tl.constexpr):
+    offsets = tl.program_id(0) if SCALAR else tl.arange(0, 16)
+    x = tl.load(X + offsets)
+    if MODE == "and":
+        result = (x >= 0) and (x <= 8)
+    elif MODE == "or":
+        result = (x < 0) or (x > 8)
+    elif MODE == "long_and":
+        result = (x > -2) and (x <= 8) and (x != 3)
+    elif MODE == "long_or":
+        result = (x == -4) or (x == 3) or (x > 8)
+    elif MODE == "nested":
+        result = (x > 0) and (x < 3) or (x > 8) and (x != 10)
+    elif MODE == "constexpr_false":
+        result = False and (x > 0)
+    else:
+        result = True and (x > 0)
+    tl.store(Y + offsets, result)
+
+
+@pytest.mark.parametrize("scalar", [False, True])
+@pytest.mark.parametrize(
+    "mode",
+    ["and", "or", "long_and", "long_or", "nested", "constexpr_false", "constexpr_true"],
+)
+def test_and_or_on_tensors_follow_compiled_triton(scalar, mode):
+    """`and`/`or` on tensors compute logical_and/logical_or, as in compiled
+    Triton; only a compile-time operand short-circuits."""
+    x = torch.arange(-4, 12, dtype=torch.int32)
+    y = torch.zeros_like(x, dtype=torch.bool)
+
+    tilelens.trace("tracer")(logical_ops_kernel)[(16 if scalar else 1,)](
+        x, y, scalar, mode
+    )
+
+    expected = {
+        "and": (x >= 0) & (x <= 8),
+        "or": (x < 0) | (x > 8),
+        "long_and": (x > -2) & (x <= 8) & (x != 3),
+        "long_or": (x == -4) | (x == 3) | (x > 8),
+        "nested": (x > 0) & (x < 3) | (x > 8) & (x != 10),
+        "constexpr_false": torch.zeros_like(y),
+        "constexpr_true": x > 0,
+    }[mode]
+    torch.testing.assert_close(y, expected)
