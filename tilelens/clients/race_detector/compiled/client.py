@@ -186,12 +186,12 @@ class CompiledRaceDetector(IRClient):
         assert isinstance(verdict, RaceVerdict)
         for record in self.last_reports:
             print_race_record(record)
-        # The undecided parts and a proof print where someone asked to
-        # see them: verbose, or tile-race, which reports every launch.
-        if cfg.verbose or cfg.cli_active:
-            print_undecided(verdict, self._printed)
-            if verdict.status == "ok":
-                print(f"[{self.LOG_TAG}] {self._kernel}: race-free{_claim(verdict)}")
+        # What was not analyzed always prints (once per site), so a quiet
+        # launch never reads as race-free. A proof prints where someone
+        # asked to see it: verbose, or tile-race, which reports every launch.
+        print_undecided(verdict, self._printed)
+        if verdict.status == "ok" and (cfg.verbose or cfg.cli_active):
+            print(f"[{self.LOG_TAG}] {self._kernel}: race-free{_claim(verdict)}")
         return out
 
     # ── snapshots ────────────────────────────────────────────────────

@@ -403,13 +403,20 @@ def test_launches_on_two_threads_take_turns():
     assert errors == [] and verdicts == ["ok"] * 10
 
 
-def test_undecided_parts_print_once_under_verbose(monkeypatch, capsys):
+def test_undecided_parts_always_print_once_and_proofs_only_under_verbose(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(cfg, "verbose", False)
     det = RaceDetector(compile=True)
-    for verbose in (False, True, True):
-        monkeypatch.setattr(cfg, "verbose", verbose)
+    for _ in range(3):
         launch("counted_while", (1,), detector=det, x=i32(1), n=4)
+    launch("add", (2,), x=f32(64), y=f32(64), out=f32(64), n=64)
     out = capsys.readouterr().out
     assert out.count("not analyzed: spin-shape") == 1
+    assert "race-free" not in out
+    monkeypatch.setattr(cfg, "verbose", True)
+    launch("add", (2,), x=f32(64), y=f32(64), out=f32(64), n=64)
+    assert "race-free" in capsys.readouterr().out
 
 
 def test_autotune_configs_are_folded_and_identical_ones_solved_once(monkeypatch):
