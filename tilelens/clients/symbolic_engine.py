@@ -2231,6 +2231,10 @@ class FpToFpSymbolicExpr(SymbolicExpr):
         super().__init__(op)
         self.add_child("src", src)
         self.add_child("dst_type", dst_type)
+        # Triton passes an ir.ROUNDING_MODE enum (or None); keep its integer
+        # value so that the child is an ordinary constant.
+        if rounding_mode is not None and not isinstance(rounding_mode, SymbolicExpr):
+            rounding_mode = int(rounding_mode)
         self.add_child("rounding_mode", rounding_mode)
         self.dtype, self.shape = self._unpack_dtype(
             self.dst_type.to_py(), self.src.shape
