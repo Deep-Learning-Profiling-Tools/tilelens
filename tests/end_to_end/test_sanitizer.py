@@ -1209,6 +1209,32 @@ def test_sanitizer_supports_data_dependent_cumsum_index():
     assert len(cumsum_sanitizer.records) == 0
 
 
+bool_op_mask_sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+
+@tilelens.trace(client=bool_op_mask_sanitizer)
+@triton.jit
+def bool_op_mask_kernel(x_ptr, out_ptr, lo, hi, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    # Compiled Triton computes a logical and/or here; Python's `and` would
+    # keep only `offs < hi`, and the load would read before x.
+    in_range = (offs >= lo) and (offs < hi)
+    outside = (offs < lo) or (offs >= hi)
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs - lo, mask=in_range), mask=in_range)
+    tl.store(out_ptr + offs, -1.0, mask=outside)
+
+
+def test_sanitizer_and_or_on_tensors_follow_compiled_triton():
+    bool_op_mask_sanitizer.records.clear()
+
+    x = torch.arange(4, dtype=torch.float32)
+    out = torch.empty((8,), dtype=torch.float32)
+
+    bool_op_mask_kernel[(1,)](x, out, 2, 6, BLOCK=8)
+
+    assert len(bool_op_mask_sanitizer.records) == 0
+
+
 ashr_index_sanitizer = SymbolicSanitizer(abort_on_error=False)
 
 

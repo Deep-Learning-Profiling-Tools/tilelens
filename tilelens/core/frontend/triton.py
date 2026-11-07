@@ -203,6 +203,83 @@ TRITON_ADAPTERS: dict[type[Op], Callable[..., AdapterResult]] = {
 }
 
 
+class _BoolOpChain:
+    """One operand of a kernel's `and`/`or`, as rewritten by `_BoolOpRewriter`.
+
+    Triton's interpreter runs `and`/`or` with Python semantics and treats any
+    tensor with more than one element as true, so `a and b` returns `b`.
+    Compiled Triton short-circuits only on compile-time values and combines
+    runtime operands with logical_and/logical_or; the rewrite chains these
+    objects with `<` so that operands are still evaluated once, left to right,
+    and the chain stops only at a compile-time value that decides the result.
+    """
+
+    def __init__(self, is_and: bool, value: Any = None) -> None:
+        self.is_and = is_and
+        self.value = value
+        self.short_circuit = False
+        self.tensor_values: list[Any] = []
+
+    def __lt__(self, rhs: "_BoolOpChain") -> "_BoolOpChain":
+        rhs.tensor_values = self.tensor_values
+        if isinstance(rhs.value, tl.core.base_value) and not isinstance(
+            rhs.value, (tl.constexpr, tl.tuple)
+        ):
+            rhs.tensor_values.append(rhs.value)
+        else:
+            rhs.short_circuit = bool(rhs.value) != self.is_and
+        return rhs
+
+    def __bool__(self) -> bool:
+        return not self.short_circuit
+
+    def get_result(self) -> Any:
+        if self.short_circuit or not self.tensor_values:
+            return self.value
+        method = "logical_and" if self.is_and else "logical_or"
+        result = self.tensor_values[-1]
+        for value in reversed(self.tensor_values[:-1]):
+            result = getattr(value, method)(result)
+        return result
+
+
+class _BoolOpRewriter(ast.NodeTransformer):
+    """Rewrite `a and b` as the native chain `op(True) < op(True, a) <
+    op(True, b)`, where `op` names `_BoolOpChain`, so that operands keep their
+    scope and their lazy, left-to-right evaluation."""
+
+    def __init__(self, helper_name: str) -> None:
+        self.helper_name = helper_name
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> ast.expr:
+        node = cast(ast.BoolOp, self.generic_visit(node))
+        is_and = isinstance(node.op, ast.And)
+
+        def operand(value: ast.expr | None = None) -> ast.expr:
+            args: list[ast.expr] = [ast.Constant(value=is_and)]
+            if value is not None:
+                args.append(value)
+            return ast.Call(
+                func=ast.Name(id=self.helper_name, ctx=ast.Load()),
+                args=args,
+                keywords=[],
+            )
+
+        chain = ast.Compare(
+            left=operand(),
+            ops=[ast.Lt() for _ in node.values],
+            comparators=[operand(value) for value in node.values],
+        )
+        return ast.copy_location(
+            ast.Call(
+                func=ast.Attribute(value=chain, attr="get_result", ctx=ast.Load()),
+                args=[],
+                keywords=[],
+            ),
+            node,
+        )
+
+
 @dataclass(frozen=True)
 class FakeTensor:
     _data_ptr: int
@@ -251,6 +328,7 @@ class TritonFrontend(Frontend):
         self._thread_local_interpreter_state.grid_idx = None
         self._current_client_manager = None
         self._loop_wrapper_arg = "_tilelens_loop_iter_wrapper"
+        self._bool_op_arg = "_tilelens_bool_op"
         self._loop_ast_methods: dict[str, Callable | object] = {}
         self._loop_ast_patched = False
         self._patch_calls_scope = 0
@@ -354,21 +432,31 @@ class TritonFrontend(Frontend):
         self, transformer: ast.NodeTransformer, node: ast.FunctionDef
     ):
         node = cast(ast.FunctionDef, transformer.generic_visit(node))
+        # Run after Triton's own rewrite, which does not visit assigned values
+        # and must not rewrite the chains again. A Triton whose interpreter
+        # rewrites `and`/`or` itself keeps its own.
+        if "visit_BoolOp" not in vars(_OrigASTTransformer):
+            node = cast(ast.FunctionDef, _BoolOpRewriter(self._bool_op_arg).visit(node))
         # Triton compiles rewritten kernels with a local namespace, but loop
         # bodies resolve names from the function defaults/globals. Add the
-        # wrapper as a defaulted kw-only arg so the rewritten loop can call it
-        # without mutating the user's global dictionary.
-        if self._loop_wrapper_arg in {
+        # helpers as defaulted kw-only args so the rewritten loops and boolean
+        # operators can call them without mutating the user's global dictionary.
+        existing = {
             arg.arg
             for arg in (node.args.posonlyargs + node.args.args + node.args.kwonlyargs)
-        }:
-            return node
-
-        node.args.kwonlyargs.append(ast.arg(arg=self._loop_wrapper_arg))
-        node.args.kw_defaults.append(
-            ast.Name(id=self._loop_wrapper_arg, ctx=ast.Load())
-        )
+        }
+        for name in self._hidden_kernel_args():
+            if name in existing:
+                continue
+            node.args.kwonlyargs.append(ast.arg(arg=name))
+            node.args.kw_defaults.append(ast.Name(id=name, ctx=ast.Load()))
         return ast.fix_missing_locations(node)
+
+    def _hidden_kernel_args(self) -> dict[str, Any]:
+        return {
+            self._loop_wrapper_arg: self.loop_iter_wrapper,
+            self._bool_op_arg: _BoolOpChain,
+        }
 
     def loop_iter_wrapper(
         self,
@@ -939,9 +1027,10 @@ class TritonFrontend(Frontend):
             *args_hst,
             **kwargs_hst,
         )
-        # The hidden loop-wrapper default is an implementation detail of the
-        # rewritten function; clients should not see it as a kernel argument.
-        args.pop(self._loop_wrapper_arg, None)
+        # The hidden helper defaults are implementation details of the
+        # rewritten function; clients should not see them as kernel arguments.
+        for name in self._hidden_kernel_args():
+            args.pop(name, None)
         call_args = {}
         for name, arg in args.items():
             if name in grid_executor.constexprs:
@@ -1126,13 +1215,10 @@ class TritonFrontend(Frontend):
 
             def compile_and_exec(rewriter, transformed_ast):
                 # Triton's FunctionRewriter executes code with `rewriter.kwargs`
-                # as the local namespace. Temporarily add the hidden loop wrapper
-                # there so rewritten function defaults can bind it.
+                # as the local namespace. Temporarily add the hidden helpers
+                # there so rewritten function defaults can bind them.
                 old_kwargs = rewriter.kwargs
-                rewriter.kwargs = {
-                    **old_kwargs,
-                    self._loop_wrapper_arg: self.loop_iter_wrapper,
-                }
+                rewriter.kwargs = {**old_kwargs, **self._hidden_kernel_args()}
                 try:
                     return old_compile_and_exec(rewriter, transformed_ast)
                 finally:
