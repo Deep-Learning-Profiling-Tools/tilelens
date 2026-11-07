@@ -1209,6 +1209,29 @@ def test_sanitizer_supports_data_dependent_cumsum_index():
     assert len(cumsum_sanitizer.records) == 0
 
 
+fp8_rounding_sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+
+@tilelens.trace(client=fp8_rounding_sanitizer)
+@triton.jit
+def fp8_rtne_cast_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = x.to(tl.float8e5, fp_downcast_rounding="rtne")
+    tl.store(out_ptr + offs, y.to(tl.float32))
+
+
+def test_sanitizer_supports_fp_downcast_rounding():
+    fp8_rounding_sanitizer.records.clear()
+
+    x = torch.randn((8,), dtype=torch.float32)
+    out = torch.empty_like(x)
+
+    fp8_rtne_cast_kernel[(1,)](x, out, BLOCK=x.numel())
+
+    assert len(fp8_rounding_sanitizer.records) == 0
+
+
 ashr_index_sanitizer = SymbolicSanitizer(abort_on_error=False)
 
 
