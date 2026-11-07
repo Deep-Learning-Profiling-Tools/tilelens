@@ -1662,6 +1662,33 @@ class ReduceSymbolicExpr(SymbolicExpr):
             raise NotImplementedError(f"Eval for op {self.op} is not implemented")
         return handler(self)
 
+    def concretize(self) -> Any:
+        input_concrete = self.input.concretize()
+        data = input_concrete.data
+        axis = self.axis.to_py() if self.axis is not None else None
+        axis = int(axis) if axis is not None else None
+        keepdims = bool(self.keepdims.to_py())
+        out_np = dtype_to_numpy(self.dtype)
+        is_float = np.issubdtype(data.dtype, np.floating)
+        if self.op == "sum":
+            out = np.sum(data.astype(out_np), axis=axis, keepdims=keepdims)
+        elif self.op in ("max", "min"):
+            # Triton's max and min ignore NaNs (maxnumf/minnumf), like fmax/fmin.
+            if self.op == "max":
+                ufunc = np.fmax if is_float else np.maximum
+            else:
+                ufunc = np.fmin if is_float else np.minimum
+            out = ufunc.reduce(data.astype(out_np), axis=axis, keepdims=keepdims)
+        elif self.op == "argmax":
+            out = np.argmax(data, axis=axis, keepdims=keepdims)
+        elif self.op == "argmin":
+            out = np.argmin(data, axis=axis, keepdims=keepdims)
+        elif self.op == "xor_sum":
+            out = np.bitwise_xor.reduce(data, axis=axis, keepdims=keepdims)
+        else:
+            out = np.bitwise_or.reduce(data, axis=axis, keepdims=keepdims)
+        return SymbolicTensorValue(np.asarray(out).astype(out_np), self.dtype)
+
     def _reduce_sum(self) -> tuple[Z3Expr, ConstraintConjunction]:
         arr, constraints = self.input._to_z3()
         return Sum(arr), constraints

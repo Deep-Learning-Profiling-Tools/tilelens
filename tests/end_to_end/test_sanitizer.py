@@ -1209,6 +1209,45 @@ def test_sanitizer_supports_data_dependent_cumsum_index():
     assert len(cumsum_sanitizer.records) == 0
 
 
+reduce_index_sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+
+@tilelens.trace(client=reduce_index_sanitizer)
+@triton.jit
+def reduce_offset_kernel(idx_ptr, src_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    idx = tl.load(idx_ptr + offs)
+    # Each offset is a reduction of loaded values, so the sanitizer must
+    # concretize the reduction.
+    tl.store(out_ptr + 0, tl.load(src_ptr + tl.max(idx, 0)))
+    tl.store(out_ptr + 1, tl.load(src_ptr + tl.min(idx, 0)))
+    tl.store(out_ptr + 2, tl.load(src_ptr + tl.argmax(idx, 0)))
+    tl.store(out_ptr + 3, tl.load(src_ptr + tl.argmin(idx, 0)))
+    tl.store(out_ptr + 4, tl.load(src_ptr + tl.sum(idx, 0)))
+    tl.store(out_ptr + 5, tl.load(src_ptr + tl.xor_sum(idx, 0)))
+    tl.store(out_ptr + 6, tl.load(src_ptr + tl.reduce_or(idx, 0)))
+
+
+@pytest.mark.parametrize(
+    "src_numel, oob_offsets", [(16, []), (7, [7]), (5, [5, 5, 5, 7])]
+)
+def test_sanitizer_concretizes_reductions_in_addresses(src_numel, oob_offsets):
+    reduce_index_sanitizer.records.clear()
+
+    # max 5, min 0, argmax 1, argmin 3, sum 7, xor 5, or 5
+    idx = torch.tensor([1, 5, 1, 0], dtype=torch.int32)
+    src = torch.zeros((src_numel,), dtype=torch.float32)
+    out = torch.empty((7,), dtype=torch.float32)
+
+    reduce_offset_kernel[(1,)](idx, src, out, BLOCK=idx.numel())
+
+    offsets = sorted(
+        (record.violation_address - src.data_ptr()) // src.element_size()
+        for record in reduce_index_sanitizer.records
+    )
+    assert offsets == oob_offsets
+
+
 ashr_index_sanitizer = SymbolicSanitizer(abort_on_error=False)
 
 
