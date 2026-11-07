@@ -1004,6 +1004,61 @@ def test_tl_min_return_indices():
     ), f"Sanitizer reported {len(reduce_indices_sanitizer.records)} error(s)"
 
 
+# ======== Reduce Result Dtype Tests ===========
+
+
+@tilelens.trace(client=SymbolicSanitizer())
+@triton.jit
+def fp16_softmax_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    # tl.max promotes fp16 to fp32, so tl.exp gets an fp32 argument.
+    e = tl.exp(x - tl.max(x, 0))
+    tl.store(out_ptr + offs, e / tl.sum(e, 0))
+
+
+def test_reduce_max_promotes_fp16_like_triton():
+    x = torch.randn((8,), dtype=torch.float16)
+    out = torch.empty_like(x)
+    fp16_softmax_kernel[(1,)](x, out, BLOCK=x.numel())
+
+
+@tilelens.trace(client=SymbolicSanitizer())
+@triton.jit
+def reduce_dtypes_kernel(i8_ptr, u8_ptr, f16_ptr, bf16_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    i8 = tl.load(i8_ptr + offs)
+    u8 = tl.load(u8_ptr + offs)
+    f16 = tl.load(f16_ptr + offs)
+    bf16 = tl.load(bf16_ptr + offs)
+    tl.static_assert(tl.sum(i8, 0).dtype == tl.int32)
+    tl.static_assert(tl.sum(u8, 0).dtype == tl.uint32)
+    tl.static_assert(tl.sum(f16, 0).dtype == tl.float16)
+    tl.static_assert(tl.sum(f16, 0, dtype=tl.float32).dtype == tl.float32)
+    tl.static_assert(tl.max(i8, 0).dtype == tl.int32)
+    tl.static_assert(tl.min(u8, 0).dtype == tl.int32)
+    tl.static_assert(tl.max(f16, 0).dtype == tl.float32)
+    tl.static_assert(tl.min(bf16, 0).dtype == tl.float32)
+    f16_max, f16_idx = tl.max(f16, 0, return_indices=True)
+    tl.static_assert(f16_max.dtype == tl.float16)
+    tl.static_assert(f16_idx.dtype == tl.int32)
+    bf16_min, _ = tl.min(bf16, 0, return_indices=True)
+    tl.static_assert(bf16_min.dtype == tl.float32)
+
+
+def test_reduce_result_dtypes_match_triton():
+    """tl.sum, tl.max, and tl.min promote small integer and float inputs as
+    triton.language.standard does."""
+    n = 8
+    reduce_dtypes_kernel[(1,)](
+        torch.ones((n,), dtype=torch.int8),
+        torch.ones((n,), dtype=torch.uint8),
+        torch.ones((n,), dtype=torch.float16),
+        torch.ones((n,), dtype=torch.bfloat16),
+        BLOCK=n,
+    )
+
+
 # ======== Reduce + Broadcast Tests ===========
 
 reduce_broadcast_sanitizer = SymbolicSanitizer()

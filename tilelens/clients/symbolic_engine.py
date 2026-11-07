@@ -87,9 +87,11 @@ from ..core.data import (
     TensorPointerStore,
 )
 from ..core.symbolic_metadata import (
+    BFLOAT16,
     FLOAT32,
     INT1,
     INT32,
+    UINT32,
     DTYPE_BY_NAME,
     SymbolicDType,
     SymbolicPointerDType,
@@ -1613,7 +1615,14 @@ class ReduceSymbolicExpr(SymbolicExpr):
     keepdims: SymbolicExpr
     axis: SymbolicExpr | None
 
-    def __init__(self, op: str, input: Any, axis: Any = None, keepdims: bool = False):
+    def __init__(
+        self,
+        op: str,
+        input: Any,
+        axis: Any = None,
+        keepdims: bool = False,
+        dtype: Any = None,
+    ):
         if op not in self._SUPPORTED_OPS:
             raise NotImplementedError(f"Unsupported reduce op: {op}")
         super().__init__(op)
@@ -1650,6 +1659,8 @@ class ReduceSymbolicExpr(SymbolicExpr):
         scalar_ty: SymbolicDType
         if op in ("argmax", "argmin"):
             scalar_ty = INT32
+        elif dtype is not None:
+            scalar_ty = SymbolicExpr._NORMALIZE_VALUE(dtype)
         else:
             assert self.input.dtype is not None
             scalar_ty = self.input.dtype
@@ -2698,10 +2709,39 @@ class SymbolicClient(Client):
     def _op_broadcast_overrider(self, arg, shape):
         return SymbolicExpr.create("broadcast", SymbolicExpr.from_value(arg), shape)
 
-    def _op_reduce_sum_overrider(self, input, axis=None, keep_dims=False, **kwargs):
-        return SymbolicExpr.create(
-            "sum", SymbolicExpr.from_value(input), axis, keep_dims
-        )
+    # tl.sum, tl.max, and tl.min convert their input before reducing
+    # (triton.language.standard); these give the resulting dtype.
+    @staticmethod
+    def _reduce_sum_dtype(dtype: Any) -> Any:
+        if not isinstance(dtype, SymbolicScalarDType) or dtype.primitive_bitwidth >= 32:
+            return dtype
+        if dtype.name.startswith("int") and dtype != INT1:
+            return INT32
+        if dtype.name.startswith("uint") or dtype == INT1:
+            return UINT32
+        return dtype
+
+    @staticmethod
+    def _reduce_minmax_dtype(dtype: Any, return_indices: bool) -> Any:
+        if dtype == BFLOAT16:
+            return FLOAT32
+        if (
+            return_indices
+            or not isinstance(dtype, SymbolicScalarDType)
+            or dtype.primitive_bitwidth >= 32
+        ):
+            return dtype
+        if dtype.name.startswith(("fp", "bf", "float")):
+            return FLOAT32
+        return INT32
+
+    def _op_reduce_sum_overrider(
+        self, input, axis=None, keep_dims=False, dtype=None, **kwargs
+    ):
+        input_sym = SymbolicExpr.from_value(input)
+        if dtype is None:
+            dtype = self._reduce_sum_dtype(input_sym.dtype)
+        return SymbolicExpr.create("sum", input_sym, axis, keep_dims, dtype)
 
     def _op_reduce_xor_overrider(self, input, axis=None, keep_dims=False, **kwargs):
         return SymbolicExpr.create(
@@ -2715,16 +2755,20 @@ class SymbolicClient(Client):
 
     def _op_reduce_max_overrider(self, input, axis=None, keep_dims=False, **kwargs):
         input_sym = SymbolicExpr.from_value(input)
-        val = SymbolicExpr.create("max", input_sym, axis, keep_dims)
-        if kwargs.get("return_indices", False):
+        return_indices = kwargs.get("return_indices", False)
+        dtype = self._reduce_minmax_dtype(input_sym.dtype, return_indices)
+        val = SymbolicExpr.create("max", input_sym, axis, keep_dims, dtype)
+        if return_indices:
             idx = SymbolicExpr.create("argmax", input_sym, axis, keep_dims)
             return (val, idx)
         return val
 
     def _op_reduce_min_overrider(self, input, axis=None, keep_dims=False, **kwargs):
         input_sym = SymbolicExpr.from_value(input)
-        val = SymbolicExpr.create("min", input_sym, axis, keep_dims)
-        if kwargs.get("return_indices", False):
+        return_indices = kwargs.get("return_indices", False)
+        dtype = self._reduce_minmax_dtype(input_sym.dtype, return_indices)
+        val = SymbolicExpr.create("min", input_sym, axis, keep_dims, dtype)
+        if return_indices:
             idx = SymbolicExpr.create("argmin", input_sym, axis, keep_dims)
             return (val, idx)
         return val
