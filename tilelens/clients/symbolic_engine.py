@@ -527,7 +527,10 @@ class SymbolicExpr:
 
         value_part: Any = None
         if self.op == "const":
-            value_part = self._value_signature(getattr(self, "value", None))
+            value_part = (
+                self._value_signature(getattr(self, "value", None)),
+                getattr(self, "origin_base", None),
+            )
 
         self.expr_signature = hash(
             (
@@ -2920,7 +2923,13 @@ class SymbolicClient(Client):
         if materialized:
             self._on_data_dependent_value()
             if expr.has_vector_const():
+                # The full replacement turns a pointer into its concrete
+                # addresses; keep the pointer argument it is computed from,
+                # which decides the tensor whose bounds the access must keep.
+                base = self._pointer_base(expr)
                 expr = expr.replace_subtree()
+                if base is not None:
+                    expr.origin_base = base
             return expr
 
         return expr
@@ -3124,6 +3133,43 @@ class SymbolicClient(Client):
 
     # ── Tensor resolution helpers ─────────────────────────────────────
 
+    @classmethod
+    def _pointer_base(cls, expr: SymbolicExpr) -> Any | None:
+        """Return the pointer argument that ``expr`` is computed from, or None.
+
+        Follow only pointer-valued operands (pointer arithmetic, broadcasts,
+        selects) down to a scalar pointer constant. A pointer loaded from
+        memory or cast from an integer has no such base: only its concrete
+        value tells where it points.
+        """
+        if not is_pointer_dtype(expr.dtype) or expr.op == "load":
+            return None
+        if expr.op == "const":
+            origin = getattr(expr, "origin_base", None)
+            if origin is not None:
+                return origin
+            value = getattr(expr, "value", None)
+            if isinstance(value, SymbolicTensorValue) and value.data.size != 1:
+                return None
+            return expr.to_py()
+        bases = set()
+        for child in expr.children.values():
+            for item in child if isinstance(child, tuple) else (child,):
+                if (
+                    item is None
+                    or not is_pointer_dtype(item.dtype)
+                    or isinstance(
+                        getattr(item, "value", None),
+                        (SymbolicScalarDType, SymbolicPointerDType, SymbolicTypeSpec),
+                    )
+                ):
+                    continue
+                base = cls._pointer_base(item)
+                if base is None:
+                    return None
+                bases.add(int(base))
+        return bases.pop() if len(bases) == 1 else None
+
     def _collect_tensor_base(self, expr: SymbolicExpr) -> Any | None:
         def walk(node: SymbolicExpr) -> Any | None:
             if (
@@ -3134,7 +3180,8 @@ class SymbolicClient(Client):
                     (SymbolicScalarDType, SymbolicPointerDType, SymbolicTypeSpec),
                 )
             ):
-                return node.to_py()
+                origin = getattr(node, "origin_base", None)
+                return origin if origin is not None else node.to_py()
             for child in node.children.values():
                 if child is None:
                     continue
