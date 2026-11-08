@@ -332,3 +332,26 @@ def test_a_program_a_client_skips_does_not_stop_the_grid():
         x
     )
     np.testing.assert_array_equal(got[128:], x[128:])
+
+
+def double_row_kernel(lhsT, rhs):
+    # nc_matmul with perf_mode="double_row_gen3" (Trn2): [K, 2, M] x [K, 2, N] -> [M, N]
+    out = nl.ndarray(
+        (lhsT.shape[2], rhs.shape[2]), dtype=nl.float32, buffer=nl.shared_hbm
+    )
+    res = nl.zeros((lhsT.shape[2], rhs.shape[2]), dtype=nl.float32, buffer=nl.psum)
+    res[...] += nisa.nc_matmul(nl.load(lhsT), nl.load(rhs), perf_mode="double_row_gen3")
+    nl.store(out, value=res)
+    return out
+
+
+def test_double_row_matmul_matches_nki_simulator(monkeypatch):
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    lhsT = rng.random((128, 2, 128)).astype(nl.float8_e4m3)
+    rhs = rng.random((128, 2, 512)).astype(nl.float8_e4m3)
+    tilelens.clear()
+    got = tilelens.trace(client=Tracer(), frontend="nki")(double_row_kernel)[(1,)](
+        lhsT, rhs
+    )
+    want = nki.simulate_kernel(nki.jit(double_row_kernel)[(1,)], lhsT, rhs)
+    np.testing.assert_allclose(got, want, rtol=1e-5)

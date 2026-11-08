@@ -844,9 +844,13 @@ class Builder:
         )
 
     def nc_matmul(self, stationary, moving, *, mask=None, **kwargs):
-        # stationary.T @ moving on the Tensor Engine, accumulated in fp32 (PSUM).
-        value = np.matmul(
-            stationary.data.astype(np.float32).T, moving.data.astype(np.float32)
+        # stationary.T @ moving on the Tensor Engine, accumulated in fp32 (PSUM). With
+        # perf_mode="double_row_*" the operands are [K, 2, M] and [K, 2, N]: the two rows of
+        # tiles are contracted together, so every axis but the last is contracted.
+        s = stationary.data.astype(np.float32)
+        m = moving.data.astype(np.float32)
+        value = np.tensordot(
+            s, m, axes=(list(range(s.ndim - 1)), list(range(m.ndim - 1)))
         )
         return NDArray(value=value, name=f"{stationary.name}_{moving.name}_nc_matmul")
 
