@@ -19,7 +19,7 @@ from .base import AdapterResult, Frontend, _LangPatchScope, register_frontend
 HAS_NKI = False
 nki_builder = None
 try:
-    from tilelens.core.simulation.nki import NDArray, nki_builder  # type: ignore
+    from tilelens.core.simulation.nki import NDArray, full_keys, nki_builder  # type: ignore
 
     HAS_NKI = True
 except ModuleNotFoundError:
@@ -62,15 +62,21 @@ if HAS_NKI:
     NKI_ADAPTERS = {
         ProgramId: lambda axis, *_args, **_kwargs: AdapterResult(axis),
         Allocate: lambda *_args, **_kwargs: AdapterResult(),
-        Load: lambda src, keys, *, mask=None, **_kwargs: AdapterResult(
+        # `nl.load(t)` and `nl.store(t, value=v)` access the whole tensor.
+        Load: lambda src, keys=None, *, mask=None, **_kwargs: AdapterResult(
             src,
             mask,
-            keys,
+            full_keys(src) if keys is None else keys,
         ),
-        Store: lambda dst, keys, value, *, mask=None, **_kwargs: AdapterResult(
+        Store: lambda dst,
+        keys=None,
+        value=None,
+        *,
+        mask=None,
+        **_kwargs: AdapterResult(
             dst,
             mask,
-            keys,
+            full_keys(dst) if keys is None else keys,
         ),
         Dot: _nki_dot_adapter,
         ReduceSum: _nki_reduce_sum_adapter,

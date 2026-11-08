@@ -12,7 +12,29 @@ except (
 import inspect
 import textwrap
 from ..frontend.nki_transform import transform_code
-from ..masked_load_store import masked_load, masked_store
+from ..masked_load_store import masked_load, masked_store, tile_mask, tile_shape
+
+
+def _value(x):
+    """The numpy value of an NDArray operand; other operands (scalars) as is."""
+    return x.data if isinstance(x, NDArray) else x
+
+
+def _axis(axis):
+    """NKI accepts a list of axes; numpy needs an int or a tuple."""
+    return tuple(axis) if isinstance(axis, list) else axis
+
+
+def _extreme(dtype, lowest):
+    """Identity of a masked max (lowest) or min (highest) reduction over `dtype`."""
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        return info.min if lowest else info.max
+    return -np.inf if lowest else np.inf
+
+
+def _cast(value, dtype):
+    return np.asarray(value) if dtype is None else np.asarray(value).astype(dtype)
 
 
 class NDArray:
@@ -251,30 +273,47 @@ class Builder:
         else:
             return keys
 
-    def load(self, src: NDArray, keys, *, mask=None, **kwargs):
+    def load(self, src: NDArray, keys=None, *, mask=None, **kwargs):
         """Load array elements with masking for out-of-bounds errors."""
         # Convert NDArray to numpy array
         ndarray = src.data
         mask_value = getattr(mask, "data", mask) if mask is not None else None
+        dtype = kwargs.pop("dtype", None)
+        keys = full_keys(src) if keys is None else keys
 
         # Convert any NDArrays in keys to numpy arrays
         numpy_keys = self._convert_keys_to_numpy(keys)
 
         # Call the actual masked_load function
+        mask_value = tile_mask(ndarray, numpy_keys, mask_value)
         result = masked_load(ndarray, numpy_keys, mask=mask_value)
 
         # Convert result back to NDArray
-        return NDArray(value=result, name=f"{src.name}_masked_load", **kwargs)
+        return NDArray(
+            value=_cast(result, dtype), name=f"{src.name}_masked_load", **kwargs
+        )
 
-    def store(self, dst: NDArray, keys, value: NDArray, *, mask=None, **kwargs):
+    def store(
+        self, dst: NDArray, keys=None, value: NDArray = None, *, mask=None, **kwargs
+    ):
         """Store array elements with masking for out-of-bounds errors."""
         # Convert NDArrays to numpy arrays
         ndarray = dst.data
-        value_array = value.data
         mask_value = getattr(mask, "data", mask) if mask is not None else None
+        keys = full_keys(dst) if keys is None else keys
 
         # Convert any NDArrays in keys to numpy arrays
         numpy_keys = self._convert_keys_to_numpy(keys)
+
+        # NKI broadcasts the stored value and the mask to the tile shape
+        tile_shape_ = tile_shape(ndarray, numpy_keys)
+        value_array = np.asarray(_value(value))
+        same_size = value_array.size == int(np.prod(tile_shape_))
+        if value_array.shape != tile_shape_ and same_size:
+            # e.g. a [P, 1] reduction stored into a 1-D slice
+            value_array = value_array.reshape(tile_shape_)
+        value_array = np.broadcast_to(value_array, tile_shape_).astype(ndarray.dtype)
+        mask_value = tile_mask(ndarray, numpy_keys, mask_value)
 
         # Call the actual masked_store function
         masked_store(ndarray, numpy_keys, value_array, mask=mask_value)
@@ -290,8 +329,43 @@ class Builder:
         value = loaded.data.astype(dtype) if dtype is not None else loaded.data
         return NDArray(value=value.T, name=f"{src.name}_load_transpose2d", **kwargs)
 
-    def _unary_op(self, x: NDArray, np_func, op_name, **kwargs):
-        return NDArray(value=np_func(x.data), name=f"{x.name}_{op_name}", **kwargs)
+    def _unary_op(
+        self, x: NDArray, np_func, op_name, *, dtype=None, mask=None, **kwargs
+    ):
+        return NDArray(
+            value=_cast(np_func(x.data), dtype), name=f"{x.name}_{op_name}", **kwargs
+        )
+
+    def _binary_op(self, x, y, np_func, op_name, *, dtype=None, mask=None, **kwargs):
+        return NDArray(
+            value=_cast(np_func(_value(x), _value(y)), dtype),
+            name=f"{getattr(x, 'name', 'scalar')}_{op_name}_{getattr(y, 'name', 'scalar')}",
+            **kwargs,
+        )
+
+    def _reduce(
+        self,
+        x,
+        axis,
+        np_func,
+        op_name,
+        *,
+        dtype=None,
+        mask=None,
+        keepdims=False,
+        initial=None,
+        **kwargs,
+    ):
+        reduce_kwargs = {}
+        if mask is not None:
+            reduce_kwargs["where"] = np.asarray(_value(mask), dtype=bool)
+            if initial is not None:
+                reduce_kwargs["initial"] = initial
+        value = np_func(x.data, axis=_axis(axis), keepdims=keepdims, **reduce_kwargs)
+        if not keepdims and np.ndim(value) == 1 and x.data.ndim >= 2:
+            # NKI keeps a free dimension: reducing all free axes of a [P, ...] tile gives [P, 1]
+            value = value[:, None]
+        return NDArray(value=_cast(value, dtype), name=f"{x.name}_{op_name}", **kwargs)
 
     # Elementwise operator implementations
     def exp(self, x: NDArray, **kwargs):
@@ -359,12 +433,45 @@ class Builder:
     def copy(self, x: NDArray, **kwargs):
         return self._unary_op(x, np.copy, "copy", **kwargs)
 
-    def sum(self, x: NDArray, *args, mask=None, **kwargs):
-        if mask is not None:
-            kwargs["where"] = mask.data
+    def sum(self, x: NDArray, *args, **kwargs):
+        axis = args[0] if args else kwargs.pop("axis", None)
+        kwargs.setdefault("keepdims", kwargs.pop("keep_dims", False))
+        return self._reduce(x, axis, np.sum, "sum", **kwargs)
+
+    def max(self, x: NDArray, axis, **kwargs):
+        lowest = _extreme(x.data.dtype, lowest=True)
+        return self._reduce(x, axis, np.max, "max", initial=lowest, **kwargs)
+
+    def min(self, x: NDArray, axis, **kwargs):
+        highest = _extreme(x.data.dtype, lowest=False)
+        return self._reduce(x, axis, np.min, "min", initial=highest, **kwargs)
+
+    def mean(self, x: NDArray, axis, **kwargs):
+        return self._reduce(x, axis, np.mean, "mean", **kwargs)
+
+    def add(self, x, y, **kwargs):
+        return self._binary_op(x, y, np.add, "add", **kwargs)
+
+    def subtract(self, x, y, **kwargs):
+        return self._binary_op(x, y, np.subtract, "subtract", **kwargs)
+
+    def divide(self, x, y, **kwargs):
+        return self._binary_op(x, y, np.divide, "divide", **kwargs)
+
+    def maximum(self, x, y, **kwargs):
+        return self._binary_op(x, y, np.maximum, "maximum", **kwargs)
+
+    def minimum(self, x, y, **kwargs):
+        return self._binary_op(x, y, np.minimum, "minimum", **kwargs)
+
+    def static_cast(self, x, dtype):
         return NDArray(
-            value=x.data.sum(*args, **kwargs), name=f"{x.name}_sum", **kwargs
+            value=_cast(_value(x), dtype), name=f"{getattr(x, 'name', 'scalar')}_cast"
         )
+
+    def par_dim(self, value):
+        # Marks a partition dimension for the compiler; the size is all the simulator needs.
+        return value
 
     def square(self, x: NDArray, **kwargs):
         return self._unary_op(x, np.square, "square", **kwargs)
@@ -372,24 +479,12 @@ class Builder:
     def rsqrt(self, x: NDArray, **kwargs):
         return self._unary_op(x, lambda v: 1 / np.sqrt(v), "rsqrt", **kwargs)
 
-    def multiply(self, x: NDArray, y: NDArray, **kwargs):
-        if isinstance(y, NDArray):
-            return NDArray(
-                value=np.multiply(x.data, y.data),
-                name=f"{x.name}_multiply_{y.name}",
-                **kwargs,
-            )
-        elif np.isscalar(y):
-            return NDArray(
-                value=np.multiply(x.data, y),
-                name=f"{x.name}_multiply_scalar",
-                **kwargs,
-            )
-        else:
-            raise TypeError(f"Unsupported type for multiply: {type(y)}")
+    def multiply(self, x, y, **kwargs):
+        return self._binary_op(x, y, np.multiply, "multiply", **kwargs)
 
-    def range(self, stop):
-        return range(stop)
+    def range(self, *args, **kwargs):
+        # affine_range, sequential_range, and static_range all iterate like range()
+        return range(*args)
 
 
 nki_builder = Builder()
@@ -415,7 +510,9 @@ def nki_patch_lang(scope=None):
     # nl.shared_hbm
     # nl.psum
     _set_attr(nl, "affine_range", nki_builder.range)
-    nl.par_dim
+    _set_attr(nl, "sequential_range", nki_builder.range)
+    _set_attr(nl, "static_range", nki_builder.range)
+    _set_attr(nl, "par_dim", nki_builder.par_dim)
     _set_attr(nl, "zeros", nki_builder.zeros)
     _set_attr(nl, "mgrid", NDArray(value=np.mgrid, buffer=nl.sbuf, name="mgrid"))
     _set_attr(nl, "matmul", nki_builder.matmul)
@@ -424,6 +521,18 @@ def nki_patch_lang(scope=None):
     _set_attr(nl, "square", nki_builder.square)
     _set_attr(nl, "rsqrt", nki_builder.rsqrt)
     _set_attr(nl, "multiply", nki_builder.multiply)
+    for name in (
+        "max",
+        "min",
+        "mean",
+        "add",
+        "subtract",
+        "divide",
+        "maximum",
+        "minimum",
+        "static_cast",
+    ):
+        _set_attr(nl, name, getattr(nki_builder, name))
 
     # attention-specific
     _set_attr(nl, "load_transpose2d", nki_builder.load_transpose2d)
@@ -452,6 +561,19 @@ def nki_patch_lang(scope=None):
 def nki_unpatch_lang(scope=None):
     if scope is not None and hasattr(scope, "restore"):
         scope.restore()
+
+
+def full_keys(tensor):
+    """Keys of a whole-tensor access such as `nl.load(t)` or `nl.store(t, value=v)`."""
+    return tuple(slice(None) for _ in range(tensor.data.ndim))
+
+
+def _to_numpy(ret):
+    if isinstance(ret, NDArray):
+        return ret.data
+    if isinstance(ret, (tuple, list)):
+        return type(ret)(_to_numpy(r) for r in ret)
+    return ret
 
 
 class NKIInterpretedFunction:
@@ -520,6 +642,7 @@ class NKIInterpretedFunction:
             ret = arg
             client_manager.arg_callback(name, arg, ret)
 
+        ret = None
         for x in range(grid_dims[0]):
             for y in range(grid_dims[1]):
                 for z in range(grid_dims[2]):
@@ -530,7 +653,11 @@ class NKIInterpretedFunction:
                         client_manager.grid_idx_callback((x, y, z))
 
                     if not client_manager.pre_run_callback(self.fn):
-                        return
-                    self.fn(*args, **kwargs)
+                        return _to_numpy(ret)
+                    ret = self.fn(*args, **kwargs)
                     if not client_manager.post_run_callback(self.fn):
-                        return
+                        # a client that needs no more programs stops the grid early
+                        return _to_numpy(ret)
+        # Kernels that allocate their outputs in shared HBM return them; every program
+        # returns the same arrays, so return the last program's, as numpy arrays.
+        return _to_numpy(ret)

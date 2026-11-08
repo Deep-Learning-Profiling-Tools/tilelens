@@ -127,7 +127,8 @@ def test_tracer_records_reduce_sum():
     assert record.input_shape == (block_m, block_n)
     assert record.index == 1
     assert record.keep_dims is False
-    assert record.output_shape == (block_m,)
+    # As in NKI, reducing the only free axis of a [P, F] tile keeps it: [P, 1].
+    assert record.output_shape == (block_m, 1)
 
 
 def test_tracer_records_dot():

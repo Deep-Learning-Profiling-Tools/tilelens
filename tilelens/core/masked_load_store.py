@@ -67,6 +67,30 @@ def _get_valid_indices(
     return valid_mask
 
 
+def tile_shape(ndarray: np.ndarray, keys) -> tuple:
+    """Shape of ``ndarray[keys]``, also when some integer-array keys are out of bounds."""
+    if not isinstance(keys, tuple):
+        keys = (keys,)
+    clipped = []
+    for dim, key in enumerate(keys):
+        if (
+            isinstance(key, np.ndarray)
+            and key.dtype.kind in "iu"
+            and dim < ndarray.ndim
+        ):
+            key = np.clip(key, 0, max(ndarray.shape[dim] - 1, 0))
+        clipped.append(key)
+    return ndarray[tuple(clipped)].shape
+
+
+def tile_mask(ndarray: np.ndarray, keys, mask) -> np.ndarray | None:
+    """``mask`` broadcast to the shape of ``ndarray[keys]``, as NKI broadcasts masks;
+    None stays None."""
+    if mask is None:
+        return None
+    return np.broadcast_to(np.asarray(mask, dtype=bool), tile_shape(ndarray, keys))
+
+
 def masked_load(
     ndarray: np.ndarray, keys: tuple, mask: np.ndarray = None
 ) -> np.ndarray:
