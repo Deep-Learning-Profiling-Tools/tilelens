@@ -132,6 +132,8 @@ def masked_load(
     padded_array[tuple(copy_slices)] = ndarray[tuple(copy_slices)]
 
     result = padded_array[keys]
+    if mask is None:  # every lane is active, so an out-of-bounds one is an error
+        mask = np.ones(np.expand_dims(result, singleton_dims).shape, dtype=bool)
     assert np.expand_dims(result, singleton_dims).shape == mask.shape
 
     mask = np.squeeze(mask, singleton_dims)
