@@ -362,7 +362,18 @@ class Buffer:
         return probe
 
 
+def _outputs_to_numpy(ret: Any) -> Any:
+    """A kernel's returned tensors (one, or a tuple or list of them) as numpy arrays."""
+    if isinstance(ret, NDArray):
+        return np.asarray(ret.data)
+    if isinstance(ret, (tuple, list)):
+        return type(ret)(_outputs_to_numpy(r) for r in ret)
+    return ret
+
+
 sbuf, hbm, psum = map(Buffer, ("sbuf", "hbm", "psum"))
+# kernels allocate the outputs they return in shared HBM: device memory like hbm
+shared_hbm = hbm
 
 
 def ndarray(
@@ -751,11 +762,33 @@ def dma_copy(
     return _store(dst, _array(dst_rmw_op.run(dst.data, src_value)))
 
 
+def memset(
+    dst: NDArray,
+    value: Any,
+    engine: Any = nisa.engine.unknown,
+    name: str | None = None,
+) -> NDArray:
+    """Fill an on-chip tensor with a constant.
+
+    Args:
+        dst: Destination tensor in SBUF or PSUM.
+        value: The constant.
+        engine: Requested execution engine token.
+        name: Optional kernel op name retained for API parity.
+    """
+    _require(
+        _buffer_name(dst) in ("sbuf", "psum"),
+        f"memset is on-chip only, received dst buffer {_buffer_name(dst)}",
+    )
+    return _store(dst, np.full(dst.shape, value))
+
+
 def tensor_copy(
     dst: NDArray,
     src: NDArray,
     engine: Any = nisa.engine.unknown,
     name: str | None = None,
+    dtype: Any = None,
 ) -> NDArray:
     """Copy tensor data within on-chip memory.
 
@@ -764,6 +797,8 @@ def tensor_copy(
         src: Source tensor in SBUF or PSUM.
         engine: Requested execution engine token.
         name: Optional kernel op name retained for API parity.
+        dtype: Output dtype, which NKI's tracer accepts (e.g. the matrix-multiplication
+            tutorial casts PSUM to the output dtype); the copy converts to ``dst``'s dtype.
     """
     dst_buffer, src_buffer = _buffer_name(dst), _buffer_name(src)
     _require(
@@ -1149,6 +1184,8 @@ def nki_patch_lang(scope: Any = None) -> None:
     set_attr(nl, "psum", psum)
     set_attr(nl, "program_id", program_id)
     set_attr(nl, "affine_range", affine_range)
+    set_attr(nl, "sequential_range", affine_range)  # all iterate like range()
+    set_attr(nl, "static_range", affine_range)
     set_attr(nl, "ds", ds)
 
     set_attr(nisa, "nc_matmul", nc_matmul)
@@ -1158,6 +1195,7 @@ def nki_patch_lang(scope: Any = None) -> None:
     set_attr(nisa, "reciprocal", reciprocal)
     set_attr(nisa, "dma_copy", dma_copy)
     set_attr(nisa, "tensor_copy", tensor_copy)
+    set_attr(nisa, "memset", memset)
     set_attr(nisa, "tensor_tensor", tensor_tensor)
     set_attr(nisa, "tensor_reduce", tensor_reduce)
     set_attr(nisa, "tensor_scalar", tensor_scalar)
@@ -1220,6 +1258,7 @@ class NKIBeta2InterpretedFunction:
             assert arg is None or isinstance(arg, (bool, int, float, str, NDArray))
             if client_manager is not None:
                 client_manager.arg_callback(name, arg, arg)
+        ret = None
         for grid_idx in itertools.product(*(range(dim) for dim in grid_dims)):
             if len(grid_idx) != len(nki_builder.grid_dims):
                 raise ValueError(
@@ -1233,8 +1272,10 @@ class NKIBeta2InterpretedFunction:
                 )
                 if not client_manager.pre_run_callback(self.fn):
                     continue  # a client that needs only some programs skips this one
-            self.fn(*kernel_args, **kwargs)
+            ret = self.fn(*kernel_args, **kwargs)
             if client_manager is not None and not client_manager.post_run_callback(
                 self.fn
             ):
-                return
+                break
+        # a kernel that allocates its outputs in HBM returns them, as numpy arrays
+        return _outputs_to_numpy(ret)

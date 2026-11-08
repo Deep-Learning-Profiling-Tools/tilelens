@@ -2219,3 +2219,39 @@ def test_interpreted_function_public_grid_edge_cases(patched_scope):
 
     with pytest.raises(ValueError, match="1D SPMD"):
         fn.run(src, np.zeros_like(src), grid=(1,), client_manager=_RankMismatch())
+
+
+def test_jit_kernel_written_like_the_matmul_tutorial_returns_its_output():
+    """An `@nki.jit` kernel as the matrix-multiplication tutorial writes it: its output in
+    shared HBM, returned; `memset`; `tensor_copy` with a `dtype`; and a sequential range.
+    NKI's own tracer checks the kernel first (pre_trace)."""
+    import nki
+
+    @nki.jit
+    def matmul_kernel(lhsT, rhs):
+        K, M = lhsT.shape
+        _, N = rhs.shape
+        result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+        lhs_tile = nl.ndarray(lhsT.shape, dtype=lhsT.dtype, buffer=nl.sbuf)
+        rhs_tile = nl.ndarray(rhs.shape, dtype=rhs.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=lhs_tile, src=lhsT)
+        nisa.dma_copy(dst=rhs_tile, src=rhs)
+        acc = nl.ndarray((M, N), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=acc, value=0.0)
+        for _ in nl.sequential_range(2):
+            psum = nl.ndarray((M, N), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(psum, lhs_tile, rhs_tile)
+            nisa.tensor_tensor(dst=acc, data1=acc, data2=psum, op=nl.add)
+        out = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=out, src=acc, dtype=lhsT.dtype)
+        nisa.dma_copy(dst=result, src=out)
+        return result
+
+    rng = np.random.default_rng(0)
+    lhsT = rng.random((128, 64)).astype(np.float32)
+    rhs = rng.random((128, 512)).astype(np.float32)
+    tilelens.clear()
+    got = tilelens.trace(client=Tracer(), frontend="nki_beta2")(matmul_kernel)[(1,)](
+        lhsT, rhs
+    )
+    np.testing.assert_allclose(got, 2 * lhsT.T @ rhs, rtol=1e-5)

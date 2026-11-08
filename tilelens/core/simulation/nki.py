@@ -1409,15 +1409,6 @@ def nki_unpatch_lang(scope=None):
         scope.restore()
 
 
-def nki_kernel_function(obj):
-    """The Python function of an NKI kernel object (`@nki.jit`, `@nki.baremetal`, ...), or
-    None for anything else."""
-    func = getattr(obj, "func", None)
-    if type(obj).__module__.startswith("neuronxcc") and inspect.isfunction(func):
-        return func
-    return None
-
-
 def _compile_rewritten(fn, namespace):
     """Compile `fn` with the NKI frontend AST transformer applied (decorators dropped, loads
     and stores given keys) into `namespace`, and return the new function."""
@@ -1442,6 +1433,8 @@ def _rewritten_namespace(module_globals, namespaces):
     kernels call as helpers) are rewritten, and NKI kernels it imports from other modules
     are their rewrites there. One namespace per module, so kernels that call each other
     find the rewrites. `namespaces` maps id(module globals) to the namespaces made so far."""
+    from ..trace import nki_kernel_function
+
     key = id(module_globals)
     if key in namespaces:
         return namespaces[key]
@@ -1522,6 +1515,8 @@ class NKIInterpretedFunction:
         # Apply the NKI frontend AST transformer, to the kernel and to the NKI kernels it
         # calls (`@nki.jit` helpers), once.
         if not getattr(self, "_rewritten", False):
+            from ..trace import nki_kernel_function
+
             fn = nki_kernel_function(self.fn) or self.fn
             if hasattr(fn, "__code__"):
                 self.fn = _rewrite_function(fn)
