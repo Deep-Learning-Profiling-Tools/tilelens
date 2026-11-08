@@ -1209,6 +1209,117 @@ def test_sanitizer_supports_data_dependent_cumsum_index():
     assert len(cumsum_sanitizer.records) == 0
 
 
+def _offsets_into_b(a, b, indices):
+    return [
+        (b.data_ptr() + i * b.element_size() - a.data_ptr()) // a.element_size()
+        for i in indices
+    ]
+
+
+@pytest.mark.parametrize("op", ["load", "store"])
+@pytest.mark.parametrize(
+    "lanes, reported",
+    [
+        ("a a a a", False),
+        ("b b b b", True),
+        ("a b b b", True),
+        ("b a a a", True),
+        ("b b past past", True),
+    ],
+)
+def test_sanitizer_checks_loaded_offsets_against_their_base_tensor(op, lanes, reported):
+    """An address computed from loaded offsets is concretized; it must still be
+    checked against the tensor of the pointer it is computed from (a_ptr), not
+    the tensor that its first address falls in."""
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+    # Defined per test, so that no launch repeats an earlier one.
+    @tilelens.trace(client=sanitizer)
+    @triton.jit
+    def load_kernel(a_ptr, b_ptr, idx_ptr, out_ptr, N: tl.constexpr):
+        offs = tl.arange(0, N)
+        idx = tl.load(idx_ptr + offs)  # offsets from a_ptr, loaded from memory
+        y = tl.load(b_ptr + offs)  # in-bounds use of b, so b is registered
+        tl.store(out_ptr + offs, tl.load(a_ptr + idx) + y)
+
+    @tilelens.trace(client=sanitizer)
+    @triton.jit
+    def store_kernel(a_ptr, b_ptr, idx_ptr, N: tl.constexpr):
+        offs = tl.arange(0, N)
+        idx = tl.load(idx_ptr + offs)
+        tl.store(a_ptr + idx, tl.load(b_ptr + offs))
+
+    a = torch.zeros(16, dtype=torch.float32)
+    b = torch.ones(16, dtype=torch.float32)
+    into_b = _offsets_into_b(a, b, range(4))
+    where = {
+        "a": list(range(4)),
+        "b": into_b,
+        "past": [into_b[0] + 1000, into_b[0] + 2000],
+    }
+    used = {name: 0 for name in where}
+    idx = []
+    for lane in lanes.split():
+        idx.append(where[lane][used[lane]])
+        used[lane] += 1
+    idx = torch.tensor(idx, dtype=torch.int64)
+
+    if op == "load":
+        load_kernel[(1,)](a, b, idx, torch.empty(4), N=4)
+    else:
+        store_kernel[(1,)](a, b, idx, N=4)
+
+    names = {record.tensor_name for record in sanitizer.records}
+    assert names == ({"a_ptr"} if reported else set())
+
+
+def test_sanitizer_checks_loaded_offsets_in_a_loop_against_their_base_tensor():
+    """The pointer tile is built before the loop and shared by its iterations;
+    concretizing the first iteration's address must not lose its base."""
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+    @tilelens.trace(client=sanitizer)
+    @triton.jit
+    def loop_kernel(a_ptr, b_ptr, idx_ptr, N: tl.constexpr, ITERS: tl.constexpr):
+        offs = tl.arange(0, N)
+        a_ptrs = a_ptr + offs * 0
+        for i in range(ITERS):
+            idx = tl.load(idx_ptr + i * N + offs)  # loaded offsets from a_ptrs
+            tl.store(a_ptrs + idx, tl.load(b_ptr + offs))
+
+    a = torch.zeros(16, dtype=torch.float32)
+    b = torch.ones(16, dtype=torch.float32)
+    # Iteration 0 stays in a; iteration 1 lands entirely in b.
+    idx = torch.tensor(
+        list(range(4)) + _offsets_into_b(a, b, range(4)), dtype=torch.int64
+    )
+
+    loop_kernel[(1,)](a, b, idx, N=4, ITERS=2)
+
+    assert {record.tensor_name for record in sanitizer.records} == {"a_ptr"}
+
+
+def test_sanitizer_resolves_a_loaded_pointer_from_its_value():
+    """A pointer loaded from memory has no pointer argument to start from;
+    its value decides the tensor, here src, which is in bounds."""
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+    @tilelens.trace(client=sanitizer)
+    @triton.jit
+    def pointer_table_kernel(table_ptr, src_ptr, out_ptr, N: tl.constexpr):
+        offs = tl.arange(0, N)
+        src = tl.load(table_ptr).to(tl.pointer_type(tl.float32))
+        tl.store(out_ptr + offs, tl.load(src + offs + tl.load(src_ptr).to(tl.int32)))
+
+    src = torch.zeros(8, dtype=torch.float32)
+    table = torch.tensor([src.data_ptr()], dtype=torch.int64)
+    out = torch.empty(4, dtype=torch.float32)
+
+    pointer_table_kernel[(1,)](table, src, out, N=4)
+
+    assert len(sanitizer.records) == 0
+
+
 ashr_index_sanitizer = SymbolicSanitizer(abort_on_error=False)
 
 
