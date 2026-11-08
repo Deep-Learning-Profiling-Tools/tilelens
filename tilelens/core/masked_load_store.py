@@ -67,6 +67,31 @@ def _get_valid_indices(
     return valid_mask
 
 
+def _has_negative_index(keys: tuple) -> bool:
+    """Whether an integer or integer-array key is negative: numpy would wrap it around,
+    where it is an out-of-bounds index."""
+    for key in keys:
+        if isinstance(key, (int, np.integer)) and key < 0:
+            return True
+        if (
+            isinstance(key, np.ndarray)
+            and key.dtype.kind == "i"
+            and key.size
+            and key.min() < 0
+        ):
+            return True
+    return False
+
+
+def _fill_value(dtype):
+    """Value of lanes a masked load does not read."""
+    if np.issubdtype(dtype, np.integer):
+        return np.iinfo(dtype).max
+    if np.issubdtype(dtype, np.floating):
+        return np.finfo(dtype).max
+    return 0
+
+
 def tile_shape(ndarray: np.ndarray, keys) -> tuple:
     """Shape of ``ndarray[keys]``, also when some integer-array keys are out of bounds."""
     if not isinstance(keys, tuple):
@@ -80,7 +105,10 @@ def tile_shape(ndarray: np.ndarray, keys) -> tuple:
         ):
             key = np.clip(key, 0, max(ndarray.shape[dim] - 1, 0))
         clipped.append(key)
-    return ndarray[tuple(clipped)].shape
+    # index a one-byte, zero-stride view: only the shape is needed, not the values
+    return np.broadcast_to(np.zeros((), dtype=bool), ndarray.shape)[
+        tuple(clipped)
+    ].shape
 
 
 def tile_mask(ndarray: np.ndarray, keys, mask) -> np.ndarray | None:
@@ -107,18 +135,19 @@ def masked_load(
     Returns:
         Indexed array with masked error handling
     """
-    try:  # fast path case - if keys aren't OOB, just go with that
-        out = ndarray[keys].copy()
-        if mask is None:
-            return out
-        out[~mask] = np.iinfo(ndarray.dtype).max
-        return out
-    except Exception:
-        pass
-
     # Convert keys to tuple if it's not already
     if not isinstance(keys, tuple):
         keys = (keys,)
+
+    if not _has_negative_index(keys):
+        try:  # fast path case - if keys aren't OOB, just go with that
+            out = ndarray[keys].copy()
+            if mask is None:
+                return out
+            out[~mask] = _fill_value(ndarray.dtype)
+            return out
+        except Exception:
+            pass
 
     # normalize (remove Nones in slices)
     keys, singleton_dims = normalize_slice(ndarray, keys)
@@ -152,13 +181,7 @@ def masked_load(
         )
 
     valid_mask = mask & in_bounds_mask
-    # Use appropriate max value based on dtype
-    if np.issubdtype(ndarray.dtype, np.integer):
-        result[~valid_mask] = np.iinfo(ndarray.dtype).max
-    elif np.issubdtype(ndarray.dtype, np.floating):
-        result[~valid_mask] = np.finfo(ndarray.dtype).max
-    else:
-        result[~valid_mask] = 0  # false
+    result[~valid_mask] = _fill_value(ndarray.dtype)
 
     return np.expand_dims(result, singleton_dims)
 
@@ -194,16 +217,32 @@ def masked_store(
     if not isinstance(keys, tuple):
         keys = (keys,)
 
+    if all(
+        k is None or isinstance(k, (int, np.integer, slice)) for k in keys
+    ) and not _has_negative_index(keys):
+        # fast path: basic indexing within bounds gives a view to store into
+        try:
+            target = ndarray[keys]
+        except IndexError:
+            target = None
+        if target is not None and target.shape == mask.shape:
+            target[mask] = value[mask]
+            return
+
     flat_mask = mask.ravel()  # can only index with bool tensors if they're 1d
 
     # normalize (remove Nones in slices)
     keys, singleton_dims = normalize_slice(ndarray, keys)
     target_shape = _calculate_target_shape(keys, ndarray.shape)
-    mgrid = np.mgrid[tuple(slice(0, dim, 1) for dim in target_shape)]
     idxs = []
-    for mgrid_dim in mgrid:
-        # get the section that would be sliced if the array was big enough
-        sliced_section = mgrid_dim[keys]
+    for dim, size in enumerate(target_shape):
+        # get the section that would be sliced if the array was big enough. The index grid
+        # of each dimension is a broadcast (zero-stride) view, so only the section is
+        # materialized, not a grid of the whole (padded) array.
+        axis_index = np.arange(size).reshape(
+            [-1 if d == dim else 1 for d in range(len(target_shape))]
+        )
+        sliced_section = np.broadcast_to(axis_index, target_shape)[keys]
 
         # get just the section where mask=True
         dim_idxs = sliced_section.ravel()[flat_mask]

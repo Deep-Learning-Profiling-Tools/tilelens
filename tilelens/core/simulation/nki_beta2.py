@@ -1232,7 +1232,7 @@ class NKIBeta2InterpretedFunction:
                     tuple(int(idx) for idx in grid_idx) + (0,) * (3 - len(grid_idx))
                 )
                 if not client_manager.pre_run_callback(self.fn):
-                    return
+                    continue  # a client that needs only some programs skips this one
             self.fn(*kernel_args, **kwargs)
             if client_manager is not None and not client_manager.post_run_callback(
                 self.fn

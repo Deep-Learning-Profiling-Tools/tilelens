@@ -433,6 +433,12 @@ def trace(client: str | Client | None = None, frontend: str = "triton"):
             trace.add_client(client)
             return trace
 
+        if frontend == "nki":
+            # an `@nki.jit` (or `@nki.baremetal`, ...) kernel runs as its Python function
+            from .simulation.nki import nki_kernel_function
+
+            kernel = nki_kernel_function(kernel) or kernel
+
         trace_source(kernel)
 
         # First-time wrapping

@@ -10,8 +10,10 @@ class NKITransformer(ast.NodeTransformer):
     - `nl.<func>(x[...], ...)` -> `nl.<func>(x, slice_obj, ...)`
        where <func> is one of {load, store, load_transpose2d}, wherever the call
        appears (e.g. nested in another call, as in `nl.store(o[i], nl.load(x[i]))`)
-    - `nisa.dma_copy(dst=o[...], src=x[...])` and `nisa.dma_transpose(x[...])` -> keys passed
-       as `dst_keys` / `src_keys`
+    - `nisa.dma_copy(dst=o[...], src=x[...])`, `nisa.dma_transpose(x[...])`, and the
+       HBM-to-HBM DMA calls `nisa._tiled_offloaded_memcpy(dst=o[...], src=x[...])` and
+       `nisa._tiled_offloaded_fma(x[...], y[...], dst=o[...], ...)` -> keys passed as
+       `dst_keys` / `src_keys` (a list, one per source, for `_tiled_offloaded_fma`)
     - strips out kernel decorators
     """
 
@@ -26,18 +28,40 @@ class NKITransformer(ast.NodeTransformer):
             new_call = self._rewrite_dma_copy_call(node)
         return node if new_call is None else new_call
 
+    _DMA_CALLS = (
+        "dma_copy",
+        "dma_transpose",
+        "_tiled_offloaded_memcpy",
+        "_tiled_offloaded_fma",
+    )
+
     def _rewrite_dma_copy_call(self, call_node: ast.Call) -> ast.Call | None:
         """`nisa.dma_copy(dst=o[...], src=x[...])` -> `nisa.dma_copy(dst=o, dst_keys=..., src=x, src_keys=...)`"""
         if not (
             isinstance(call_node.func, ast.Attribute)
             and isinstance(call_node.func.value, ast.Name)
             and call_node.func.value.id == "nisa"
-            and call_node.func.attr in ("dma_copy", "dma_transpose")
+            and call_node.func.attr in self._DMA_CALLS
         ):
             return None
         args = list(call_node.args)
         keywords = []
         changed = False
+        if call_node.func.attr == "_tiled_offloaded_fma" and any(
+            isinstance(a, ast.Subscript) for a in args
+        ):
+            # positional sources -> `src_keys=[keys of each source, or None]`
+            keys = [
+                cast(ast.expr, self._create_slice_value_node(a.slice))
+                if isinstance(a, ast.Subscript)
+                else ast.Constant(value=None)
+                for a in args
+            ]
+            args = [a.value if isinstance(a, ast.Subscript) else a for a in args]
+            keywords.append(
+                ast.keyword(arg="src_keys", value=ast.List(elts=keys, ctx=ast.Load()))
+            )
+            changed = True
         if (
             call_node.func.attr == "dma_transpose"
             and args
