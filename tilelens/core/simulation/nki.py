@@ -653,10 +653,11 @@ class NKIInterpretedFunction:
                         client_manager.grid_idx_callback((x, y, z))
 
                     if not client_manager.pre_run_callback(self.fn):
-                        return
+                        return _to_numpy(ret)
                     ret = self.fn(*args, **kwargs)
                     if not client_manager.post_run_callback(self.fn):
-                        return
+                        # a client that needs no more programs stops the grid early
+                        return _to_numpy(ret)
         # Kernels that allocate their outputs in shared HBM return them; every program
         # returns the same arrays, so return the last program's, as numpy arrays.
         return _to_numpy(ret)

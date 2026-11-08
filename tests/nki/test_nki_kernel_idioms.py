@@ -120,3 +120,21 @@ def test_kernel_idioms_match_nki_simulator(kernel, grid, args):
     want = _reference(kernel, grid, *args)
     assert isinstance(got, np.ndarray)
     np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+
+
+class _StopAfterFirstProgram(Tracer):
+    def post_run_callback(self, fn):
+        return False
+
+
+def test_outputs_are_returned_when_a_client_stops_the_grid_early():
+    tilelens.clear()
+    a = rng.standard_normal((256, 512)).astype(np.float32)
+    b = rng.standard_normal((256, 512)).astype(np.float32)
+    traced = tilelens.trace(client=_StopAfterFirstProgram(), frontend="nki")(
+        spmd_add_kernel
+    )
+    got = traced[(2, 2)](a, b)
+    assert isinstance(got, np.ndarray)
+    # Only program (0, 0) ran; its tile holds the sum.
+    np.testing.assert_allclose(got[:128, :256], a[:128, :256] + b[:128, :256])
