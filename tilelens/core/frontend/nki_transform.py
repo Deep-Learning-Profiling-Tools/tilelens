@@ -8,35 +8,19 @@ class NKITransformer(ast.NodeTransformer):
 
     Transformations:
     - `nl.<func>(x[...], ...)` -> `nl.<func>(x, slice_obj, ...)`
-       where <func> is one of {load, store, load_transpose2d}
+       where <func> is one of {load, store, load_transpose2d}, wherever the call
+       appears (e.g. nested in another call, as in `nl.store(o[i], nl.load(x[i]))`)
     - strips out kernel decorators
     """
-
-    def visit_Expr(self, node: ast.Expr) -> ast.AST | list[ast.AST]:
-        if not isinstance(node.value, ast.Call):
-            return self.generic_visit(node)
-
-        new_call = self._rewrite_nl_slice_call(node.value)
-        if new_call is None:
-            return self.generic_visit(node)
-        return ast.Expr(value=new_call)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
         node.decorator_list = []
         return self.generic_visit(node)
 
-    def visit_Assign(self, node: ast.Assign) -> ast.AST:
-        if not isinstance(node.value, ast.Call):
-            return self.generic_visit(node)
-
-        new_call = self._rewrite_nl_slice_call(node.value)
-        if new_call is None:
-            return self.generic_visit(node)
-        return ast.Assign(
-            targets=node.targets,
-            value=new_call,
-            type_comment=getattr(node, "type_comment", None),
-        )
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        node = cast(ast.Call, self.generic_visit(node))
+        new_call = self._rewrite_nl_slice_call(node)
+        return node if new_call is None else new_call
 
     def _rewrite_nl_slice_call(self, call_node: ast.Call) -> ast.Call | None:
         if not (

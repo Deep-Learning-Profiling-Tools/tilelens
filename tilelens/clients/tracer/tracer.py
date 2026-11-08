@@ -13,8 +13,18 @@ from ...core.data import (
     Allocate,
 )
 from ...utils.traceback_utils import extract_user_frames
-from tilelens.core.masked_load_store import masked_load
+from tilelens.core.masked_load_store import masked_load, tile_mask, tile_shape
 import numpy as np
+
+
+def _nki_offsets_and_mask(tensor, keys, mask):
+    """Element offsets and mask of an NKI access ``tensor[keys]``. NKI masks broadcast
+    to the tile shape, and an access without a mask touches every lane."""
+    offsets = tensor.get_offsets().data
+    mask_data = tile_mask(offsets, keys, mask.data if mask is not None else None)
+    if mask_data is None:
+        mask_data = np.ones(tile_shape(offsets, keys), dtype=bool)
+    return masked_load(offsets, keys, mask=mask_data), mask_data
 
 
 def _convert_grid_idx(grid_idx) -> tuple[int, int, int] | None:
@@ -103,12 +113,13 @@ class Tracer(Client):
                 first_ptr = np.reshape(ptr.data, (-1))[0]
                 tensor = self._get_tensor(first_ptr)
                 offsets = ptr.data - tensor.data_ptr()
+                mask_data = mask.data
             else:
                 keys = _convert_keys_to_numpy(keys)
-                offsets = masked_load(ptr.get_offsets().data, keys, mask=mask.data)
+                offsets, mask_data = _nki_offsets_and_mask(ptr, keys, mask)
                 tensor = ptr
 
-            rec = Load(tensor.data_ptr(), offsets, mask.data)
+            rec = Load(tensor.data_ptr(), offsets, mask_data)
             rec.call_path = extract_user_frames(num_frames=1)
             self.records.append(rec)
 
@@ -124,12 +135,7 @@ class Tracer(Client):
                 mask_data = mask.data
             else:
                 keys = _convert_keys_to_numpy(keys)
-                if mask is None:
-                    offsets = masked_load(ptr.get_offsets().data, keys)
-                    mask_data = np.ones_like(offsets).astype(bool)
-                else:
-                    mask_data = mask.data
-                    offsets = masked_load(ptr.get_offsets().data, keys, mask=mask_data)
+                offsets, mask_data = _nki_offsets_and_mask(ptr, keys, mask)
                 tensor = ptr
 
             rec = Store(tensor.data_ptr(), offsets, mask_data)
