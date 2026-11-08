@@ -1273,6 +1273,32 @@ def test_sanitizer_checks_loaded_offsets_against_their_base_tensor(op, lanes, re
     assert names == ({"a_ptr"} if reported else set())
 
 
+def test_sanitizer_checks_loaded_offsets_in_a_loop_against_their_base_tensor():
+    """The pointer tile is built before the loop and shared by its iterations;
+    concretizing the first iteration's address must not lose its base."""
+    sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+    @tilelens.trace(client=sanitizer)
+    @triton.jit
+    def loop_kernel(a_ptr, b_ptr, idx_ptr, N: tl.constexpr, ITERS: tl.constexpr):
+        offs = tl.arange(0, N)
+        a_ptrs = a_ptr + offs * 0
+        for i in range(ITERS):
+            idx = tl.load(idx_ptr + i * N + offs)  # loaded offsets from a_ptrs
+            tl.store(a_ptrs + idx, tl.load(b_ptr + offs))
+
+    a = torch.zeros(16, dtype=torch.float32)
+    b = torch.ones(16, dtype=torch.float32)
+    # Iteration 0 stays in a; iteration 1 lands entirely in b.
+    idx = torch.tensor(
+        list(range(4)) + _offsets_into_b(a, b, range(4)), dtype=torch.int64
+    )
+
+    loop_kernel[(1,)](a, b, idx, N=4, ITERS=2)
+
+    assert {record.tensor_name for record in sanitizer.records} == {"a_ptr"}
+
+
 def test_sanitizer_resolves_a_loaded_pointer_from_its_value():
     """A pointer loaded from memory has no pointer argument to start from;
     its value decides the tensor, here src, which is in bounds."""

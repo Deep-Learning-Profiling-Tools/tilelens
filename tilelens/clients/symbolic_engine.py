@@ -807,11 +807,14 @@ class SymbolicExpr:
             if not isinstance(concrete, SymbolicTensorValue):
                 raise TypeError(f"Unexpected dtype: {type(concrete)}!")
 
+            origin = getattr(self, "origin_base", None)
             self = SymbolicExpr.create(
                 "const",
                 concrete,
                 type_spec(concrete.dtype, concrete.shape),
             )
+            if origin is not None:
+                self.origin_base = origin
 
         return self
 
@@ -2926,10 +2929,13 @@ class SymbolicClient(Client):
                 # The full replacement turns a pointer into its concrete
                 # addresses; keep the pointer argument it is computed from,
                 # which decides the tensor whose bounds the access must keep.
+                # It replaces subtrees in place, and they may be shared with
+                # later accesses (a pointer tile built before a loop), so every
+                # pointer node on the way keeps it.
                 base = self._pointer_base(expr)
-                expr = expr.replace_subtree()
                 if base is not None:
-                    expr.origin_base = base
+                    self._mark_pointer_base(expr, base)
+                expr = expr.replace_subtree()
             return expr
 
         return expr
@@ -3169,6 +3175,25 @@ class SymbolicClient(Client):
                     return None
                 bases.add(int(base))
         return bases.pop() if len(bases) == 1 else None
+
+    @classmethod
+    def _mark_pointer_base(cls, expr: SymbolicExpr, base: Any) -> None:
+        """Set ``origin_base`` on ``expr`` and on the pointer-valued operands
+        that ``_pointer_base`` followed to find ``base``."""
+        expr.origin_base = base
+        if expr.op == "const":
+            return
+        for child in expr.children.values():
+            for item in child if isinstance(child, tuple) else (child,):
+                if (
+                    item is not None
+                    and is_pointer_dtype(item.dtype)
+                    and not isinstance(
+                        getattr(item, "value", None),
+                        (SymbolicScalarDType, SymbolicPointerDType, SymbolicTypeSpec),
+                    )
+                ):
+                    cls._mark_pointer_base(item, base)
 
     def _collect_tensor_base(self, expr: SymbolicExpr) -> Any | None:
         def walk(node: SymbolicExpr) -> Any | None:
