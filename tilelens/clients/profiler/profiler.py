@@ -15,6 +15,15 @@ import numpy as np
 from dataclasses import dataclass, replace
 
 
+def _mask_data(mask: TensorHandle | np.ndarray) -> np.ndarray:
+    """The boolean mask of a load or store.
+
+    Tensor-descriptor and block-pointer accesses pass their bounds mask to the
+    masked load/store as a plain NumPy array, whose ``.data`` is a memoryview.
+    """
+    return mask if isinstance(mask, np.ndarray) else mask.data
+
+
 @dataclass(frozen=False)
 class LoopInfo:
     length: int | None = None
@@ -157,12 +166,13 @@ class Profiler(Client):
             self.sampled_blocks = None
 
     def _report_load_store_bytes(
-        self, type, ptr: TensorHandle, mask: TensorHandle
+        self, type, ptr: TensorHandle, mask: TensorHandle | np.ndarray
     ):  # internal methods assumed to be called under the lock
         dtype_tt = ptr.get_element_ty()
         dtype_np: np.dtype = _get_np_dtype(dtype_tt)
-        mask_true = np.count_nonzero(mask.data)
-        mask_false = np.count_nonzero(np.logical_not(mask.data))
+        mask_data = _mask_data(mask)
+        mask_true = np.count_nonzero(mask_data)
+        mask_false = np.count_nonzero(np.logical_not(mask_data))
         total_bytes_true = mask_true * dtype_np.itemsize
         total_bytes_attempted = (mask_true + mask_false) * dtype_np.itemsize
         if type == "load":
@@ -200,17 +210,18 @@ class Profiler(Client):
                 self.potential_buffer_load_issue_found = True
 
     def register_op_callback(self, op_type: type[Op]) -> OpCallbacks:
-        def _get_mask_stats(mask: TensorHandle) -> tuple[int, int]:
+        def _get_mask_stats(mask: TensorHandle | np.ndarray) -> tuple[int, int]:
             """Get mask statistics: total count and false count.
 
             Args:
-                mask: TensorHandle containing boolean mask data
+                mask: TensorHandle or NumPy array containing boolean mask data
 
             Returns:
                 Tuple of (total_count, false_count)
             """
-            total_count = mask.data.size
-            false_count = np.count_nonzero(np.logical_not(mask.data))
+            mask_data = _mask_data(mask)
+            total_count = mask_data.size
+            false_count = np.count_nonzero(np.logical_not(mask_data))
             return total_count, false_count
 
         @self.lock_fn

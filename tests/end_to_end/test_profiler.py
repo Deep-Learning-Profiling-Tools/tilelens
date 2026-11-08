@@ -259,6 +259,44 @@ def test_mask_percentage(_isolate_profiler_cfg):
     ), f"Expected store masked percentage {expected_store_masked_percentage:.2f}%, got {actual_store_masked_percentage:.2f}%"
 
 
+@triton.jit
+def descriptor_copy_kernel(in_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    src = tl.make_tensor_descriptor(
+        in_ptr, shape=[N], strides=[1], block_shape=[BLOCK_SIZE]
+    )
+    dst = tl.make_tensor_descriptor(
+        out_ptr, shape=[N], strides=[1], block_shape=[BLOCK_SIZE]
+    )
+    dst.store([pid * BLOCK_SIZE], src.load([pid * BLOCK_SIZE]))
+
+
+def test_mask_percentage_of_tensor_descriptor_accesses(_isolate_profiler_cfg):
+    """A descriptor load/store passes its bounds mask as a NumPy array, not a TensorHandle."""
+    N = 100
+    BLOCK_SIZE = 32
+    num_blocks = triton.cdiv(N, BLOCK_SIZE)
+    x = torch.randn(N, dtype=torch.float32)
+    y = torch.empty(N, dtype=torch.float32)
+
+    cfg.profiler_enable_block_sampling = False
+    cfg.profiler_disable_buffer_load_check = True
+    profiler = Profiler()
+    traced_kernel = tilelens.trace(profiler)(descriptor_copy_kernel)
+    traced_kernel[(num_blocks,)](x, y, N, BLOCK_SIZE)
+
+    # 4 blocks of 32 elements; the last block has 4 in bounds, so 28 are masked.
+    assert profiler.load_mask_total_count == 128
+    assert profiler.load_mask_false_count == 28
+    assert profiler.store_mask_total_count == 128
+    assert profiler.store_mask_false_count == 28
+    # Bytes: 100 float32 elements in bounds out of 128 attempted.
+    assert profiler.load_bytes.total_bytes_attempted == 128 * 4
+    assert profiler.load_bytes.total_bytes_true == 100 * 4
+    assert profiler.store_bytes.total_bytes_attempted == 128 * 4
+    assert profiler.store_bytes.total_bytes_true == 100 * 4
+
+
 # ======== Block Sampling ========
 @triton.jit
 def block_sampling_test_kernel(
