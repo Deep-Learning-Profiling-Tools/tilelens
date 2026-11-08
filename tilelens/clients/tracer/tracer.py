@@ -21,7 +21,9 @@ def _nki_offsets_and_mask(tensor, keys, mask):
     """Element offsets and mask of an NKI access ``tensor[keys]``. NKI masks broadcast
     to the tile shape, and an access without a mask touches every lane."""
     offsets = tensor.get_offsets().data
-    mask_data = tile_mask(offsets, keys, mask.data if mask is not None else None)
+    mask_data = tile_mask(
+        offsets, keys, getattr(mask, "data", mask)
+    )  # NDArray, bool, or None
     if mask_data is None:
         mask_data = np.ones(tile_shape(offsets, keys), dtype=bool)
     return masked_load(offsets, keys, mask=mask_data), mask_data
@@ -102,6 +104,13 @@ class Tracer(Client):
             """Convert any NDArrays in keys to numpy arrays."""
             if isinstance(keys, (tuple, list)):
                 return tuple(_convert_keys_to_numpy(k) for k in keys)
+            if isinstance(keys, slice):  # e.g. nl.ds(start, size) with a computed start
+                part = (
+                    lambda v: v
+                    if v is None or isinstance(v, int)
+                    else int(np.asarray(getattr(v, "data", v)))
+                )  # noqa: E731
+                return slice(part(keys.start), part(keys.stop), part(keys.step))
             return keys.data if hasattr(keys, "data") else keys
 
         @self.lock_fn
