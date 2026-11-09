@@ -17,13 +17,21 @@ from tilelens.core.masked_load_store import masked_load, tile_mask, tile_shape
 import numpy as np
 
 
+def _nki_value(x):
+    """The numpy value of an NKI interpreter array; numpy arrays and scalars as they are
+    (their own `.data` is a memoryview)."""
+    if isinstance(x, (np.ndarray, np.generic)):
+        return x
+    return getattr(x, "data", x)
+
+
 def _nki_offsets_and_mask(tensor, keys, mask):
     """Element offsets and mask of an NKI access ``tensor[keys]``. NKI masks broadcast
     to the tile shape, and an access without a mask touches every lane."""
     offsets = tensor.get_offsets().data
     mask_data = tile_mask(
-        offsets, keys, getattr(mask, "data", mask)
-    )  # NDArray, bool, or None
+        offsets, keys, _nki_value(mask)
+    )  # NDArray, numpy array, bool, or None
     if mask_data is None:
         mask_data = np.ones(tile_shape(offsets, keys), dtype=bool)
     return masked_load(offsets, keys, mask=mask_data), mask_data
@@ -108,10 +116,10 @@ class Tracer(Client):
                 part = (
                     lambda v: v
                     if v is None or isinstance(v, int)
-                    else int(np.asarray(getattr(v, "data", v)))
+                    else int(np.asarray(_nki_value(v)))
                 )  # noqa: E731
                 return slice(part(keys.start), part(keys.stop), part(keys.step))
-            return keys.data if hasattr(keys, "data") else keys
+            return _nki_value(keys)
 
         @self.lock_fn
         def pre_load_callback(ptr, mask, keys):

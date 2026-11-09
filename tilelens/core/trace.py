@@ -363,6 +363,17 @@ class GluonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
         return self.run(*args, warmup=True, **kwargs)
 
 
+def nki_kernel_function(obj):
+    """The Python function of an NKI kernel object (`@nki.jit`, `@nki.baremetal`, ... of the
+    legacy `neuronxcc.nki` or of the newer `nki` package), or None for anything else."""
+    if type(obj).__module__.split(".")[0] not in ("neuronxcc", "nki"):
+        return (
+            None  # (checked first: some objects, e.g. proxies, fail on any attribute)
+        )
+    func = getattr(obj, "func", None)
+    return func if isinstance(func, types.FunctionType) else None
+
+
 def trace_source(kernel):
     """
     Add the kernel code to be traceable within stack traces for clients
@@ -432,6 +443,10 @@ def trace(client: str | Client | None = None, frontend: str = "triton"):
             trace = kernel
             trace.add_client(client)
             return trace
+
+        if frontend in ("nki", "nki_beta2"):
+            # an `@nki.jit` (or `@nki.baremetal`, ...) kernel runs as its Python function
+            kernel = nki_kernel_function(kernel) or kernel
 
         trace_source(kernel)
 
