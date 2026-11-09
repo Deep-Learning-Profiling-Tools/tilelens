@@ -14,9 +14,10 @@ import types
 import warnings
 from typing import Annotated, Any, get_args, get_origin
 
+import ml_dtypes
 import numpy as np
 
-from tilelens.utils.dtypes import STORAGE_DTYPES
+from tilelens.utils.dtypes import STORAGE_DTYPES as _SHARED_STORAGE_DTYPES
 
 try:
     import cuda.tile as ct
@@ -31,6 +32,14 @@ except ImportError:  # cuTile 1.0 tile-function wrappers have no dispatch hook.
     DispatchMode = None
 
 from ..frontend.base import get_frontend
+
+# cuTile-only dtypes stay out of the shared table, which NKI uses to reject
+# unsupported dtypes.
+STORAGE_DTYPES = _SHARED_STORAGE_DTYPES | {
+    "int64": np.dtype(np.int64),
+    "uint64": np.dtype(np.uint64),
+    "float8_e8m0fnu": np.dtype(ml_dtypes.float8_e8m0fnu),
+}
 
 
 cutile_execution_lock = threading.RLock()

@@ -111,7 +111,12 @@ def _dtype_element_size(dtype) -> int:
         if name in ("bool", "bool_"):
             return 1
         storage = STORAGE_DTYPES.get(name)
-        return storage.itemsize if storage is not None else 4
+        if storage is not None:
+            return storage.itemsize
+        try:
+            return np.dtype(name).itemsize
+        except TypeError:
+            return 4
     try:
         return max(1, int(dtype.element_ty.primitive_bitwidth // 8))
     except Exception:
