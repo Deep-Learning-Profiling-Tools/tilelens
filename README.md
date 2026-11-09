@@ -125,7 +125,7 @@ cuTile support is optional too. Install it with `pip install "tilelens[cutile]"`
 ### Testing
 * To run core TileLens tests, run `pytest tests/`.
 * (if NKI installed) To run NKI-specific tests, run `pytest tests/ -m nki`.
-* To run cuTile-specific tests, run `pytest tests/unit/test_cutile.py tests/end_to_end/test_cutile.py tests/cutile/test_cutile_tracer.py`.
+* To run cuTile-specific tests, run `pytest tests/unit/test_cutile.py tests/end_to_end/test_cutile.py`.
 * To run all tests (Triton + NKI + cuTile), install all extras and run `pytest tests/ -m ""`.
 * To run visualizer web UI tests, run `npm run test:frontend`.
 
