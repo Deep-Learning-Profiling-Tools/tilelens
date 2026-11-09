@@ -86,22 +86,39 @@ def _is_tile_function(fn):
     )
 
 
+# Float formats NumPy does not report as kind "f".
+_LOW_PRECISION_DTYPES = (
+    DTYPES[ct.bfloat16],
+    DTYPES[ct.float8_e4m3fn],
+    DTYPES[ct.float8_e5m2],
+    STORAGE_DTYPES["float8_e8m0fnu"],
+)
+
+
 def _is_float(dtype):
-    return dtype.kind == "f" or dtype in (
-        DTYPES[ct.bfloat16],
-        DTYPES[ct.float8_e4m3fn],
-        DTYPES[ct.float8_e5m2],
-        STORAGE_DTYPES["float8_e8m0fnu"],
-    )
+    return dtype.kind == "f" or dtype in _LOW_PRECISION_DTYPES
 
 
 def _is_low_precision(dtype):
-    return dtype in (
-        DTYPES[ct.bfloat16],
-        DTYPES[ct.float8_e4m3fn],
-        DTYPES[ct.float8_e5m2],
-        STORAGE_DTYPES["float8_e8m0fnu"],
-    )
+    return dtype in _LOW_PRECISION_DTYPES
+
+
+_PADDING_VALUES = {
+    ct.PaddingMode.ZERO: 0,
+    ct.PaddingMode.NEG_ZERO: -0.0,
+    ct.PaddingMode.NAN: np.nan,
+    ct.PaddingMode.POS_INF: np.inf,
+    ct.PaddingMode.NEG_INF: -np.inf,
+}
+
+
+def _padding_value(padding_mode, dtype):
+    """Fill value for a defined padding mode, shared by both load paths."""
+    if padding_mode not in _PADDING_VALUES:
+        raise ValueError("Unsupported padding mode")
+    if padding_mode != ct.PaddingMode.ZERO and not _is_float(dtype):
+        raise TypeError("Nonzero padding modes require a floating-point array")
+    return _PADDING_VALUES[padding_mode]
 
 
 def _binary_values(x, y, force_float=False):
@@ -690,18 +707,8 @@ class Builder:
         if padding_mode == ct.PaddingMode.UNDETERMINED:
             value = np.empty(access_shape, dtype=data.dtype)
         else:
-            padding = {
-                ct.PaddingMode.ZERO: 0,
-                ct.PaddingMode.NEG_ZERO: -0.0,
-                ct.PaddingMode.NAN: np.nan,
-                ct.PaddingMode.POS_INF: np.inf,
-                ct.PaddingMode.NEG_INF: -np.inf,
-            }
-            if padding_mode not in padding:
-                raise ValueError("Unsupported padding mode")
-            if padding_mode != ct.PaddingMode.ZERO and not _is_float(data.dtype):
-                raise TypeError("Nonzero padding modes require a floating-point array")
-            value = np.full(access_shape, padding[padding_mode], dtype=data.dtype)
+            padding = _padding_value(padding_mode, data.dtype)
+            value = np.full(access_shape, padding, dtype=data.dtype)
         value[tile_slices] = data[array_slices]
         return Tile(value.reshape(shape))
 
@@ -1719,18 +1726,7 @@ class Builder:
                 )
             padding = 0
         else:
-            modes = {
-                ct.PaddingMode.ZERO: 0,
-                ct.PaddingMode.NEG_ZERO: -0.0,
-                ct.PaddingMode.NAN: np.nan,
-                ct.PaddingMode.POS_INF: np.inf,
-                ct.PaddingMode.NEG_INF: -np.inf,
-            }
-            if padding_mode not in modes:
-                raise ValueError("Unsupported padding mode")
-            if padding_mode != ct.PaddingMode.ZERO and not _is_float(array.data.dtype):
-                raise TypeError("Nonzero padding requires a floating-point array")
-            padding = modes[padding_mode]
+            padding = _padding_value(padding_mode, array.data.dtype)
         return self.gather(array, keys, padding_value=padding, check_bounds=True)
 
     def store_advanced_indexing(

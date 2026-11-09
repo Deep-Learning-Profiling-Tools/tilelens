@@ -29,6 +29,13 @@ except ModuleNotFoundError:
     pass
 
 
+def _root(array: Any) -> Any:
+    """The array that owns the memory of a sliced view."""
+    while array._parent is not None:
+        array = array._parent
+    return array
+
+
 def _cutile_memory_adapter(
     array: Any,
     index: Any,
@@ -40,9 +47,7 @@ def _cutile_memory_adapter(
     _, axes, access_shape, starts = _tile_access(
         array, index, shape, order, traversal_steps
     )
-    root = array
-    while root._parent is not None:
-        root = root._parent
+    root = _root(array)
     keys: list[Any] = [None] * array.ndim
     mask = np.ones(access_shape, dtype=bool)
     for axis, (start, size, array_axis) in enumerate(zip(starts, access_shape, axes)):
@@ -102,9 +107,7 @@ def _cutile_indexed_adapter(
     if valid.ndim == 0:
         keys = tuple(key.reshape(1) for key in keys)
         valid = valid.reshape(1)
-    root = array
-    while root._parent is not None:
-        root = root._parent
+    root = _root(array)
     return AdapterResult(
         root,
         Tile(valid),
