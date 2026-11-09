@@ -114,6 +114,71 @@ def _shape(shape):
     return int(getattr(shape, "value", shape))
 
 
+class _ParDim(int):
+    """`nl.par_dim(n)`: the size n, marking the partition dimension of a tensor's shape."""
+
+    @property
+    def value(self):
+        return int(self)
+
+
+def _partition_axis(shape):
+    """The partition dimension of a shape: the one marked `par_dim`, else the first (NKI's
+    blocks precede the partition dimension)."""
+    if isinstance(shape, (tuple, list)):
+        for axis, d in enumerate(shape):
+            if isinstance(d, _ParDim) or type(d).__name__ == "ParDim":
+                return axis
+    return 0
+
+
+# The physical SBUF of a NeuronCore, for tensors placed by address (ncc.sbuf.mod_alloc /
+# alloc): bytes per partition. SBUF is 192 KiB per partition on Trn1/Trn2; the model allows
+# more (pages that are not touched cost nothing), since NKI's own simulator does not check
+# the capacity either. PSUM tensors start from zero instead (see Builder.ndarray).
+_SBUF_BYTES = 16 * 1024 * 1024
+_PARTITIONS = 128
+
+
+def _linearize(index, tiles):
+    """NKI's modulo allocation: each block index modulo its tile count, linearized in
+    row-major order over the tile counts (all ones when `tiles` is empty)."""
+    tiles = tuple(tiles) or (1,) * len(index)
+    linear = 0
+    for i, n in zip(index, tiles):
+        linear = linear * n + i % n
+    return linear
+
+
+def _block_address(alloc, index, pdim, fdim_bytes):
+    """(start partition, byte offset in a partition) of a logical tile under a direct SBUF
+    allocation."""
+    if type(alloc).__name__ == "SBUFModuloAllocFunc":
+        return (
+            alloc.base_partition + _linearize(index, alloc.num_par_tiles) * pdim,
+            alloc.base_addr + _linearize(index, alloc.num_free_tiles) * fdim_bytes,
+        )
+    partition, offset = alloc.func(tuple(index), pdim, fdim_bytes)  # SBUFAllocFunc
+    return partition, offset
+
+
+def _block_periods(alloc, blocks):
+    """Per block dimension, after how many indices the addresses repeat (the logical tiles
+    of a modulo allocation can outnumber its physical tiles); a custom allocation function
+    is taken not to repeat."""
+    if type(alloc).__name__ != "SBUFModuloAllocFunc":
+        return tuple(blocks)
+    counts = [alloc.num_par_tiles, alloc.num_free_tiles]
+    periods = []
+    for d, b in enumerate(blocks):
+        period = 1
+        for tiles in counts:
+            if tiles:
+                period = np.lcm(period, int(tiles[d]))
+        periods.append(min(int(period), int(b)))
+    return tuple(periods)
+
+
 def _partition_aligned(operand, ndim):
     """NKI broadcasts a 1-D tile, which has only the partition dimension, along the free
     dimensions of an N-D tile: as an array it is [P, 1, ...], not [P] aligned to the last axis."""
@@ -403,6 +468,44 @@ class NDArray:
         )
 
 
+class AddressedTiles(NDArray):
+    """A tensor placed by address whose logical tiles outnumber its physical tiles (e.g. two
+    blocks on one physical tile): its data are the physical tiles, and block indices are
+    taken modulo their period, so logical tiles that share memory share values."""
+
+    def __init__(self, value, logical_shape, periods, **kwargs):
+        super().__init__(value=value, **kwargs)
+        self._logical_shape = tuple(logical_shape)
+        self._periods = tuple(periods)
+
+    @property
+    def shape(self):
+        return self._logical_shape
+
+    def _physical_keys(self, keys):
+        keys = list(keys if isinstance(keys, tuple) else (keys,))
+        for d, period in enumerate(self._periods[: len(keys)]):
+            k = _value(keys[d])
+            if isinstance(k, slice):
+                start, stop, step = k.indices(self._logical_shape[d])
+                if max(start, stop - 1) >= period:
+                    k = np.arange(start, stop, step) % period
+            elif k is not None and k is not Ellipsis:
+                k = (
+                    np.asarray(k) % period
+                    if isinstance(k, np.ndarray)
+                    else int(k) % period
+                )
+            keys[d] = k
+        return tuple(keys)
+
+    def __getitem__(self, keys):
+        return NDArray.__getitem__(self, self._physical_keys(keys))
+
+    def __setitem__(self, keys, value):
+        return NDArray.__setitem__(self, self._physical_keys(keys), value)
+
+
 class HBMAccess(NDArray):
     """`t[keys]` of an HBM tensor outside a load or store, as in `a = t[i, j]` followed by
     `nl.load(a, mask=m)`: in NKI an access pattern that the load transfers, applying its
@@ -480,6 +583,7 @@ class Builder:
         self.fn = None
         self.shared_hbm_arrays = {}
         self.rng = np.random.default_rng(0)  # nl.dropout; reseeded by nl.random_seed
+        self.memory = {}  # "sbuf" / "psum": physical memory for tensors placed by address
         self.accumulator = None  # the Vector Engine's per-partition reduce registers
 
     def set_grid_dim(self, *grid_dims):
@@ -490,7 +594,75 @@ class Builder:
         self.grid_y = y
         self.grid_z = z
 
+    def _physical_memory(self, kind):
+        if kind not in self.memory:
+            self.memory[kind] = np.zeros((_PARTITIONS, _SBUF_BYTES), dtype=np.uint8)
+        return self.memory[kind]
+
+    def _placed_ndarray(self, shape, dtype, buffer, name, kwargs):
+        """An SBUF tensor placed by address (`buffer=ncc.sbuf.mod_alloc(...)` or
+        `ncc.sbuf.alloc(...)`): a view of the NeuronCore's physical SBUF, so tensors (and
+        logical tiles) at the same address share their values, as on the device."""
+        alloc = buffer.allocation
+        p_axis = _partition_axis(shape)
+        dims = _shape(shape)
+        blocks, pdim, free = dims[:p_axis], dims[p_axis], dims[p_axis + 1 :]
+        dtype = np.dtype(dtype)
+        fdim_bytes = int(np.prod(free, dtype=np.int64)) * dtype.itemsize
+        memory = self._physical_memory("sbuf")
+        row = memory.strides[0]
+        periods = _block_periods(alloc, blocks)
+
+        def offset(index):
+            partition, byte = _block_address(alloc, index, pdim, fdim_bytes)
+            return partition * row + byte
+
+        origin = offset((0,) * len(blocks))
+        block_strides = []
+        for d in range(len(blocks)):
+            unit = [0] * len(blocks)
+            unit[d] = 1
+            block_strides.append(offset(unit) - origin if periods[d] > 1 else 0)
+        for index in np.ndindex(*periods):  # the layout must be strided to be a view
+            expected = origin + sum(i * st for i, st in zip(index, block_strides))
+            if offset(index) != expected:
+                raise NotImplementedError(
+                    "the interpreter supports direct allocations whose tiles are evenly spaced"
+                )
+        free_strides = []
+        step = dtype.itemsize
+        for f in reversed(free):
+            free_strides.insert(0, step)
+            step *= f
+        view_shape = tuple(periods) + (pdim,) + tuple(free)
+        strides = tuple(block_strides) + (row,) + tuple(free_strides)
+        last = origin + sum((n - 1) * st for n, st in zip(view_shape, strides) if n)
+        if origin < 0 or last + dtype.itemsize > memory.nbytes:
+            raise NotImplementedError(
+                "a direct allocation outside the on-chip memory the interpreter models"
+            )
+        view = np.ndarray(
+            view_shape, dtype=dtype, buffer=memory, offset=origin, strides=strides
+        )
+        value = kwargs.pop("value", None)
+        if value is not None:
+            view[...] = (
+                value
+                if tuple(periods) == tuple(blocks)
+                else value[tuple(slice(0, n) for n in periods)]
+            )
+        if tuple(periods) == tuple(blocks):
+            return NDArray(buffer=buffer, name=name, value=view, **kwargs)
+        return AddressedTiles(view, dims, periods, buffer=buffer, name=name, **kwargs)
+
     def ndarray(self, shape, dtype, *, buffer=None, name=None, **kwargs):
+        if getattr(buffer, "name", None) == "psum" and "value" not in kwargs:
+            # A PSUM tensor starts from zero, also when placed in a bank an earlier tensor
+            # used: its first `+=` of a matmul result is that result, as in NKI's simulator.
+            kwargs["value"] = np.zeros(_shape(shape), dtype=dtype)
+            buffer = nl.psum
+        elif getattr(buffer, "allocation", None) is not None:
+            return self._placed_ndarray(shape, dtype, buffer, name, kwargs)
         shape = _shape(shape)
         if buffer == nl.shared_hbm:
             if name is None:
@@ -521,8 +693,7 @@ class Builder:
         return ret
 
     def zeros(self, shape, dtype, *, buffer=None, name=None, **kwargs):
-        shape = _shape(shape)
-        value = np.zeros(shape, dtype=dtype)
+        value = np.zeros(_shape(shape), dtype=dtype)
         return self.ndarray(
             shape, dtype, buffer=buffer, name=name, value=value, **kwargs
         )
@@ -752,8 +923,8 @@ class Builder:
         )
 
     def par_dim(self, value):
-        # Marks a partition dimension for the compiler; the size is all the simulator needs.
-        return value
+        # Marks the partition dimension; tensors placed by address need to know which it is.
+        return _ParDim(value)
 
     def square(self, x: NDArray, **kwargs):
         return self._unary_op(x, np.square, "square", **kwargs)
@@ -766,8 +937,7 @@ class Builder:
 
     # ---- nl: tensor creation, slicing, grid ------------------------------
     def full(self, shape, fill_value, dtype, *, buffer=None, name=None, **kwargs):
-        shape = _shape(shape)
-        value = np.full(shape, fill_value, dtype=dtype)
+        value = np.full(_shape(shape), fill_value, dtype=dtype)
         return self.ndarray(
             shape, dtype, buffer=buffer, name=name, value=value, **kwargs
         )
@@ -1505,6 +1675,7 @@ class NKIInterpretedFunction:
         nki_builder.shared_hbm_arrays = {}
         nki_builder.rng = np.random.default_rng(0)
         nki_builder.accumulator = None
+        nki_builder.memory = {}
         nki_builder.fn = self.fn
 
         kwargs.pop("warmup", None)  # Remove warmup from kwargs if it exists

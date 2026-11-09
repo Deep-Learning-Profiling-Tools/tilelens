@@ -355,3 +355,101 @@ def test_double_row_matmul_matches_nki_simulator(monkeypatch):
     )
     want = nki.simulate_kernel(nki.jit(double_row_kernel)[(1,)], lhsT, rhs)
     np.testing.assert_allclose(got, want, rtol=1e-5)
+
+
+def double_buffered_kernel(x):
+    # Four logical tiles on two physical tiles (ncc.sbuf.mod_alloc), and a tile declared in
+    # the loop at a fixed address: as NKI's simulator and the device compute it.
+    out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+    bufs = nl.ndarray(
+        (4, nl.par_dim(128), x.shape[1]),
+        dtype=x.dtype,
+        buffer=ncc.sbuf.mod_alloc(base_addr=0, num_free_tiles=(2,)),
+    )
+    for i in nl.affine_range(4):
+        rows = nl.ds(i * 128, 128)
+        bufs[i] = nl.load(x[rows, :])
+        res = nl.ndarray(
+            (nl.par_dim(128), x.shape[1]),
+            dtype=x.dtype,
+            buffer=ncc.sbuf.mod_alloc(base_addr=2 * x.shape[1] * 4),
+        )
+        res[...] = nl.exp(bufs[i])
+        nl.store(out[rows, :], value=res)
+    return out
+
+
+def test_address_placed_tiles_match_nki_simulator():
+    x = rng.standard_normal((512, 64)).astype(np.float32)
+    tilelens.clear()
+    got = tilelens.trace(client=Tracer(), frontend="nki")(double_buffered_kernel)[(1,)](
+        x
+    )
+    want = nki.simulate_kernel(nki.jit(double_buffered_kernel)[(1,)], x)
+    np.testing.assert_allclose(got, want, rtol=1e-6)
+
+
+def shared_address_kernel(x):
+    out = nl.ndarray((2, 128, x.shape[1]), dtype=x.dtype, buffer=nl.shared_hbm)
+    t = nl.ndarray(
+        (2, nl.par_dim(128), x.shape[1]),
+        dtype=x.dtype,
+        buffer=ncc.sbuf.mod_alloc(base_addr=0, num_free_tiles=(1,)),
+    )
+    u = nl.ndarray(
+        (nl.par_dim(128), x.shape[1]),
+        dtype=x.dtype,
+        buffer=ncc.sbuf.mod_alloc(base_addr=0),
+    )
+    t[0] = nl.load(x)
+    nl.store(out[0], value=nl.multiply(t[1], 2.0))  # logical tile 1 is tile 0's memory
+    nl.store(out[1], value=nl.multiply(u, 3.0))  # so is another tensor at address 0
+    return out
+
+
+def test_tiles_at_one_address_share_their_values():
+    # The device semantics of direct allocation (NKI's simulator gives each tensor its own
+    # storage, so it is not the reference here).
+    from tilelens.core.simulation.nki import AddressedTiles
+
+    x = rng.standard_normal((128, 64)).astype(np.float32)
+    tilelens.clear()
+    got = tilelens.trace(client=Tracer(), frontend="nki")(shared_address_kernel)[(1,)](
+        x
+    )
+    np.testing.assert_allclose(got[0], 2 * x, rtol=1e-6)
+    np.testing.assert_allclose(got[1], 3 * x, rtol=1e-6)
+    from tilelens.core.simulation.nki import nki_builder
+
+    t = nki_builder.ndarray(
+        (4, nl.par_dim(128), 8),
+        np.float32,
+        buffer=ncc.sbuf.mod_alloc(base_addr=0, num_free_tiles=(2,)),
+    )
+    assert (
+        isinstance(t, AddressedTiles)
+        and t.shape == (4, 128, 8)
+        and t.data.shape == (2, 128, 8)
+    )
+
+
+def psum_reuse_kernel(a, b):
+    out = nl.ndarray((2, 128, b.shape[1]), dtype=nl.float32, buffer=nl.shared_hbm)
+    x = nl.load(a)
+    y = nl.load(b)
+    for i in nl.affine_range(2):
+        p = nl.ndarray(
+            (128, b.shape[1]), dtype=nl.float32, buffer=ncc.psum.mod_alloc(base_bank=3)
+        )
+        p[...] += nisa.nc_matmul(x, y)  # starts from zero, though the bank was used
+        nl.store(out[i], value=nl.copy(p))
+    return out
+
+
+def test_psum_tensors_start_from_zero():
+    a = rng.standard_normal((128, 128)).astype(np.float32)
+    b = rng.standard_normal((128, 512)).astype(np.float32)
+    tilelens.clear()
+    got = tilelens.trace(client=Tracer(), frontend="nki")(psum_reuse_kernel)[(1,)](a, b)
+    want = nki.simulate_kernel(nki.jit(psum_reuse_kernel)[(1,)], a, b)
+    np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
