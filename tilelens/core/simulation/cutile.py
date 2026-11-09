@@ -18,6 +18,7 @@ import ml_dtypes
 import numpy as np
 
 from tilelens.utils.dtypes import STORAGE_DTYPES as _SHARED_STORAGE_DTYPES
+from tilelens.utils.traceback_utils import is_library_path
 
 try:
     import cuda.tile as ct
@@ -1980,6 +1981,9 @@ def _execution_scope(fn):
         if not isinstance(function, types.FunctionType) or id(function) in visited:
             return
         visited.add(id(function))
+        # Only user code is patched, never Python, installed packages, or tilelens.
+        if is_library_path(function.__code__.co_filename):
+            return
         namespace = function.__globals__
         for name, operation in (
             ("max", cutile_builder.maximum),
@@ -1997,8 +2001,8 @@ def _execution_scope(fn):
                 value = replacement
             if isinstance(value, types.FunctionType):
                 patch_function(value)
-            elif isinstance(value, types.ModuleType) and not value.__name__.startswith(
-                ("cuda", "numpy", "tilelens")
+            elif isinstance(value, types.ModuleType) and not is_library_path(
+                getattr(value, "__file__", None)
             ):
                 for attribute in names:
                     helper = getattr(value, attribute, None)

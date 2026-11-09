@@ -1,11 +1,18 @@
 """Tests for cuTile values and operations."""
 
+import builtins
 import operator
 
 import numpy as np
 import pytest
 
 ct = pytest.importorskip("cuda.tile")
+
+try:
+    import torch
+    import torch.serialization
+except ImportError:
+    torch = None
 
 from tilelens.core.simulation.cutile import (  # noqa: E402
     Array,
@@ -421,3 +428,21 @@ def test_atomic_cas_compares_bit_patterns():
     CuTileInterpretedFunction(kernel).run(values, old, np.float32(np.nan))
     # Identical NaN bits match, so the NaN lane is swapped.
     np.testing.assert_array_equal(values, [1.0, 5.0])
+
+
+def test_kernel_setup_leaves_library_modules_alone():
+    if torch is None:
+        pytest.skip("requires torch")
+    seen = {}
+
+    def kernel(src, dst):
+        # torch is a module global here, as in user code. Scanning the
+        # kernel's ct.load must not reach torch.load and patch its module.
+        seen["max"] = torch.serialization.__dict__.get("max", builtins.max)
+        ct.store(dst, (0,), ct.load(src, (0,), (4,)))
+
+    src = np.arange(4, dtype=np.float32)
+    dst = np.zeros_like(src)
+    CuTileInterpretedFunction(kernel).run(src, dst)
+    np.testing.assert_array_equal(dst, src)
+    assert seen["max"] is builtins.max
