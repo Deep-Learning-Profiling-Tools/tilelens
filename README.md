@@ -120,10 +120,13 @@ uv sync --extra nki # NKI support but no testing
 uv sync --extra test # tests but no NKI support
 ```
 
+cuTile support is optional too. Install it with `pip install "tilelens[cutile]"`, or from source with `uv sync --extra cutile` (add `--extra test` for its tests). cuda-tile publishes wheels only for Linux and Windows.
+
 ### Testing
 * To run core TileLens tests, run `pytest tests/`.
 * (if NKI installed) To run NKI-specific tests, run `pytest tests/ -m nki`.
-* To run all tests (Triton + NKI), run `pytest tests/ -m ""`.
+* To run cuTile-specific tests, run `pytest tests/unit/test_cutile.py tests/end_to_end/test_cutile.py`.
+* To run all tests (Triton + NKI + cuTile), install all extras and run `pytest tests/ -m ""`.
 * To run visualizer web UI tests, run `npm run test:frontend`.
 
 ## Working with Examples
@@ -171,17 +174,40 @@ tilelens.launch()
 
 ## DSL Frontends
 
-Triton is the default DSL frontend. NKI support is optional and selected with
-the `frontend` argument:
+Triton is the default DSL frontend. NKI and cuTile are also supported. Select
+them with the `frontend` argument:
 
 ```py
 tilelens.trace("tracer")  # Triton
 tilelens.trace("tracer", frontend="nki")  # NKI
 tilelens.trace("tracer", frontend="nki_beta2")  # NKI Beta 2
+tilelens.trace("tracer", frontend="cutile")  # cuTile
 ```
 
-The runtime integration code lives under `tilelens/core/frontend/`. NKI
+The runtime integration code lives under `tilelens/core/frontend/`. NKI and cuTile
 simulation runtimes live under `tilelens/core/simulation/`.
+
+### cuTile tracing
+
+cuTile kernels run on the CPU with NumPy arrays and support tracing and visualization:
+
+```sh
+uv sync --extra test --extra cutile
+uv run --extra test --extra cutile python -m examples.cutile.matmul --visualize
+```
+
+```py
+@tilelens.trace("tracer", frontend="cutile")
+@ct.kernel
+def kernel(lhs, rhs, result):
+    ...
+
+
+kernel[grid](lhs, rhs, result)
+```
+
+Use contiguous NumPy arrays for visualization. cuTile analysis currently supports
+only the tracer client; numerical behavior may differ from GPU execution.
 
 ## Analysis Clients
 
