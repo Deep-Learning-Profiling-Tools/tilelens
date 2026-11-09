@@ -66,10 +66,10 @@ jobs:
         uv run pytest tests -n auto --ignore=tests/end_to_end/test_triton_kernels.py --ignore=tests/unit/test_multithreading.py
         TRITON_INTERPRET=1 uv run pytest tests/unit/test_multithreading.py tests/end_to_end/test_core.py::test_autotune_interpreter_mode
 
-    - name: Install TileLens with NKI extras
+    - name: Install TileLens with NKI and cuTile extras
       run: |
         cd tilelens
-        uv sync --extra test --extra nki
+        uv sync --extra test --extra nki --extra cutile
 
     - name: Upgrade Triton to the latest 3.8 release (NKI)
       run: |
@@ -77,7 +77,7 @@ jobs:
         uv pip install --pre -U "triton<3.9"
         uv pip install "git+https://github.com/triton-lang/triton.git@v3.8.0#subdirectory=python/triton_kernels"
 
-    - name: Run full (Triton + NKI) pytest suite
+    - name: Run full (Triton + NKI + cuTile) pytest suite
       run: |
         cd tilelens
         uv run pytest tests -m "" -n auto --ignore=tests/end_to_end/test_triton_kernels.py --ignore=tests/unit/test_multithreading.py
@@ -94,7 +94,7 @@ jobs:
         python-version: '3.12'
 
     - name: Install with pip
-      run: pip install ".[test]"
+      run: pip install ".[test,cutile]"
 
     - name: Verify installation
       working-directory: ${{ runner.temp }}

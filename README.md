@@ -120,11 +120,13 @@ uv sync --extra nki # NKI support but no testing
 uv sync --extra test # tests but no NKI support
 ```
 
+cuTile support is optional too. Install it with `pip install "tilelens[cutile]"`, or from source with `uv sync --extra cutile` (add `--extra test` for its tests). cuda-tile publishes wheels only for Linux and Windows.
+
 ### Testing
 * To run core TileLens tests, run `pytest tests/`.
 * (if NKI installed) To run NKI-specific tests, run `pytest tests/ -m nki`.
 * To run cuTile-specific tests, run `pytest tests/unit/test_cutile.py tests/end_to_end/test_cutile.py tests/cutile/test_cutile_tracer.py`.
-* To run all tests (Triton + NKI), run `pytest tests/ -m ""`.
+* To run all tests (Triton + NKI + cuTile), install all extras and run `pytest tests/ -m ""`.
 * To run visualizer web UI tests, run `npm run test:frontend`.
 
 ## Working with Examples
@@ -190,8 +192,8 @@ simulation runtimes live under `tilelens/core/simulation/`.
 cuTile kernels run on the CPU with NumPy arrays and support tracing and visualization:
 
 ```sh
-uv sync --extra test
-uv run --extra test python -m examples.cutile.matmul --visualize
+uv sync --extra test --extra cutile
+uv run --extra test --extra cutile python -m examples.cutile.matmul --visualize
 ```
 
 ```py
