@@ -1650,9 +1650,11 @@ def nki_patch_lang(scope=None):
     # `scalar` is usually imported by name (from neuronxcc.nki.typing import scalar): patch the
     # modules that hold it too
     real_scalar = nki_typing.scalar
-    for module in list(sys.modules.values()):
-        namespace = getattr(module, "__dict__", None)
-        if isinstance(namespace, dict) and namespace.get("scalar") is real_scalar:
+    for namespace in _modules_with(
+        "scalar", lambda module, globals_: globals_.get("scalar") is real_scalar
+    ):
+        module = sys.modules.get(namespace.get("__name__"))
+        if module is not None and namespace.get("scalar") is real_scalar:
             _set_attr(module, "scalar", nki_builder.scalar)
     _set_attr(nisa, "_tiled_offloaded_memcpy", nki_builder.tiled_offloaded_memcpy)
     _set_attr(nisa, "_tiled_offloaded_fma", nki_builder.tiled_offloaded_fma)
@@ -1746,7 +1748,42 @@ def _rewrite_function(fn, namespaces):
     return _compile_rewritten(fn, _rewritten_namespace(fn.__globals__, namespaces))
 
 
+def _library_paths():
+    import sysconfig
+
+    paths = sysconfig.get_paths()
+    roots = {paths.get(k) for k in ("stdlib", "platstdlib", "purelib", "platlib")}
+    return tuple(sorted(r for r in roots if r)) + (_PACKAGE_DIR,)
+
+
 _LIBRARY_PATHS = ("site-packages", "dist-packages")
+_module_scans: dict = {}  # what -> (len(sys.modules), [module globals]), rescanned on growth
+
+
+def _modules_with(what, has):
+    """Globals of the loaded modules for which `has(module, globals)` holds, cached until
+    more modules are loaded (scanning thousands of modules on every launch costs ms)."""
+    count = len(sys.modules)
+    cached = _module_scans.get(what)
+    if cached is None or cached[0] != count:
+        found = []
+        for module in list(sys.modules.values()):
+            globals_ = getattr(module, "__dict__", None)
+            if isinstance(globals_, dict) and has(module, globals_):
+                found.append(globals_)
+        cached = _module_scans[what] = (count, found)
+    return cached[1]
+
+
+def _user_module(module, globals_):
+    """A module of the user's code (a file outside Python's library and the installed
+    packages, TileLens's included)."""
+    path = getattr(module, "__file__", None) or ""
+    return (
+        bool(path)
+        and not any(p in path for p in _LIBRARY_PATHS)
+        and not path.startswith(_library_paths())
+    )
 
 
 def _swap_in_rewritten_kernels(namespaces):
@@ -1755,15 +1792,7 @@ def _swap_in_rewritten_kernels(namespaces):
     from ..trace import nki_kernel_function
 
     swapped = []
-    for module in list(sys.modules.values()):
-        globals_ = getattr(module, "__dict__", None)
-        path = getattr(module, "__file__", None) or ""
-        if (
-            not isinstance(globals_, dict)
-            or not path
-            or any(p in path for p in _LIBRARY_PATHS)
-        ):
-            continue
+    for globals_ in _modules_with("user", _user_module):
         names = [
             n for n, v in list(globals_.items()) if nki_kernel_function(v) is not None
         ]
