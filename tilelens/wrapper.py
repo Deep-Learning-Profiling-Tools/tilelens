@@ -171,6 +171,7 @@ def apply_sanitizer():
         sanitizer_wrapper,
         SANITIZER_COMMAND,
         f"Usage: {SANITIZER_COMMAND} <script.py> [args...]",
+        cutile_client="sanitizer",
     )
 
 

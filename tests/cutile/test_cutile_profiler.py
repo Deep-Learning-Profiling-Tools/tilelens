@@ -26,7 +26,7 @@ from tilelens.core.frontend.cutile import (
 )
 from tilelens.core.simulation.cutile import Array, Tile, cutile_builder
 from tilelens.core.trace import launches
-from tilelens.wrapper import PROFILER_COMMAND, SANITIZER_COMMAND
+from tilelens.wrapper import PROFILER_COMMAND, RACE_DETECTOR_COMMAND
 
 example_path = Path(__file__).resolve().parents[2] / "examples" / "cutile" / "matmul.py"
 spec = importlib.util.spec_from_file_location("cutile_matmul_example", example_path)
@@ -463,7 +463,7 @@ def test_other_clis_keep_nested_interpreted_launches(tmp_path: Path):
             ct.launch(None, (1,), copy_kernel, (src, dst))
         print("DST", dst.tolist())
         """,
-        command=SANITIZER_COMMAND,
+        command=RACE_DETECTOR_COMMAND,
     )
 
     assert proc.returncode == 0, proc.stderr
