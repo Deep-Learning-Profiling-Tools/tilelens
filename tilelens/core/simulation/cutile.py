@@ -1139,14 +1139,22 @@ class Builder:
         if comparisons is not None:
             old[~valid] = comparisons[~valid]
             comparisons = comparisons[valid]
+        bits = np.dtype(f"u{array.data.dtype.itemsize}")
+
+        def same_bits(lhs, rhs):
+            # Hardware CAS compares bit patterns: -0.0 != 0.0, and equal NaNs match.
+            lhs = np.asarray(lhs, dtype=array.data.dtype).view(bits)
+            return lhs == np.asarray(rhs, dtype=array.data.dtype).view(bits)
+
+        # Lanes that write memory; failed CAS lanes do not.
+        written = np.ones(len(order), dtype=bool)
         if len(starts) - 1 == len(order):
             # Distinct addresses do not interact, so apply the operation at once.
             if operation == "exchange":
                 new_values = valid_updates
             elif operation == "cas":
-                new_values = np.where(
-                    old_values == comparisons, valid_updates, old_values
-                )
+                written = same_bits(old_values, comparisons)
+                new_values = np.where(written, valid_updates, old_values)
             else:
                 new_values = operation(
                     old_values, valid_updates, dtype=array.data.dtype
@@ -1161,7 +1169,9 @@ class Builder:
                 current = initial
                 for lane in group:
                     old_values[lane] = current
-                    if operation == "exchange" or current == comparisons[lane]:
+                    if operation == "cas":
+                        written[lane] = same_bits(current, comparisons[lane])
+                    if operation == "exchange" or written[lane]:
                         current = valid_updates[lane]
             else:
                 sequence = np.concatenate(
@@ -1172,9 +1182,11 @@ class Builder:
                 current = accumulated[-1]
             new_values[group] = current
         old[valid], final[valid] = old_values, new_values
+        stored = valid.copy()
+        stored[valid] = written
         # One vector access per operation, even when addresses repeat.
         self.scatter(
-            array, indices, Tile(final), mask=Tile(valid), check_bounds=check_bounds
+            array, indices, Tile(final), mask=Tile(stored), check_bounds=check_bounds
         )
         return Tile(old)
 

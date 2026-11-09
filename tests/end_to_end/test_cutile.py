@@ -493,3 +493,21 @@ def test_tuple_argument_arrays_are_traced():
     tilelens.trace("tracer", frontend="cutile")(kernel)[(1,)]((src,), dst)
     np.testing.assert_array_equal(dst, src)
     assert {t.data_ptr() for t in launches[-1].tensors} >= {src.ctypes.data}
+
+
+def test_failed_cas_lanes_are_not_traced_as_stores():
+    @ct.kernel
+    def cas_kernel(values, old):
+        lanes = ct.arange(2, dtype=ct.int32)
+        ct.store(old, (0,), ct.atomic_cas(values, lanes, 2.0, 5.0))
+
+    values = np.array([1.0, 2.0], dtype=np.float32)
+    old = np.zeros(2, dtype=np.float32)
+    tilelens.trace("tracer", frontend="cutile")(cas_kernel)[(1,)](values, old)
+    np.testing.assert_array_equal(values, [1.0, 5.0])
+    cas_store = next(
+        r
+        for r in launches[-1].records
+        if isinstance(r, Store) and r.ptr == values.ctypes.data
+    )
+    np.testing.assert_array_equal(cas_store.masks, [False, True])

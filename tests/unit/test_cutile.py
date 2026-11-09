@@ -405,3 +405,19 @@ def test_grid_accepts_numpy_integers():
     for grid in ((1.0,), (True,), (0,), (1, 1, 1, 1)):
         with pytest.raises(ValueError, match="one to three positive integers"):
             CuTileInterpretedFunction(kernel).run(dst, grid=grid)
+
+
+def test_atomic_cas_compares_bit_patterns():
+    def kernel(values, old, expected):
+        lanes = ct.arange(2, dtype=ct.int32)
+        ct.store(old, (0,), ct.atomic_cas(values, lanes, expected, 5.0))
+
+    old = np.zeros(2, dtype=np.float32)
+    values = np.array([-0.0, 1.0], dtype=np.float32)
+    CuTileInterpretedFunction(kernel).run(values, old, 0.0)
+    # -0.0 and 0.0 have different bits, so nothing is swapped.
+    np.testing.assert_array_equal(np.signbit(values), [True, False])
+    values = np.array([1.0, np.nan], dtype=np.float32)
+    CuTileInterpretedFunction(kernel).run(values, old, np.float32(np.nan))
+    # Identical NaN bits match, so the NaN lane is swapped.
+    np.testing.assert_array_equal(values, [1.0, 5.0])
