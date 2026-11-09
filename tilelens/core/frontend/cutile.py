@@ -207,11 +207,15 @@ def interpreted_launches(client="tracer"):
     from tilelens.core.trace import CuTileTrace
 
     def launch(stream, grid, kernel, args):
-        runner = (
-            kernel
-            if isinstance(kernel, CuTileTrace)
-            else tilelens.trace(client, frontend="cutile")(kernel)
-        )
+        if isinstance(kernel, CuTileTrace):
+            runner = kernel
+        else:
+            # Each launch gets its own trace, so a reused tracer starts empty
+            # instead of repeating earlier launches' records.
+            records = getattr(client, "records", None)
+            if isinstance(records, list):
+                records.clear()
+            runner = tilelens.trace(client, frontend="cutile")(kernel)
         return runner.run(*args, grid=grid)
 
     # The global entry point can be shared by worker threads. Hold this guard

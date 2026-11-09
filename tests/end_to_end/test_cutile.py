@@ -10,6 +10,8 @@ import pytest
 ct = pytest.importorskip("cuda.tile")
 
 import tilelens
+from tilelens.clients import Tracer
+from tilelens.core.frontend.cutile import interpreted_launches
 from tilelens.core.simulation.cutile import CuTileInterpretedFunction, DTYPES
 from tilelens.core.trace import launches
 from tilelens.visualizer import interface
@@ -281,3 +283,15 @@ def test_kernel_preserves_shadowed_builtins_and_keyword_defaults(monkeypatch):
     CuTileInterpretedFunction(kernel).run(src, dst)
     np.testing.assert_array_equal(dst, src + 2)
     assert calls == [True]
+
+
+def test_interpreted_launches_keep_records_per_launch():
+    src = np.arange(4, dtype=np.float32)
+    dst = np.zeros(4, dtype=np.float32)
+    with interpreted_launches(Tracer()):
+        ct.launch(None, (1,), copy_kernel, (src, dst))
+        ct.launch(None, (1,), copy_kernel, (src, dst))
+
+    # A reused tracer does not repeat the first launch's records.
+    assert [len(launch.records) for launch in launches] == [3, 3]
+    np.testing.assert_array_equal(dst, src)
