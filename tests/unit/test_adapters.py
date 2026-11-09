@@ -748,3 +748,29 @@ def test_patchop_uses_adapter_for_callbacks():
     expected_args = (ptr, mask, None)
     assert before_log == [("before", expected_args, {})]
     assert after_log == [("after", expected_args, {})]
+
+
+def test_cutile_memory_adapters_offset_only_the_access():
+    """cuTile hands the tracer offsets for the accessed elements, not the array."""
+    pytest.importorskip("cuda.tile")
+    from tilelens.core.simulation.cutile import Array, Tile
+
+    adapters = get_frontend("cutile").adapters
+    array = Array(np.zeros((64, 64), dtype=np.float32))
+    view = array.slice(0, 8, 64)
+
+    tiled = adapters[Load](view, (1, 2), (4, 8))
+    ptr, mask, keys = tiled.args
+    assert ptr.data_ptr() == array.data_ptr()
+    offsets = ptr.get_offsets().data
+    assert offsets.shape == (4, 8)
+    # Row 8 + 4 of the view's tile row 1, column 16 of its tile column 2.
+    assert offsets[0, 0] == (12 * 64 + 16) * 4
+    np.testing.assert_array_equal(offsets[tuple(k.data for k in keys)], offsets)
+    assert mask.data.all()
+
+    indices = Tile(np.array([0, 3, 70], dtype=np.int32))
+    gathered = adapters[Load](array, (indices, 1), None)
+    ptr, mask, _ = gathered.args
+    assert ptr.get_offsets().data.shape == (3,)
+    np.testing.assert_array_equal(mask.data, [True, True, False])

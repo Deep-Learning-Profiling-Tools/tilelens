@@ -36,6 +36,37 @@ def _root(array: Any) -> Any:
     return array
 
 
+class _AccessArray:
+    """The root array, with byte offsets for only the elements one access touches.
+
+    The tracer reads offsets through ``get_offsets()`` and indexes them with the
+    adapter's keys, so tracing costs O(tile) per access instead of O(array).
+    """
+
+    def __init__(self, root: Any, keys: tuple, mask: np.ndarray) -> None:
+        keys = tuple(np.asarray(_tile_value(key)) for key in keys)
+        shape = np.broadcast_shapes(*(key.shape for key in keys), mask.shape)
+        offsets = np.zeros(shape, dtype=np.int64)
+        for key, extent, stride in zip(keys, root.shape, root.data.strides):
+            # Masked-off lanes may lie outside the array; clamp them.
+            offsets = offsets + np.clip(key, 0, max(extent - 1, 0)) * stride
+        self._root = root
+        self._offsets = offsets
+        # Identity keys into the offsets array above.
+        self.keys = tuple(Tile(key) for key in np.indices(shape))
+
+    def get_offsets(self) -> Any:
+        return Array(self._offsets)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._root, name)
+
+
+def _access_result(array: Any, keys: tuple, mask: np.ndarray) -> AdapterResult:
+    access = _AccessArray(_root(array), keys, mask)
+    return AdapterResult(access, Tile(mask), access.keys)
+
+
 def _cutile_memory_adapter(
     array: Any,
     index: Any,
@@ -47,7 +78,6 @@ def _cutile_memory_adapter(
     _, axes, access_shape, starts = _tile_access(
         array, index, shape, order, traversal_steps
     )
-    root = _root(array)
     keys: list[Any] = [None] * array.ndim
     mask = np.ones(access_shape, dtype=bool)
     for axis, (start, size, array_axis) in enumerate(zip(starts, access_shape, axes)):
@@ -55,9 +85,9 @@ def _cutile_memory_adapter(
         broadcast_shape = [1] * array.ndim
         broadcast_shape[axis] = size
         coordinates = coordinates.reshape(broadcast_shape)
-        keys[array_axis] = Tile(coordinates + array._origin[array_axis])
+        keys[array_axis] = coordinates + array._origin[array_axis]
         mask &= (coordinates >= 0) & (coordinates < array.shape[array_axis])
-    return AdapterResult(root, Tile(mask), tuple(keys))
+    return _access_result(array, tuple(keys), mask)
 
 
 def _cutile_load_adapter(
@@ -107,11 +137,8 @@ def _cutile_indexed_adapter(
     if valid.ndim == 0:
         keys = tuple(key.reshape(1) for key in keys)
         valid = valid.reshape(1)
-    root = _root(array)
-    return AdapterResult(
-        root,
-        Tile(valid),
-        tuple(Tile(key + origin) for key, origin in zip(keys, array._origin)),
+    return _access_result(
+        array, tuple(key + origin for key, origin in zip(keys, array._origin)), valid
     )
 
 
