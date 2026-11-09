@@ -5,6 +5,7 @@ try:
     import neuronxcc.nki.language as nl
     import neuronxcc.nki.isa as nisa
     import neuronxcc.nki.compiler as ncc
+    import neuronxcc.nki.typing as nki_typing
 except (
     ModuleNotFoundError
 ) as exc:  # pragma: no cover - only hit when optional deps missing
@@ -13,9 +14,16 @@ except (
     ) from exc
 import inspect
 import os
+import sys
 import textwrap
 from ..frontend.nki_transform import transform_code
-from ..masked_load_store import masked_load, masked_store, tile_mask, tile_shape
+from ..masked_load_store import (
+    in_bounds_lanes,
+    masked_load,
+    masked_store,
+    tile_mask,
+    tile_shape,
+)
 
 
 _PACKAGE_DIR = (
@@ -31,6 +39,17 @@ def _value(x):
 
 def _is_hbm(buffer):
     return getattr(buffer, "name", None) in ("hbm", "shared_hbm", "private_hbm")
+
+
+def _index_key(key):
+    """A subscript key as numpy takes it. A scalar index tile (a 0-d integer array, e.g. a
+    value loaded from SBUF or a loop index the sanitizer tracks) becomes an int: numpy would
+    treat a 0-d array as an advanced index and return a copy, so writes through the slice
+    would be lost; in NKI the slice is an access pattern of the same memory."""
+    key = key.data if isinstance(key, NDArray) else key
+    if isinstance(key, np.ndarray) and key.ndim == 0 and key.dtype.kind in "iu":
+        return int(key)
+    return key
 
 
 def _tile_keys(data, keys):
@@ -180,11 +199,13 @@ def _block_periods(alloc, blocks):
 
 
 def _partition_aligned(operand, ndim):
-    """NKI broadcasts a 1-D tile, which has only the partition dimension, along the free
-    dimensions of an N-D tile: as an array it is [P, 1, ...], not [P] aligned to the last axis."""
+    """NKI tiles start with the partition dimension, so an operand of fewer dimensions aligns
+    from the left and broadcasts along the trailing ones: a 1-D tile (a partition vector) or a
+    [P, 1] tile with an N-D tile is [P, 1, ...], not aligned to the last axis as in numpy."""
     value = _value(operand)
-    if np.ndim(value) == 1 and ndim >= 2:
-        return np.reshape(value, (np.shape(value)[0],) + (1,) * (ndim - 1))
+    rank = np.ndim(value)
+    if 1 <= rank < ndim:
+        return np.reshape(value, np.shape(value) + (1,) * (ndim - rank))
     return value
 
 
@@ -230,6 +251,18 @@ def _bool_tile(pred, shape, reverse=False):
     value = np.asarray(_partition_aligned(pred, len(shape)), dtype=bool)
     value = np.broadcast_to(value, shape)
     return ~value if reverse else value
+
+
+def _left_aligned(operand, shape):
+    """A predicate as a boolean array of `shape`: one of as many elements per partition is
+    taken as it is; one of fewer dimensions aligns from the partition dimension and
+    broadcasts along the trailing ones (a [P, A] predicate of a [P, A, B] tile)."""
+    value = np.asarray(operand)
+    if value.size == int(np.prod(shape)):
+        return value.reshape(shape).astype(bool)
+    if value.ndim < len(shape):
+        value = value.reshape(value.shape + (1,) * (len(shape) - value.ndim))
+    return np.broadcast_to(value.astype(bool), shape)
 
 
 def _per_partition(value):
@@ -280,6 +313,10 @@ class NDArray:
     @property
     def dtype(self):
         return self.data.dtype if self.data is not None else None
+
+    @property
+    def itemsize(self):
+        return self.data.itemsize
 
     def data_ptr(self):
         if self._data_ptr is None:
@@ -335,9 +372,7 @@ class NDArray:
             return HBMAccess(self, tuple(_value(k) for k in keys))
 
         # Apply the slicing to the underlying numpy array
-        new_keys = _tile_keys(
-            self.data, [k.data if isinstance(k, NDArray) else k for k in keys]
-        )
+        new_keys = _tile_keys(self.data, [_index_key(k) for k in keys])
         sliced_value = self.data[tuple(new_keys)]
 
         # Create a new NDArray with the sliced data
@@ -353,11 +388,10 @@ class NDArray:
             keys = (keys,)
 
         # Apply the slicing to the underlying numpy array
-        new_keys = _tile_keys(
-            self.data, tuple(k.data if isinstance(k, NDArray) else k for k in keys)
-        )
+        new_keys = _tile_keys(self.data, tuple(_index_key(k) for k in keys))
         target_shape = self.data[new_keys].shape
         reduce = value if isinstance(value, LoopReduced) else None
+        skipped = value.valid if isinstance(value, SkippedLanes) else None
         value = np.asarray(value.data if isinstance(value, NDArray) else value)
         if value.shape != target_shape and value.size == int(np.prod(target_shape)):
             value = value.reshape(target_shape)  # e.g. a [P, 1] result into a [P] slot
@@ -367,6 +401,8 @@ class NDArray:
             value = reduce.op(current, np.broadcast_to(value, target_shape))
             if reduce.mask is not None:
                 value = np.where(reduce.mask.reshape(target_shape), value, current)
+        if skipped is not None:  # lanes a skipping load did not read keep their values
+            value = np.where(skipped.reshape(target_shape), value, self.data[new_keys])
         self.data[new_keys] = value
 
         return self
@@ -527,6 +563,57 @@ class HBMAccess(NDArray):
     @data.setter
     def data(self, value):
         self._value = value
+
+
+class SkippedLanes(NDArray):
+    """The result of a load with `mode=oob_mode.skip`: its out-of-bounds lanes are not read.
+    Assigned into a tile, it leaves those lanes of the tile as they were, as the DMA that
+    writes the tile skips them."""
+
+    def __init__(self, value, valid, **kwargs):
+        super().__init__(value=value, **kwargs)
+        self.valid = np.broadcast_to(np.asarray(valid, dtype=bool), value.shape)
+
+
+def _clip_keys(keys, shape):
+    """Integer and integer-array keys clipped into the array, for an access whose
+    out-of-bounds lanes are masked off (oob_mode.skip): those lanes are neither read nor
+    written, and the clipped keys keep the access in bounds."""
+    keys = keys if isinstance(keys, tuple) else (keys,)
+    clipped, dim = [], 0
+    for key in keys:
+        if key is None:
+            clipped.append(key)
+            continue
+        if dim < len(shape) and (
+            isinstance(key, (int, np.integer))
+            or (isinstance(key, np.ndarray) and key.dtype.kind in "iu")
+        ):
+            value = np.clip(key, 0, max(shape[dim] - 1, 0))
+            key = value if isinstance(key, np.ndarray) else int(value)
+        clipped.append(key)
+        dim += 1
+    return tuple(clipped)
+
+
+def skipped_access(tensor, keys, mask):
+    """An access with `mode=oob_mode.skip` as it is performed: its out-of-bounds lanes
+    masked off and its keys clipped into the tensor. Returns (numpy keys, mask, lanes in
+    bounds)."""
+    numpy_keys = _expand_oob_slices(
+        nki_builder._convert_keys_to_numpy(keys), tensor.data.shape
+    )
+    valid = in_bounds_lanes(tensor.data, numpy_keys)
+    mask_value = tile_mask(tensor.data, numpy_keys, _value(mask))
+    mask_value = valid if mask_value is None else mask_value & valid
+    return _clip_keys(numpy_keys, tensor.data.shape), mask_value, valid
+
+
+def _skips_oob(kwargs):
+    """Whether a load/store/DMA has `mode=oob_mode.skip` (or `oob_mode=`); removes it."""
+    mode = kwargs.pop("mode", None)
+    mode = kwargs.pop("oob_mode", mode)
+    return getattr(mode, "name", None) == "skip"
 
 
 class LoopReduced(NDArray):
@@ -728,16 +815,23 @@ class Builder:
         ndarray = src.data
         mask_value = _value(mask)
         dtype = kwargs.pop("dtype", None)
+        skip = _skips_oob(kwargs)
 
-        # Convert any NDArrays in keys to numpy arrays
-        numpy_keys = self._convert_keys_to_numpy(keys)
-
-        # Call the actual masked_load function
-        numpy_keys = _expand_oob_slices(numpy_keys, ndarray.shape)
-        mask_value = tile_mask(ndarray, numpy_keys, mask_value)
+        valid = None
+        if skip:  # out-of-bounds lanes are not read (oob_mode.skip)
+            numpy_keys, mask_value, valid = skipped_access(src, keys, mask)
+        else:
+            # Convert any NDArrays in keys to numpy arrays
+            numpy_keys = self._convert_keys_to_numpy(keys)
+            numpy_keys = _expand_oob_slices(numpy_keys, ndarray.shape)
+            mask_value = tile_mask(ndarray, numpy_keys, mask_value)
         result = masked_load(ndarray, numpy_keys, mask=mask_value)
 
         # Convert result back to NDArray
+        if valid is not None:
+            return SkippedLanes(
+                _cast(result, dtype), valid, name=f"{src.name}_masked_load", **kwargs
+            )
         return NDArray(
             value=_cast(result, dtype), name=f"{src.name}_masked_load", **kwargs
         )
@@ -752,9 +846,14 @@ class Builder:
         **kwargs,
     ):
         """Store array elements with masking for out-of-bounds errors."""
+        if (
+            value is None
+        ):  # `nl.store(t[k], v)` not rewritten: the value is the second argument
+            keys, value = None, keys
         dst, keys = access(dst, keys)
         ndarray = dst.data
         mask_value = _value(mask)
+        skip = _skips_oob(kwargs)
 
         # Convert any NDArrays in keys to numpy arrays
         numpy_keys = self._convert_keys_to_numpy(keys)
@@ -769,6 +868,10 @@ class Builder:
             value_array = value_array.reshape(tile_shape_)
         value_array = np.broadcast_to(value_array, tile_shape_).astype(ndarray.dtype)
         mask_value = tile_mask(ndarray, numpy_keys, mask_value)
+        if skip:  # out-of-bounds lanes are not written (oob_mode.skip)
+            valid = in_bounds_lanes(ndarray, numpy_keys)
+            mask_value = valid if mask_value is None else mask_value & valid
+            numpy_keys = _clip_keys(numpy_keys, ndarray.shape)
 
         # Call the actual masked_store function
         masked_store(ndarray, numpy_keys, value_array, mask=mask_value)
@@ -1178,15 +1281,16 @@ class Builder:
         src_keys=None,
         mask=None,
         dst_rmw_op=None,
+        oob_mode=None,
         **kwargs,
     ):
         # A DMA transfer reads `src[src_keys]` and writes `dst[dst_keys]`; both go through
         # load/store, so analysis clients see them as a load and a store.
-        value = self.load(src, src_keys, mask=mask)
+        value = self.load(src, src_keys, mask=mask, oob_mode=oob_mode)
         if dst_rmw_op is not None:
-            current = self.load(dst, dst_keys, mask=mask)
+            current = self.load(dst, dst_keys, mask=mask, oob_mode=oob_mode)
             value = NDArray(value=_ufunc(dst_rmw_op)(current.data, value.data))
-        self.store(dst, dst_keys, value, mask=mask)
+        self.store(dst, dst_keys, value, mask=mask, oob_mode=oob_mode)
 
     def scalar_tensor_tensor(
         self,
@@ -1412,9 +1516,7 @@ class Builder:
     ):
         # dst = where(predicate, src, dst), matching operands by partition.
         current = _per_partition(dst.data)
-        pred = _per_partition(
-            _bool_tile(_value(predicate), np.shape(_value(predicate)))
-        )
+        pred = _per_partition(_left_aligned(_value(predicate), dst.data.shape))
         pred = np.broadcast_to(pred, current.shape)
         if reverse_pred:
             pred = ~pred
@@ -1453,6 +1555,12 @@ class Builder:
     def range(self, *args, **kwargs):
         # affine_range, sequential_range, and static_range all iterate like range()
         return range(*args)
+
+    def scalar(self, value, *, dtype=None):
+        # A tile's single value as a scalar, e.g. the trip count of a dynamic loop
+        # (`for _ in range(scalar(t))`).
+        item = np.asarray(_value(value)).reshape(-1)[0]
+        return _cast(item, dtype).item()
 
     def multi_buffer(self, *args, **kwargs):
         # a scheduling directive for a range (`directives=`), which ranges ignore
@@ -1539,6 +1647,13 @@ def nki_patch_lang(scope=None):
         _set_attr(nisa, name, getattr(nki_builder, name))
     _set_attr(nisa, "reciprocal", nki_builder.nisa_reciprocal)
     _set_attr(ncc, "multi_buffer", nki_builder.multi_buffer)
+    # `scalar` is usually imported by name (from neuronxcc.nki.typing import scalar): patch the
+    # modules that hold it too
+    real_scalar = nki_typing.scalar
+    for module in list(sys.modules.values()):
+        namespace = getattr(module, "__dict__", None)
+        if isinstance(namespace, dict) and namespace.get("scalar") is real_scalar:
+            _set_attr(module, "scalar", nki_builder.scalar)
     _set_attr(nisa, "_tiled_offloaded_memcpy", nki_builder.tiled_offloaded_memcpy)
     _set_attr(nisa, "_tiled_offloaded_fma", nki_builder.tiled_offloaded_fma)
     for name in (
@@ -1625,10 +1740,41 @@ def _rewritten_namespace(module_globals, namespaces):
     return namespace
 
 
-def _rewrite_function(fn):
+def _rewrite_function(fn, namespaces):
     """`fn` rewritten by the NKI frontend AST transformer, in the rewritten namespace of its
     module, so the NKI kernels it calls by name are rewritten too."""
-    return _compile_rewritten(fn, _rewritten_namespace(fn.__globals__, {}))
+    return _compile_rewritten(fn, _rewritten_namespace(fn.__globals__, namespaces))
+
+
+_LIBRARY_PATHS = ("site-packages", "dist-packages")
+
+
+def _swap_in_rewritten_kernels(namespaces):
+    """Replace, in user modules, the NKI kernel objects that plain helper functions call
+    through their module's globals with their rewrites; return what to restore."""
+    from ..trace import nki_kernel_function
+
+    swapped = []
+    for module in list(sys.modules.values()):
+        globals_ = getattr(module, "__dict__", None)
+        path = getattr(module, "__file__", None) or ""
+        if (
+            not isinstance(globals_, dict)
+            or not path
+            or any(p in path for p in _LIBRARY_PATHS)
+        ):
+            continue
+        names = [
+            n for n, v in list(globals_.items()) if nki_kernel_function(v) is not None
+        ]
+        if not names:
+            continue
+        rewritten = _rewritten_namespace(globals_, namespaces)
+        for name in names:
+            if rewritten.get(name) is not globals_[name]:
+                swapped.append((globals_, name, globals_[name]))
+                globals_[name] = rewritten[name]
+    return swapped
 
 
 def full_keys(tensor):
@@ -1693,8 +1839,9 @@ class NKIInterpretedFunction:
             from ..trace import nki_kernel_function
 
             fn = nki_kernel_function(self.fn) or self.fn
+            self._namespaces = {}
             if hasattr(fn, "__code__"):
-                self.fn = _rewrite_function(fn)
+                self.fn = _rewrite_function(fn, self._namespaces)
             self._rewritten = True
 
         # convert args to NDArray if they are not already, also those passed by keyword
@@ -1716,6 +1863,16 @@ class NKIInterpretedFunction:
             ret = arg
             client_manager.arg_callback(name, arg, ret)
 
+        # Plain helper functions call NKI kernels through their own module's globals: run
+        # with the rewrites in place there, and restore the kernels afterwards.
+        swapped = _swap_in_rewritten_kernels(getattr(self, "_namespaces", {}))
+        try:
+            return self._run_grid(grid_dims, args, kwargs, client_manager)
+        finally:
+            for globals_, name, kernel in reversed(swapped):
+                globals_[name] = kernel
+
+    def _run_grid(self, grid_dims, args, kwargs, client_manager):
         ret = None
         for x in range(grid_dims[0]):
             for y in range(grid_dims[1]):

@@ -96,19 +96,56 @@ def tile_shape(ndarray: np.ndarray, keys) -> tuple:
     """Shape of ``ndarray[keys]``, also when some integer-array keys are out of bounds."""
     if not isinstance(keys, tuple):
         keys = (keys,)
-    clipped = []
-    for dim, key in enumerate(keys):
-        if (
-            isinstance(key, np.ndarray)
-            and key.dtype.kind in "iu"
-            and dim < ndarray.ndim
+    clipped: list = []
+    dim = 0
+    for key in keys:
+        if key is None:
+            clipped.append(key)
+            continue
+        if dim < ndarray.ndim and (
+            isinstance(key, (int, np.integer))
+            or (isinstance(key, np.ndarray) and key.dtype.kind in "iu")
         ):
             key = np.clip(key, 0, max(ndarray.shape[dim] - 1, 0))
+            key = key if isinstance(key, np.ndarray) and key.ndim else int(key)
         clipped.append(key)
+        dim += 1
     # index a one-byte, zero-stride view: only the shape is needed, not the values
     return np.broadcast_to(np.zeros((), dtype=bool), ndarray.shape)[
         tuple(clipped)
     ].shape
+
+
+def in_bounds_lanes(ndarray: np.ndarray, keys) -> np.ndarray:
+    """Which lanes of ``ndarray[keys]`` index inside the array (a boolean array of the tile's
+    shape), also when some keys are out of bounds. Each dimension's validity is a
+    zero-stride view indexed with the keys, so no array of the tensor's size is built."""
+    keys = keys if isinstance(keys, tuple) else (keys,)
+    norm, singleton_dims = normalize_slice(ndarray, keys)
+    target = list(_calculate_target_shape(norm, ndarray.shape))
+    fixed = []
+    for dim, key in enumerate(norm):
+        if isinstance(key, (int, np.integer)) or (
+            isinstance(key, np.ndarray) and key.dtype.kind in "iu"
+        ):
+            value = np.asarray(key)
+            if (
+                value.size and value.min() < 0
+            ):  # negative indices: one more, invalid index
+                target[dim] += 1
+                value = np.where(value < 0, target[dim] - 1, value)
+            fixed.append(value if isinstance(key, np.ndarray) else int(value))
+        else:
+            fixed.append(key)
+    lanes = None
+    for dim, size in enumerate(ndarray.shape):
+        valid = (np.arange(target[dim]) < size).reshape(
+            [-1 if d == dim else 1 for d in range(len(target))]
+        )
+        part = np.broadcast_to(valid, target)[tuple(fixed)]
+        lanes = part if lanes is None else lanes & part
+    lanes = np.ones((), dtype=bool) if lanes is None else lanes
+    return np.expand_dims(lanes, singleton_dims)
 
 
 def tile_mask(ndarray: np.ndarray, keys, mask) -> np.ndarray | None:

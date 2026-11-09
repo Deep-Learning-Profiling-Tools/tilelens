@@ -366,12 +366,12 @@ class GluonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
 def nki_kernel_function(obj):
     """The Python function of an NKI kernel object (`@nki.jit`, `@nki.baremetal`, ... of the
     legacy `neuronxcc.nki` or of the newer `nki` package), or None for anything else."""
+    if type(obj).__module__.split(".")[0] not in ("neuronxcc", "nki"):
+        return (
+            None  # (checked first: some objects, e.g. proxies, fail on any attribute)
+        )
     func = getattr(obj, "func", None)
-    if type(obj).__module__.split(".")[0] in ("neuronxcc", "nki") and isinstance(
-        func, types.FunctionType
-    ):
-        return func
-    return None
+    return func if isinstance(func, types.FunctionType) else None
 
 
 def trace_source(kernel):

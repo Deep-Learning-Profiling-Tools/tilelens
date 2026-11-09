@@ -19,7 +19,12 @@ from .base import AdapterResult, Frontend, _LangPatchScope, register_frontend
 HAS_NKI = False
 nki_builder = None
 try:
-    from tilelens.core.simulation.nki import NDArray, access, nki_builder  # type: ignore
+    from tilelens.core.simulation.nki import (  # type: ignore
+        NDArray,
+        access,
+        nki_builder,
+        skipped_access,
+    )
 
     HAS_NKI = True
 except ModuleNotFoundError:
@@ -33,10 +38,17 @@ def _nki_dot_adapter(x: Any, y: Any, *_args: Any, **_kwargs: Any) -> AdapterResu
     return AdapterResult(x, y)
 
 
-def _nki_access_adapter(tensor: Any, keys: Any, mask: Any) -> AdapterResult:
+def _nki_access_adapter(
+    tensor: Any, keys: Any, mask: Any, kwargs: dict | None = None
+) -> AdapterResult:
     # `nl.load(t)` and `nl.store(t, value=v)` access the whole tensor, and
-    # `a = t[k]; nl.load(a)` accesses t[k].
+    # `a = t[k]; nl.load(a)` accesses t[k]. With `mode=oob_mode.skip`, clients see the
+    # access as it is performed: out-of-bounds lanes masked off, keys clipped.
     tensor, keys = access(tensor, keys)
+    kwargs = kwargs or {}
+    mode = kwargs.get("oob_mode", kwargs.get("mode"))
+    if getattr(mode, "name", None) == "skip":
+        keys, mask, _ = skipped_access(tensor, keys, mask)
     return AdapterResult(tensor, mask, keys)
 
 
@@ -70,14 +82,16 @@ if HAS_NKI:
         ProgramId: lambda axis, *_args, **_kwargs: AdapterResult(axis),
         Allocate: lambda *_args, **_kwargs: AdapterResult(),
         Load: lambda src, keys=None, *, mask=None, **_kwargs: _nki_access_adapter(
-            src, keys, mask
+            src, keys, mask, _kwargs
         ),
         Store: lambda dst,
         keys=None,
         value=None,
         *,
         mask=None,
-        **_kwargs: _nki_access_adapter(dst, keys, mask),
+        **_kwargs: _nki_access_adapter(
+            dst, None if value is None else keys, mask, _kwargs
+        ),
         Dot: _nki_dot_adapter,
         ReduceSum: _nki_reduce_sum_adapter,
     }

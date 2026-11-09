@@ -453,3 +453,108 @@ def test_psum_tensors_start_from_zero():
     got = tilelens.trace(client=Tracer(), frontend="nki")(psum_reuse_kernel)[(1,)](a, b)
     want = nki.simulate_kernel(nki.jit(psum_reuse_kernel)[(1,)], a, b)
     np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+
+
+from neuronxcc.nki.isa.constants import oob_mode  # noqa: E402
+from neuronxcc.nki.typing import scalar  # noqa: E402 - kernels import it by name
+
+
+@nki.jit(mode="trace")
+def _scale_rows(t, factor):
+    return nl.multiply(t, factor)
+
+
+def _plain_helper(x_hbm, rows):
+    # not an NKI kernel: calls one through this module's globals, and stores positionally
+    return _scale_rows(nl.load(x_hbm[rows, :]), 2.0)
+
+
+def skip_and_helper_kernel(x, blocks, idx):
+    # loads with oob_mode.skip at a loaded index, one past the tensor (the tile keeps its
+    # values there); a helper that is not an NKI kernel, calling one through this module's
+    # globals, whose result is stored positionally
+    out = nl.ndarray((128, x.shape[1]), dtype=x.dtype, buffer=nl.shared_hbm)
+    picked = nl.ndarray(
+        (2, 128, blocks.shape[2]), dtype=blocks.dtype, buffer=nl.shared_hbm
+    )
+    nl.store(out, _plain_helper(x, nl.ds(128, 128)))
+    i = nl.load(idx)
+    tile = nl.full((128, blocks.shape[2]), -1.0, dtype=blocks.dtype)
+    tile[...] = nl.load(blocks[i[0, 0]], mode=oob_mode.skip)  # in bounds: copied
+    nl.store(picked[0], value=tile)
+    tile[...] = nl.load(blocks[i[0, 1]], mode=oob_mode.skip)  # past the end: kept
+    nl.store(picked[1], value=tile)
+    return out, picked
+
+
+def test_skip_mode_and_plain_helpers_match_nki_simulator():
+    x = rng.standard_normal((256, 32)).astype(np.float32)
+    blocks = rng.standard_normal((4, 128, 16)).astype(np.float32)
+    idx = np.array([[2, 9]], dtype=np.int32)
+    tilelens.clear()
+    got = tilelens.trace(client=Tracer(), frontend="nki")(skip_and_helper_kernel)[(1,)](
+        x, blocks, idx
+    )
+    want = nki.simulate_kernel(nki.jit(skip_and_helper_kernel)[(1,)], x, blocks, idx)
+    for g, w in zip(got, want):
+        np.testing.assert_allclose(g, w, rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_equal(got[1][0], blocks[2])
+    np.testing.assert_array_equal(got[1][1], blocks[2])
+
+
+def dynamic_loop_kernel(x, steps):
+    # range(scalar(t)): a trip count loaded from HBM (a dynamic loop; NKI's CPU simulator
+    # does not run these, so the expected values are written out)
+    out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+    acc = nl.zeros(x.shape, dtype=nl.float32, buffer=nl.sbuf)
+    for _ in range(scalar(nl.load(steps))):
+        acc[...] = nl.add(acc, nl.load(x))
+    nl.store(out, value=acc)
+    return out
+
+
+def test_dynamic_trip_count():
+    x = rng.standard_normal((128, 32)).astype(np.float32)
+    tilelens.clear()
+    got = tilelens.trace(client=Tracer(), frontend="nki")(dynamic_loop_kernel)[(1,)](
+        x, np.array([[3]], dtype=np.int32)
+    )
+    np.testing.assert_allclose(got, 3 * x, rtol=1e-6)
+
+
+def left_aligned_kernel(x, pred):
+    # a [P, 1] bias of a [P, A, B] activation, and a [P, A] predicate of a [P, A, B] copy
+    out = nl.ndarray(x.shape, dtype=x.dtype, buffer=nl.shared_hbm)
+    t = nl.load(x)
+    bias = nl.full((x.shape[0], 1), 0.5, dtype=nl.float32)
+    a = nisa.activation(op=nl.copy, data=t, bias=bias, scale=1.0)
+    dst = nl.full(x.shape, -1.0, dtype=x.dtype)
+    nisa.tensor_copy_predicated(src=a, dst=dst, predicate=nl.load(pred))
+    nl.store(out, value=dst)
+    return out
+
+
+def test_lower_rank_operands_align_from_the_partition_dimension():
+    x = rng.standard_normal((128, 4, 8)).astype(np.float32)
+    pred = (rng.random((128, 4)) < 0.5).astype(np.uint8)
+    tilelens.clear()
+    got = tilelens.trace(client=Tracer(), frontend="nki")(left_aligned_kernel)[(1,)](
+        x, pred
+    )
+    want = np.where(pred[:, :, None].astype(bool), x + 0.5, -1.0)
+    np.testing.assert_allclose(got, want, rtol=1e-6)
+
+
+def test_scalar_index_tiles_keep_slices_as_views():
+    # A 0-d index (a loaded value, or a loop index the sanitizer tracks) must slice like an
+    # int: a write through the slice reaches the tile.
+    from tilelens.core.masked_load_store import tile_shape
+    from tilelens.core.simulation.nki import NDArray
+
+    t = NDArray(value=np.zeros((4, 3), dtype=np.float32))
+    row = t[NDArray(value=np.array(2))]
+    row[...] = 5.0
+    assert np.all(t.data[2] == 5.0) and np.all(t.data[[0, 1, 3]] == 0.0)
+    assert tile_shape(np.zeros((4, 3)), (7, slice(None))) == (
+        3,
+    )  # out-of-bounds int key
