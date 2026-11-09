@@ -355,3 +355,15 @@ def test_scalar_float64_results():
 def test_arange_requires_dtype():
     with pytest.raises(TypeError, match="dtype"):
         cutile_builder.arange(4)
+
+
+@pytest.mark.parametrize(
+    "dtype, fill",
+    [(np.float32, np.nan), (np.int32, np.iinfo(np.int32).max), (np.uint8, 255)],
+)
+def test_undetermined_padding_is_deterministic(dtype, fill):
+    array = Array(np.arange(6).astype(dtype))
+    # A (4,) tile at index 1 covers elements 4..7 of a 6-element array.
+    for _ in range(3):
+        tile = cutile_builder.load(array, (1,), (4,))
+        np.testing.assert_array_equal(tile.data, np.array([4, 5, fill, fill], dtype))

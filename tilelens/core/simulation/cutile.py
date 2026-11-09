@@ -112,6 +112,20 @@ _PADDING_VALUES = {
 }
 
 
+def _undetermined_padding(dtype):
+    """Sentinel for undefined lanes: NaN for floats, the maximum otherwise."""
+    dtype = np.dtype(dtype)
+    if dtype == np.dtype(np.bool_):
+        return np.array(True)
+    if dtype.kind in "iu":
+        return np.array(np.iinfo(dtype).max, dtype=dtype)
+    nan = np.array(np.nan).astype(dtype)
+    if np.isnan(nan.astype(np.float64)):
+        return nan
+    # Formats without NaN, such as float4_e2m1fn, use their largest value.
+    return np.array(ml_dtypes.finfo(dtype).max, dtype=dtype)
+
+
 def _padding_value(padding_mode, dtype):
     """Fill value for a defined padding mode, shared by both load paths."""
     if padding_mode not in _PADDING_VALUES:
@@ -703,9 +717,10 @@ class Builder:
         data = array.data.transpose(axes)
         array_slices, tile_slices = self._region(data.shape, starts, access_shape)
 
-        # UNDETERMINED padding leaves out-of-bounds elements uninitialized.
+        # UNDETERMINED padding is undefined on the GPU. A fixed sentinel keeps
+        # traces reproducible and makes reliance on those lanes visible.
         if padding_mode == ct.PaddingMode.UNDETERMINED:
-            value = np.empty(access_shape, dtype=data.dtype)
+            value = np.full(access_shape, _undetermined_padding(data.dtype))
         else:
             padding = _padding_value(padding_mode, data.dtype)
             value = np.full(access_shape, padding, dtype=data.dtype)
