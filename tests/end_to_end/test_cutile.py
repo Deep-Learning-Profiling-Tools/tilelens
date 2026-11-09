@@ -482,3 +482,14 @@ def test_trace_tiled_views(tmp_path):
         assert interface.app.test_client().get("/api/data").status_code == 200
     finally:
         tilelens.clear()
+
+
+def test_tuple_argument_arrays_are_traced():
+    def kernel(arrays, dst):
+        ct.store(dst, (0,), ct.load(arrays[0], (0,), (4,)))
+
+    src = np.arange(4, dtype=np.float32)
+    dst = np.zeros(4, dtype=np.float32)
+    tilelens.trace("tracer", frontend="cutile")(kernel)[(1,)]((src,), dst)
+    np.testing.assert_array_equal(dst, src)
+    assert {t.data_ptr() for t in launches[-1].tensors} >= {src.ctypes.data}

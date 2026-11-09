@@ -2062,7 +2062,14 @@ def _wrap_argument(arg, scalar_dtype=None):
         return arg
     if isinstance(arg, np.ndarray):
         return Array(arg)
-    if isinstance(arg, (bool, int, float, np.generic)):
+    if isinstance(arg, (tuple, list)):
+        # cuTile accepts tuple and list parameters holding arrays and scalars.
+        return type(arg)(_wrap_argument(item) for item in arg)
+    if isinstance(arg, int) and not isinstance(arg, bool):
+        # Like cuTile, plain ints are int32 unless annotated ct.ScalarInt64.
+        _check_integer_scalar(arg, ct.int32)
+        return Tile(arg, ct.int32)
+    if isinstance(arg, (bool, float, np.generic)):
         return Tile(arg)
     torch = sys.modules.get("torch")
     if torch is not None and isinstance(arg, torch.Tensor):
@@ -2090,6 +2097,24 @@ def cutile_unpatch_lang(scope=None):
         scope.restore()
 
 
+def _grid_dims(grid):
+    """Normalize a grid of one to three positive integers, numpy ones included."""
+    dims = tuple(grid) if isinstance(grid, (tuple, list)) else (grid,)
+    error = ValueError("cuTile grid must contain one to three positive integers")
+    if not 1 <= len(dims) <= 3:
+        raise error
+    if any(isinstance(dim, (bool, np.bool_)) for dim in dims):
+        raise error
+    try:
+        # operator.index accepts numpy integers but rejects floats.
+        dims = tuple(operator.index(dim) for dim in dims)
+    except TypeError:
+        raise error from None
+    if any(dim <= 0 for dim in dims):
+        raise error
+    return dims + (1,) * (3 - len(dims))
+
+
 class CuTileInterpretedFunction:
     """Execute a Python kernel over a grid with optional tracing callbacks."""
 
@@ -2102,13 +2127,7 @@ class CuTileInterpretedFunction:
             return self._run(*args, grid=grid, client_manager=client_manager, **kwargs)
 
     def _run(self, *args, grid=(1,), client_manager=None, **kwargs) -> None:
-        grid_dims = (grid,) if isinstance(grid, int) else tuple(grid)
-        if not 1 <= len(grid_dims) <= 3 or any(
-            not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0
-            for dim in grid_dims
-        ):
-            raise ValueError("cuTile grid must contain one to three positive integers")
-        grid_dims += (1,) * (3 - len(grid_dims))
+        grid_dims = _grid_dims(grid)
         cutile_builder.set_grid_dim(*grid_dims)
 
         signature = inspect.signature(self.fn)
@@ -2132,13 +2151,19 @@ class CuTileInterpretedFunction:
         args, kwargs = bound.args, bound.kwargs
 
         if client_manager is not None:
-            for name, arg in bound.arguments.items():
+
+            def report_arg(name, arg):
+                if isinstance(arg, (tuple, list)):
+                    # Register arrays nested in tuple and list arguments too.
+                    for index, item in enumerate(arg):
+                        report_arg(f"{name}[{index}]", item)
+                    return
                 if isinstance(arg, Array) and not arg.is_contiguous():
                     warnings.warn(
                         f"cuTile argument {name!r} is noncontiguous; visualization "
                         "and trace saving require contiguous arrays",
                         RuntimeWarning,
-                        stacklevel=3,
+                        stacklevel=4,
                     )
                 trace_arg = (
                     _TraceArray(arg)
@@ -2146,6 +2171,9 @@ class CuTileInterpretedFunction:
                     else arg
                 )
                 client_manager.arg_callback(name, trace_arg, arg)
+
+            for name, arg in bound.arguments.items():
+                report_arg(name, arg)
             client_manager.grid_callback(grid_dims)
 
         # Traced execution is already patched by ClientManager.patch_run().

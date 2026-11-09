@@ -9,6 +9,7 @@ ct = pytest.importorskip("cuda.tile")
 
 from tilelens.core.simulation.cutile import (  # noqa: E402
     Array,
+    CuTileInterpretedFunction,
     Tile,
     cutile_builder,
 )
@@ -367,3 +368,40 @@ def test_undetermined_padding_is_deterministic(dtype, fill):
     for _ in range(3):
         tile = cutile_builder.load(array, (1,), (4,))
         np.testing.assert_array_equal(tile.data, np.array([4, 5, fill, fill], dtype))
+
+
+def test_tuple_and_list_array_arguments():
+    def kernel(arrays, dst):
+        ct.store(
+            dst, (0,), ct.load(arrays[0], (0,), (4,)) + ct.load(arrays[1], (0,), (4,))
+        )
+
+    src = np.arange(4, dtype=np.float32)
+    for container in (tuple, list):
+        dst = np.zeros(4, dtype=np.float32)
+        CuTileInterpretedFunction(kernel).run(container((src, src * 10)), dst)
+        np.testing.assert_array_equal(dst, src * 11)
+
+
+def test_plain_int_arguments_are_int32():
+    def kernel(n, dst):
+        ct.store(dst, (0,), ct.full((1,), n * 2, ct.int64))
+
+    dst = np.zeros(1, dtype=np.int64)
+    CuTileInterpretedFunction(kernel).run(2**30, dst)
+    # Like on the GPU, an int32 parameter wraps on overflow.
+    np.testing.assert_array_equal(dst, [-(2**31)])
+    with pytest.raises(ValueError, match="out of range of int32"):
+        CuTileInterpretedFunction(kernel).run(2**31, dst)
+
+
+def test_grid_accepts_numpy_integers():
+    def kernel(dst):
+        ct.store(dst, (ct.bid(0),), ct.full((1,), 1, ct.int32))
+
+    dst = np.zeros(3, dtype=np.int32)
+    CuTileInterpretedFunction(kernel).run(dst, grid=(np.int64(3),))
+    np.testing.assert_array_equal(dst, [1, 1, 1])
+    for grid in ((1.0,), (True,), (0,), (1, 1, 1, 1)):
+        with pytest.raises(ValueError, match="one to three positive integers"):
+            CuTileInterpretedFunction(kernel).run(dst, grid=grid)
