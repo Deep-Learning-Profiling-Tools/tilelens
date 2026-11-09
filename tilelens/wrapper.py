@@ -2,6 +2,8 @@ import os
 import shutil
 import runpy
 import sys
+from contextlib import nullcontext
+from typing import Any
 import triton
 import tilelens
 from triton.experimental import gluon as _gluon
@@ -78,9 +80,12 @@ def create_patched_autotune(wrapper_func):
     return _patched_autotune
 
 
-def _apply_wrapper(wrapper_func, command_name, usage_msg):
+def _apply_wrapper(wrapper_func, command_name, usage_msg, cutile_client=None):
     """
     Generic function to apply a wrapper to triton.jit and run the user script.
+
+    When cutile_client is given, ct.launch also runs kernels through the cuTile
+    interpreter with that client.
     """
     legacy_command = LEGACY_COMMANDS[command_name]
     if os.path.basename(sys.argv[0]) not in (command_name, legacy_command):
@@ -113,7 +118,18 @@ def _apply_wrapper(wrapper_func, command_name, usage_msg):
         frontend="gluon",
     )
 
-    # run user script
+    # Patch cuTile launches when the client supports the cuTile frontend.
+    cutile_launches: Any = nullcontext()
+    if cutile_client is not None:
+        from tilelens.core.frontend.cutile import HAS_CUTILE, interpreted_launches
+
+        if HAS_CUTILE:
+            cutile_launches = interpreted_launches(cutile_client, cli=True)
+    with cutile_launches:
+        _run_user_script(usage_msg)
+
+
+def _run_user_script(usage_msg):
     if len(sys.argv) < 2:
         print(usage_msg)
         sys.exit(1)
@@ -166,6 +182,7 @@ def apply_profiler():
         profiler_wrapper,
         PROFILER_COMMAND,
         f"Usage: {PROFILER_COMMAND} <script.py> [args...]",
+        cutile_client="profiler",
     )
 
 
