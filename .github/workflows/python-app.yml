@@ -101,15 +101,20 @@ jobs:
       run: |
         python - <<'PY'
         import tilelens
+        import cuda.tile
         import triton_viz
         from tilelens.clients import Sanitizer
         from triton_viz.clients import Sanitizer as LegacySanitizer
         from tilelens.core.trace import launches
+        from tilelens.core.frontend.cutile import frontend
+        from tilelens.core.simulation.cutile import CuTileInterpretedFunction
         from triton_viz.core.trace import launches as legacy_launches
 
         assert triton_viz.trace is tilelens.trace
         assert triton_viz.config is tilelens.config
         assert LegacySanitizer is Sanitizer
         assert legacy_launches is launches
+        assert frontend.name == "cutile"
+        assert CuTileInterpretedFunction is not None
         print(tilelens.__version__)
         PY

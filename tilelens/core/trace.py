@@ -221,6 +221,48 @@ class TritonTrace(LaunchInterface, TraceInterface, KernelTraceSupport):
                 self.warmup_runner.warmup(*args, **kwargs)
 
 
+class CuTileTrace(LaunchInterface, TraceInterface):
+    """Run cuTile through its CPU interpreter with the shared tracer."""
+
+    def __init__(self, kernel, client: str | Client) -> None:
+        from .simulation.cutile import CuTileInterpretedFunction
+
+        self.frontend_name = "cutile"
+        if isinstance(kernel, CuTileInterpretedFunction):
+            self.interpreter_fn = kernel
+            self.func = kernel.fn
+        else:
+            self.interpreter_fn = CuTileInterpretedFunction(kernel)
+            # Unlike a raw NKI function, @ct.kernel needs unwrapping first.
+            self.func = self.interpreter_fn.fn
+
+        self.fn = self.func  # Preserve the shared source-unwrapping protocol.
+        TraceInterface.__init__(self, client)
+
+    def add_client(self, new_client: str | Client) -> None:
+        selected = self._normalize_client(new_client)
+        if not isinstance(selected, Tracer):
+            raise ValueError("cuTile currently supports only the tracer client")
+        super().add_client(selected)
+
+    def run(self, *args, grid=(1,), **kwargs):
+        from .simulation.cutile import cutile_execution_lock
+
+        kwargs.pop("warmup", None)
+        with cutile_execution_lock:
+            with self.client_manager.patch_run(
+                self.func, frontend_name=self.frontend_name
+            ):
+                ret = self.interpreter_fn.run(
+                    *args, grid=grid, client_manager=self.client_manager, **kwargs
+                )
+                self.finalize()
+                return ret
+
+    def __call__(self, *args, **kwargs):
+        return self.run(*args, **kwargs)
+
+
 class NKITrace(LaunchInterface, TraceInterface):
     def __init__(self, kernel, client: str | Client, beta2: bool = True) -> None:
         nki_fn_cls: object = None
@@ -373,7 +415,8 @@ def trace_source(kernel):
     while not isinstance(base_fn, types.FunctionType):
         # base_fn may be a raw function but also a JITFunction, Autotuner, InterpretedFunction, ...
         # we want to strip away the wrappers until we get to the python function
-        base_fn = base_fn.fn
+        # cuTile kernels expose _pyfunc; the other wrappers expose fn.
+        base_fn = base_fn._pyfunc if hasattr(base_fn, "_pyfunc") else base_fn.fn
     CODE_KEYS.add(get_code_key(base_fn))
     return kernel
 
@@ -408,7 +451,7 @@ def trace(client: str | Client | None = None, frontend: str = "triton"):
         # test_flag_off_does_not_swallow_explicit_instance.
         return isinstance(selected, NullRaceDetector)
 
-    def decorator(kernel) -> TritonTrace | NKITrace | GluonTrace | Any:
+    def decorator(kernel) -> TritonTrace | NKITrace | GluonTrace | CuTileTrace | Any:
         if cfg.cli_active and isinstance(kernel, TraceInterface):
             raise RuntimeError(
                 "@tilelens.trace() decorator cannot be used together with "
@@ -442,6 +485,8 @@ def trace(client: str | Client | None = None, frontend: str = "triton"):
             return GluonTrace(kernel, client)
         elif frontend == "triton":
             return TritonTrace(kernel, client)
+        elif frontend == "cutile":
+            return CuTileTrace(kernel, client)
         else:
             raise ValueError(f"Unknown frontend: {frontend}")
 

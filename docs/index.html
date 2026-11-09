@@ -571,7 +571,7 @@
         </div>
         <h1>Analyze and debug your tile-based DSL kernels</h1>
         <p style="display: block; font-size: 0.95rem; color: var(--text-muted); margin-top: -1rem; margin-bottom: 2.5rem;">
-            Note: Triton is the default DSL frontend; Amazon NKI support is optional and in active development.
+            Note: Triton is the default DSL frontend; NVIDIA cuTile is also supported, and Amazon NKI support is optional and in active development.
         </p>
         <div class="install-container">
             <div class="install-box">
@@ -589,6 +589,15 @@
                     <div class="install-command">
                         <code style="white-space: pre-wrap;">pip install "tilelens[nki]" --extra-index-url https://pip.repos.neuron.amazonaws.com</code>
                         <button class="copy-btn" onclick="navigator.clipboard.writeText('pip install &quot;tilelens[nki]&quot; --extra-index-url https://pip.repos.neuron.amazonaws.com')" title="Copy to clipboard">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="install-step">
+                    <div class="install-label">Install (cuTile support)</div>
+                    <div class="install-command">
+                        <code style="white-space: pre-wrap;">pip install "tilelens[cutile]"</code>
+                        <button class="copy-btn" onclick="navigator.clipboard.writeText('pip install &quot;tilelens[cutile]&quot;')" title="Copy to clipboard">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                         </button>
                     </div>
