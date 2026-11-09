@@ -484,3 +484,34 @@ def test_unsupported_math_options_are_rejected(call, error):
 
     with pytest.raises(error):
         CuTileInterpretedFunction(kernel).run(np.ones(4, dtype=np.float32))
+
+
+@pytest.mark.parametrize(
+    "call, message",
+    [
+        (
+            lambda t, out: ct.store(out, (0,), t, ordr="C"),
+            "unexpected keyword argument 'ordr'",
+        ),
+        (lambda t, out: ct.exp(t, None, None), "too many positional arguments"),
+        (
+            lambda t, out: ct.store(out, (0,), t, memory_order="weak"),
+            "Invalid memory_order",
+        ),
+    ],
+)
+def test_language_calls_still_validate_arguments(call, message):
+    def kernel(x, out):
+        call(ct.load(x, (0,), (4,)), out)
+
+    with pytest.raises(TypeError, match=message):
+        CuTileInterpretedFunction(kernel).run(
+            np.ones(4, np.float32), np.zeros(4, np.float32)
+        )
+
+
+def test_computed_tiles_stay_immutable():
+    x = Tile(np.array([1.0, 2.0], dtype=np.float32))
+    for result in (x + x, x < x, cutile_builder.exp(x)):
+        with pytest.raises(ValueError):
+            result.data[0] = 0

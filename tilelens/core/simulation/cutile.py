@@ -350,6 +350,15 @@ class Tile:
             ct.tfloat32 if dtype == ct.tfloat32 else NUMPY_DTYPES[self.data.dtype]
         )
 
+    @classmethod
+    def _wrap(cls, value):
+        """Adopt an array the interpreter just computed, without copying it."""
+        tile = cls.__new__(cls)
+        tile.data = value
+        tile.data.setflags(write=False)
+        tile._dtype = NUMPY_DTYPES[value.dtype]
+        return tile
+
     @property
     def shape(self):
         return self.data.shape
@@ -803,12 +812,12 @@ class Builder:
             np.remainder,
         ):
             raise TypeError("Boolean arithmetic requires an integer cast")
-        return Tile(operation(x, y).astype(dtype))
+        return Tile._wrap(np.asarray(operation(x, y)).astype(dtype))
 
     @staticmethod
     def _compare(x, y, operation):
         x, y, _ = _binary_values(x, y)
-        return Tile(operation(x, y))
+        return Tile._wrap(np.asarray(operation(x, y)))
 
     def add(self, x, y, /, **kwargs):
         return self._binary(x, y, np.add)
@@ -999,9 +1008,13 @@ class Builder:
         value = _unary_value(x)
         if not _is_float(value.dtype):
             value = value.astype(np.float32)
-        return Tile(
-            operation(
-                value.astype(np.float64 if value.dtype == np.float64 else np.float32)
+        return Tile._wrap(
+            np.asarray(
+                operation(
+                    value.astype(
+                        np.float64 if value.dtype == np.float64 else np.float32
+                    )
+                )
             ).astype(value.dtype)
         )
 
@@ -1938,27 +1951,52 @@ cutile_builder = Builder()
 
 def _language_operation(name):
     original = _LANG_FUNCTIONS[name]
+    # Check arguments against cuTile's signature without binding it per call.
+    # Option parameters (memory order, rounding, flush-to-zero) are keyword-only.
+    parameters = _LANG_SIGNATURES[name].parameters.values()
+    kinds = inspect.Parameter
+    keywords = {
+        p.name
+        for p in parameters
+        if p.kind in (kinds.POSITIONAL_OR_KEYWORD, kinds.KEYWORD_ONLY)
+    }
+    accepts_any_keyword = any(p.kind is kinds.VAR_KEYWORD for p in parameters)
+    max_positional = (
+        None
+        if any(p.kind is kinds.VAR_POSITIONAL for p in parameters)
+        else sum(
+            p.kind in (kinds.POSITIONAL_ONLY, kinds.POSITIONAL_OR_KEYWORD)
+            for p in parameters
+        )
+    )
 
     @wraps(original)
     def execute(*args, **kwargs):
-        bound = _LANG_SIGNATURES[name].bind(*args, **kwargs)
-        bound.apply_defaults()
+        if max_positional is not None and len(args) > max_positional:
+            raise TypeError(f"ct.{name}() got too many positional arguments")
+        if not accepts_any_keyword and not keywords.issuperset(kwargs):
+            unexpected = sorted(set(kwargs) - keywords)[0]
+            raise TypeError(
+                f"ct.{name}() got an unexpected keyword argument {unexpected!r}"
+            )
         for key, enum in (
             ("memory_order", ct.MemoryOrder),
             ("memory_scope", ct.MemoryScope),
         ):
-            if key in bound.arguments and not isinstance(bound.arguments[key], enum):
-                raise TypeError(f"Invalid {key}: {bound.arguments[key]}")
-        flush_to_zero = bound.arguments.get("flush_to_zero", False)
-        cutile_builder._check_cpu_math_options(
-            bound.arguments.get("rounding_mode"),
-            flush_to_zero,
-            op=name,
-            dtype=next(
-                (v.dtype for v in bound.arguments.values() if isinstance(v, Tile)),
-                None,
-            ),
-        )
+            if key in kwargs and not isinstance(kwargs[key], enum):
+                raise TypeError(f"Invalid {key}: {kwargs[key]}")
+        rounding_mode = kwargs.get("rounding_mode")
+        flush_to_zero = kwargs.get("flush_to_zero", False)
+        if rounding_mode is not None or flush_to_zero is not False:
+            cutile_builder._check_cpu_math_options(
+                rounding_mode,
+                flush_to_zero,
+                op=name,
+                dtype=next(
+                    (v.dtype for v in (*args, *kwargs.values()) if isinstance(v, Tile)),
+                    None,
+                ),
+            )
         method = getattr(cutile_builder, name, None)
         if method is None:
             raise NotImplementedError(f"ct.{name} is unsupported")
