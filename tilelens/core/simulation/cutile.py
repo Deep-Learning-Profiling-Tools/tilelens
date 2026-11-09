@@ -32,6 +32,11 @@ try:
 except ImportError:  # cuTile 1.0 tile-function wrappers have no dispatch hook.
     DispatchMode = None
 
+try:
+    from cuda.tile._ir.ops_utils import BINOP_REGISTRY, UNARYOP_REGISTRY
+except ImportError:  # Older cuda-tile releases have no per-op option table.
+    BINOP_REGISTRY = UNARYOP_REGISTRY = {}
+
 from ..frontend.base import get_frontend
 
 # cuTile-only dtypes stay out of the shared table, which NKI uses to reject
@@ -111,6 +116,26 @@ _PADDING_VALUES = {
     ct.PaddingMode.POS_INF: np.inf,
     ct.PaddingMode.NEG_INF: -np.inf,
 }
+
+
+# cuTile's per-op rounding-mode and flush-to-zero support. Reductions and
+# ct.maximum/minimum are checked like the ops they apply.
+_MATH_OPS = {**BINOP_REGISTRY, **UNARYOP_REGISTRY}
+_MATH_OP_NAMES = {"sum": "add", "cumsum": "add", "maximum": "max", "minimum": "min"}
+_DIRECTED_ROUNDING = tuple(
+    getattr(ct.RoundingMode, mode)
+    for mode in ("RZ", "RM", "RP", "RZI")
+    if hasattr(ct.RoundingMode, mode)
+)
+
+
+def _flush_subnormals(value):
+    """Flush float32 subnormals to signed zero, as flush_to_zero does."""
+    if not isinstance(value, Tile) or value.data.dtype != np.float32:
+        return value
+    data = value.data
+    tiny = np.finfo(np.float32).tiny
+    return Tile(np.where(np.abs(data) < tiny, np.copysign(0, data), data), value.dtype)
 
 
 def _undetermined_padding(dtype):
@@ -1268,17 +1293,35 @@ class Builder:
 
     @staticmethod
     def _check_cpu_math_options(
-        rounding_mode=None, flush_to_zero=False, *, rounding_modes=(ct.RoundingMode.RN,)
+        rounding_mode=None, flush_to_zero=False, *, op=None, dtype=None
     ):
         if not isinstance(flush_to_zero, bool):
             raise TypeError("flush_to_zero must be a constant bool")
         if rounding_mode is not None and not isinstance(rounding_mode, ct.RoundingMode):
             raise TypeError("rounding_mode must be a RoundingMode or None")
-        if flush_to_zero:
-            raise NotImplementedError("flush_to_zero is unsupported")
-        if rounding_mode is not None and rounding_mode not in rounding_modes:
+        if rounding_mode is None and not flush_to_zero:
+            return
+        # Accept what cuTile accepts for this op (see its check_rd_and_ftz).
+        definition = _MATH_OPS.get(_MATH_OP_NAMES.get(op, op))
+        if definition is not None:
+            if rounding_mode is not None and (
+                rounding_mode not in definition.supported_rounding_modes
+            ):
+                raise TypeError(
+                    f"Rounding mode {rounding_mode.value} is not supported for {op}"
+                )
+            if flush_to_zero and not definition.support_flush_to_zero:
+                raise TypeError(f"Flush to zero is not supported for {op}")
+        exact_modes = (ct.RoundingMode.FULL, ct.RoundingMode.APPROX)
+        if (rounding_mode in exact_modes or flush_to_zero) and dtype not in (
+            None,
+            ct.float32,
+        ):
+            raise TypeError(f"{op} rounding and flush-to-zero options require float32")
+        # RN, FULL, and APPROX all compute the exact CPU result.
+        if rounding_mode in _DIRECTED_ROUNDING:
             raise NotImplementedError(
-                "CPU simulation does not implement this rounding mode"
+                "CPU simulation does not emulate directed rounding modes"
             )
 
     def abs(self, x, /):
@@ -1319,16 +1362,14 @@ class Builder:
         return self._unary(x, np.tan)
 
     def tanh(self, x, /, *, rounding_mode=None):
-        self._check_cpu_math_options(
-            rounding_mode, rounding_modes=(ct.RoundingMode.FULL,)
-        )
+        self._check_cpu_math_options(rounding_mode)
         value = _tile_value(x)
         if (
             rounding_mode is not None
             and _is_float(value.dtype)
             and value.dtype != np.float32
         ):
-            raise TypeError("Explicit FULL tanh rounding requires float32")
+            raise TypeError("Explicit tanh rounding requires float32")
         return self._unary(x, np.tanh)
 
     def sinh(self, x, /):
@@ -1908,15 +1949,25 @@ def _language_operation(name):
         ):
             if key in bound.arguments and not isinstance(bound.arguments[key], enum):
                 raise TypeError(f"Invalid {key}: {bound.arguments[key]}")
+        flush_to_zero = bound.arguments.get("flush_to_zero", False)
         cutile_builder._check_cpu_math_options(
             bound.arguments.get("rounding_mode"),
-            bound.arguments.get("flush_to_zero", False),
-            rounding_modes=(ct.RoundingMode.RN, ct.RoundingMode.FULL),
+            flush_to_zero,
+            op=name,
+            dtype=next(
+                (v.dtype for v in bound.arguments.values() if isinstance(v, Tile)),
+                None,
+            ),
         )
         method = getattr(cutile_builder, name, None)
         if method is None:
             raise NotImplementedError(f"ct.{name} is unsupported")
-        return method(*args, **kwargs)
+        if flush_to_zero is not True:
+            return method(*args, **kwargs)
+        # Flush-to-zero treats float32 subnormal inputs and results as zero.
+        args = tuple(_flush_subnormals(arg) for arg in args)
+        kwargs = {key: _flush_subnormals(value) for key, value in kwargs.items()}
+        return _flush_subnormals(method(*args, **kwargs))
 
     return execute
 

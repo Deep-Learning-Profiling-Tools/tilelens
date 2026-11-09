@@ -446,3 +446,41 @@ def test_kernel_setup_leaves_library_modules_alone():
     CuTileInterpretedFunction(kernel).run(src, dst)
     np.testing.assert_array_equal(dst, src)
     assert seen["max"] is builtins.max
+
+
+def test_approx_rounding_and_flush_to_zero():
+    def kernel(x, out):
+        tile = ct.truediv(
+            ct.load(x, (0,), (4,)), 2.0, rounding_mode=ct.RoundingMode.APPROX
+        )
+        tile = ct.add(tile, ct.exp(tile, rounding_mode=ct.RoundingMode.APPROX) * 0.0)
+        ct.store(out, (0,), ct.add(tile, 0.0, flush_to_zero=True))
+
+    subnormal = np.float32(1e-39)
+    x = np.array([1.0, subnormal, -2 * subnormal, 3.0], dtype=np.float32)
+    out = np.zeros(4, dtype=np.float32)
+    CuTileInterpretedFunction(kernel).run(x, out)
+    # APPROX gives the exact CPU result; flush-to-zero zeroes subnormals.
+    np.testing.assert_array_equal(out, [0.5, 0.0, 0.0, 1.5])
+
+
+@pytest.mark.parametrize(
+    "call, error",
+    [
+        (lambda t: ct.add(t, 1.0, rounding_mode=ct.RoundingMode.APPROX), TypeError),
+        (
+            lambda t: ct.add(ct.astype(t, ct.float16), 1.0, flush_to_zero=True),
+            TypeError,
+        ),
+        (
+            lambda t: ct.add(t, 1.0, rounding_mode=ct.RoundingMode.RZ),
+            NotImplementedError,
+        ),
+    ],
+)
+def test_unsupported_math_options_are_rejected(call, error):
+    def kernel(x):
+        call(ct.load(x, (0,), (4,)))
+
+    with pytest.raises(error):
+        CuTileInterpretedFunction(kernel).run(np.ones(4, dtype=np.float32))
