@@ -1615,3 +1615,96 @@ def test_strided_view_warns_on_large_numel(_isolate_per_element_threshold):
 
     # Warning path must not change correctness -- no OOB with correct mask.
     assert len(strided_view_sanitizer.records) == 0
+
+
+# ======== Values Concretized in One Block ===========
+
+
+block_values_sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+
+@tilelens.trace(client=block_values_sanitizer)
+@triton.jit
+def data_dependent_mask_kernel(p_ptr, flag_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    flag = tl.load(flag_ptr + offs, mask=mask, other=0)
+    mask = mask & (flag == 0)
+    p = tl.load(p_ptr + offs, mask=mask)
+    tl.store(p_ptr + offs, p + 1, mask=mask)
+
+
+@tilelens.trace(client=block_values_sanitizer)
+@triton.jit
+def data_dependent_mask_oob_kernel(p_ptr, flag_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    flag = tl.load(flag_ptr + offs, mask=offs < n, other=0)
+    p = tl.load(p_ptr + offs, mask=flag == 0)
+    tl.store(p_ptr + offs, p + 1, mask=offs < n)
+
+
+@tilelens.trace(client=block_values_sanitizer)
+@triton.jit
+def loaded_loop_bound_kernel(
+    lens_ptr, x_ptr, out_ptr, MAX_ROWS: tl.constexpr, BLOCK: tl.constexpr
+):
+    b = tl.program_id(0)
+    n = tl.load(lens_ptr + b)
+    offs = tl.arange(0, BLOCK)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for j in range(0, n):
+        acc += tl.load(x_ptr + (b * MAX_ROWS + j) * BLOCK + offs)
+    tl.store(out_ptr + b * BLOCK + offs, acc)
+
+
+def test_data_dependent_mask_is_checked_per_block():
+    """
+    A bounds mask AND-ed with a condition on loaded values is concretized
+    with the running block's values, so it applies to that block only.
+
+    Setup: n = 20, BLOCK = 8, three blocks, every flag 0. offs < n masks off
+    lanes 20-23 of block 2; blocks 0 and 1 have no masked-off lane.
+    """
+    block_values_sanitizer.records.clear()
+
+    p = torch.zeros((20,), dtype=torch.float32)
+    flag = torch.zeros((20,), dtype=torch.int32)
+    data_dependent_mask_kernel[(3,)](p, flag, 20, BLOCK=8)
+
+    assert block_values_sanitizer.records == []
+
+
+def test_data_dependent_mask_without_bounds_reports_last_block():
+    """
+    The same kernel without the bounds mask on p: block 2 loads p[20:24].
+    Blocks 0-2 build the same concretized mask (all lanes on), so the
+    check of block 2 must not be skipped as a repeat of block 0's.
+    """
+    block_values_sanitizer.records.clear()
+
+    p = torch.zeros((20,), dtype=torch.float32)
+    flag = torch.zeros((20,), dtype=torch.int32)
+    data_dependent_mask_oob_kernel[(3,)](p, flag, 20, BLOCK=8)
+
+    assert len(block_values_sanitizer.records) > 0, "Expected OOB to be detected"
+
+
+@pytest.mark.parametrize(
+    "lens, expect_oob", [([4, 3], False), ([3, 4], True)], ids=["fits", "overruns"]
+)
+def test_loop_bound_loaded_per_block(lens, expect_oob):
+    """
+    Each block loops over its own number of rows, loaded from lens.
+
+    Setup: x packs 4 rows of 4 elements per block, except that it holds
+    only 7 rows, so block 1 may read 3 rows. With lens = [4, 3] every block
+    stays in x; with lens = [3, 4], block 1 reads row 7.
+    """
+    block_values_sanitizer.records.clear()
+
+    lens_t = torch.tensor(lens, dtype=torch.int32)
+    x = torch.zeros((7 * 4,), dtype=torch.float32)
+    out = torch.empty((2 * 4,), dtype=torch.float32)
+    loaded_loop_bound_kernel[(2,)](lens_t, x, out, MAX_ROWS=4, BLOCK=4)
+
+    assert (len(block_values_sanitizer.records) > 0) == expect_oob

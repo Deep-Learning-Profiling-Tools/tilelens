@@ -423,6 +423,27 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
         self.addr_ok_cache[cache_key] = addr_ok
         return addr_ok
 
+    def _current_block_constraint(self) -> BoolRef | None:
+        """Pin the program ids to the running block once it concretized values.
+
+        A concretized value is the value in the running block only, so an
+        access built from it says nothing about other blocks. Every block of
+        such a launch runs (``need_full_grid``), and each checks its own
+        accesses.
+        """
+        grid_idx = self.grid_idx
+        if not self.need_full_grid or grid_idx is None:
+            return None
+        x, y, z = grid_idx
+        return cast(
+            BoolRef,
+            And(
+                SymbolicExpr.PID0 == x,
+                SymbolicExpr.PID1 == y,
+                SymbolicExpr.PID2 == z,
+            ),
+        )
+
     def _check_range_satisfiable(
         self,
         access_addr: Z3Expr,
@@ -461,6 +482,9 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
         solver.push()
         try:
             solver.add(Not(addr_ok))
+            block_constraint = self._current_block_constraint()
+            if block_constraint is not None:
+                solver.add(block_constraint)
             if expr_constraints is not None:
                 solver.add(expr_constraints)
 
@@ -562,11 +586,12 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
         doesn't distinguish reads vs writes at the Z3 level.
         """
         if not self.loop_stack:
-            expr_signature = hash(("expr", expr.signature()))
+            block = self.grid_idx if self.need_full_grid else None
+            expr_signature = hash(("expr", expr.signature(), block))
             if expr_signature in self.access_check_cache:
                 return
             z3_addr, z3_constraints = expr.eval()
-            z3_signature = hash(("z3", _make_signature(z3_addr, z3_constraints)))
+            z3_signature = hash(("z3", _make_signature(z3_addr, z3_constraints), block))
             if z3_signature in self.access_check_cache:
                 self.access_check_cache.add(expr_signature)
                 return
