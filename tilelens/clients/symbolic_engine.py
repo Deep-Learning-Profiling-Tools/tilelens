@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import warnings
 import weakref
 from collections.abc import Callable, Iterator, Sequence
@@ -33,6 +34,9 @@ from z3 import (
     LShR,
     BoolVal,
     Not,
+    is_const,
+    substitute,
+    Z3_OP_UNINTERPRETED,
 )
 from z3.z3 import BoolRef, ArithRef, IntNumRef, ExprRef, Tactic, Probe
 
@@ -181,6 +185,81 @@ def _range_to_iterator_constraint(
     # `i in range(start, stop, step)` iff bounds hold and (i-start) is a multiple
     # of abs(step). Use a positive modulus to avoid negative-divisor semantics.
     return And(bounds, (var - start) % abs_step == 0)
+
+
+_LANE_VAR_NAME = re.compile(r"arange_(-?\d+)_(-?\d+)(?:_ax(\d+))?")
+
+
+def _lane_var(
+    start: int, end: int, axis: int
+) -> tuple[ArithRef, ConstraintConjunction]:
+    """Return the lane variable of ``tl.arange(start, end)`` laid along ``axis``.
+
+    The lanes of a tile along one axis are one index, so every arange laid
+    along that axis shares a variable, and those laid along different axes
+    (the rows and columns in ``a[:, None] + b[None, :]``) get different ones.
+    Axes are counted from the last one (``axis`` 0 is the last axis), which is
+    how broadcasting aligns operands of different ranks. A 1-D arange starts
+    on axis 0; the shape ops that move axes rename its variable
+    (``_move_lane_axes``).
+    """
+    key = (start, end, axis)
+    cached = SymbolicExpr.ARANGE_DICT.get(key)
+    if cached is not None:
+        return cached
+    name = f"arange_{start}_{end}" if axis == 0 else f"arange_{start}_{end}_ax{axis}"
+    v = Int(name)
+    entry = (v, _and_constraints(v >= start, v < end))
+    SymbolicExpr.ARANGE_DICT[key] = entry
+    return entry
+
+
+def _lane_vars(*exprs: Any) -> list[ArithRef]:
+    """Return the lane variables that occur in z3 expressions or lists of them."""
+    found: dict[str, ArithRef] = {}
+    seen: set[int] = set()
+    stack = list(exprs)
+    while stack:
+        e = stack.pop()
+        if isinstance(e, (list, tuple)):
+            stack.extend(e)
+            continue
+        if not isinstance(e, ExprRef) or e.get_id() in seen:
+            continue
+        seen.add(e.get_id())
+        if is_const(e) and e.decl().kind() == Z3_OP_UNINTERPRETED:
+            if _LANE_VAR_NAME.fullmatch(e.decl().name()):
+                found[e.decl().name()] = cast(ArithRef, e)
+        else:
+            stack.extend(e.children())
+    return list(found.values())
+
+
+def _move_lane_axes(
+    value: Z3Expr,
+    constraints: ConstraintConjunction,
+    move: Callable[[int], int],
+) -> tuple[Z3Expr, ConstraintConjunction]:
+    """Rename lane variables after a shape op moves axis ``k`` to ``move(k)``."""
+    pairs = []
+    for var in _lane_vars(value, constraints):
+        match = _LANE_VAR_NAME.fullmatch(var.decl().name())
+        assert match is not None
+        start, end, axis = int(match[1]), int(match[2]), int(match[3] or 0)
+        new_axis = move(axis)
+        if new_axis != axis:
+            pairs.append((var, _lane_var(start, end, new_axis)[0]))
+    if not pairs:
+        return value, constraints
+
+    def rename(e: Any) -> Any:
+        if isinstance(e, list):
+            return [rename(x) for x in e]
+        if not isinstance(e, ExprRef):
+            return e
+        return substitute(e, *pairs)
+
+    return rename(value), rename(constraints)
 
 
 def _literal_int(value: Any) -> int | None:
@@ -439,8 +518,9 @@ class SymbolicExpr:
     PID1: ClassVar[ArithRef] = Int("pid_1")
     PID2: ClassVar[ArithRef] = Int("pid_2")
 
+    # (start, end, axis) -> lane variable and its range; see _lane_var.
     ARANGE_DICT: ClassVar[
-        dict[tuple[int, int], tuple[ArithRef, ConstraintConjunction]]
+        dict[tuple[int, int, int], tuple[ArithRef, ConstraintConjunction]]
     ] = {}
     _OP_CLASS_MAP: ClassVar[dict[str, type[SymbolicExpr]]] = {}
     _CONCRETE_FNS: ClassVar[dict[str, Callable[..., Any]]] = {}
@@ -1023,14 +1103,7 @@ class ArangeSymbolicExpr(SymbolicExpr):
     def _to_z3_impl(self) -> tuple[Z3Expr, ConstraintConjunction]:
         start = self.start.to_py()
         end = self.end.to_py()
-        key = (start, end)
-        if key in SymbolicExpr.ARANGE_DICT:
-            return SymbolicExpr.ARANGE_DICT[key]
-        name = f"arange_{start}_{end}"
-        v = Int(name)
-        constraints = _and_constraints(v >= start, v < end)
-        SymbolicExpr.ARANGE_DICT[key] = (v, constraints)
-        return v, constraints
+        return _lane_var(start, end, 0)
 
     def concretize(self) -> Any:
         return self.concrete_fn(
@@ -2070,9 +2143,16 @@ class ExpandDimsSymbolicExpr(SymbolicExpr):
         new_shape = arg_shape[:axis_val] + [1] + arg_shape[axis_val:]
         self.dtype = self.arg.dtype
         self.shape = tuple(new_shape)
+        self.axis_val = axis_val
 
     def _to_z3_impl(self) -> tuple[Z3Expr, ConstraintConjunction]:
-        return self.arg._to_z3()
+        value, constraints = self.arg._to_z3()
+        # Counted from the last axis, the axes left of the new one move one
+        # place further.
+        first_moved = len(self.arg.shape) - self.axis_val
+        return _move_lane_axes(
+            value, constraints, lambda k: k + 1 if k >= first_moved else k
+        )
 
     def concretize(self) -> Any:
         concrete = self.arg.concretize()
@@ -2114,7 +2194,21 @@ class ReshapeSymbolicExpr(SymbolicExpr):
         self.shape = _shape_to_tuple(shape)
 
     def _to_z3_impl(self) -> tuple[Z3Expr, ConstraintConjunction]:
-        return self.arg._to_z3()
+        value, constraints = self.arg._to_z3()
+        # A reshape that only adds or drops size-1 axes moves the others.
+        # Lanes are not tracked through one that merges or splits axes.
+        in_axes = [i for i, d in enumerate(self.arg.shape) if d != 1]
+        out_axes = [j for j, d in enumerate(self.shape) if d != 1]
+        if [self.arg.shape[i] for i in in_axes] != [self.shape[j] for j in out_axes]:
+            return value, constraints
+        in_rank, out_rank = len(self.arg.shape), len(self.shape)
+        to_out = dict(zip(in_axes, out_axes))
+
+        def move(k: int) -> int:
+            i = in_rank - 1 - k
+            return out_rank - 1 - to_out[i] if i in to_out else k
+
+        return _move_lane_axes(value, constraints, move)
 
     def concretize(self) -> Any:
         concrete = self.arg.concretize()
@@ -2137,7 +2231,16 @@ class TransSymbolicExpr(SymbolicExpr):
         self.shape = tuple(self.arg.shape[i] for i in axes) if self.arg.shape else ()
 
     def _to_z3_impl(self) -> tuple[Z3Expr, ConstraintConjunction]:
-        return self.arg._to_z3()
+        value, constraints = self.arg._to_z3()
+        rank = len(self.arg.shape)
+        # Result axis j is argument axis axes[j].
+        to_out = {i: j for j, i in enumerate(_shape_to_tuple(self.permutation))}
+
+        def move(k: int) -> int:
+            i = rank - 1 - k
+            return rank - 1 - to_out[i] if i in to_out else k
+
+        return _move_lane_axes(value, constraints, move)
 
     def concretize(self) -> Any:
         concrete = self.arg.concretize()
