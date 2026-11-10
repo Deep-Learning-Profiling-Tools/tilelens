@@ -421,3 +421,71 @@ def test_load_store_skip_enabled(_isolate_profiler_cfg):
     assert torch.allclose(
         y, torch.zeros_like(y)
     ), f"Skipped execution should leave output unchanged, got {y[:10]}"
+
+
+# ======== Fake Tensors ========
+@pytest.fixture
+def _isolate_virtual_memory():
+    """Save and restore config.virtual_memory around a test."""
+    saved = cfg.virtual_memory
+    yield
+    cfg.virtual_memory = saved
+
+
+@triton.jit
+def fake_tensor_atomic_kernel(x_ptr, counter_ptr, lock_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    tl.load(x_ptr + offsets)
+    tl.atomic_add(counter_ptr, 1.0)
+    tl.atomic_cas(lock_ptr, 0, 7)
+
+
+def test_fake_tensor_atomics_do_not_touch_memory(
+    _isolate_profiler_cfg, _isolate_virtual_memory
+):
+    """Fake tensors have no storage, so the profiler must not perform atomics through them.
+
+    On a GPU tensor, an atomic through a fake tensor dereferences a device address on the
+    host and crashes; on a CPU tensor it writes into the caller's tensor.
+    """
+    BLOCK_SIZE = 16
+    x = torch.ones(4 * BLOCK_SIZE, dtype=torch.float32)
+    counter = torch.zeros(1, dtype=torch.float32)
+    lock = torch.zeros(1, dtype=torch.int32)
+
+    cfg.virtual_memory = True
+    cfg.profiler_enable_block_sampling = False
+    cfg.profiler_disable_buffer_load_check = True
+    profiler = Profiler(disable_load_mask_percentage_check=True)
+    tilelens.trace(profiler)(fake_tensor_atomic_kernel)[(4,)](
+        x, counter, lock, BLOCK_SIZE
+    )
+
+    assert counter.item() == 0.0
+    assert lock.item() == 0
+    assert profiler.load_bytes.total_bytes_attempted == 4 * BLOCK_SIZE * 4
+
+
+@triton.jit
+def fake_tensor_copy_kernel(x_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    tl.store(y_ptr + offsets, tl.load(x_ptr + offsets).to(tl.float32))
+
+
+def test_fake_tensor_accepts_reinterpreted_tensor(
+    _isolate_profiler_cfg, _isolate_virtual_memory
+):
+    """triton.reinterpret wraps a tensor in a TensorWrapper, which reads the tensor's .data."""
+    BLOCK_SIZE = 16
+    x = torch.zeros(2 * BLOCK_SIZE, dtype=torch.uint8)
+    y = torch.zeros(2 * BLOCK_SIZE, dtype=torch.float32)
+
+    cfg.virtual_memory = True
+    cfg.profiler_enable_block_sampling = False
+    cfg.profiler_disable_buffer_load_check = True
+    profiler = Profiler(disable_load_mask_percentage_check=True)
+    x_f8 = triton.reinterpret(x, tl.float8e5)
+    tilelens.trace(profiler)(fake_tensor_copy_kernel)[(2,)](x_f8, y, BLOCK_SIZE)
+
+    assert profiler.load_bytes.total_bytes_attempted == 2 * BLOCK_SIZE
+    assert profiler.store_bytes.total_bytes_attempted == 2 * BLOCK_SIZE * 4
