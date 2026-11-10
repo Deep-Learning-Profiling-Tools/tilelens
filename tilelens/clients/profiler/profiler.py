@@ -2,7 +2,7 @@ from collections.abc import Callable
 
 from ...core.client import Client
 from ...core.callbacks import OpCallbacks, ForLoopCallbacks
-from ...core.data import Op, Load, Store, AddPtr, Dot
+from ...core.data import Op, Load, Store, AddPtr, Dot, AtomicCas, AtomicRMW
 from ...core.config import config as cfg
 from ...core.patch import LoopSite
 from .data import LoadStoreBytes
@@ -289,6 +289,20 @@ class Profiler(Client):
             # This replaces np.matmul(a_data, b_data, dtype=d.data.dtype) + d.data
             return TensorHandle(np.zeros_like(d.data), d.dtype.scalar)
 
+        def atomic_rmw_overrider(rmwOp, ptr, val, mask, sem, scope):
+            # Fake tensors have no storage: skip the access, return zeros
+            dtype_tt = ptr.get_element_ty()
+            return TensorHandle(
+                np.zeros_like(ptr.data, dtype=_get_np_dtype(dtype_tt)), dtype_tt
+            )
+
+        def atomic_cas_overrider(ptr, cmp, val, sem, scope):
+            # Fake tensors have no storage: skip the access, return zeros
+            dtype_tt = ptr.get_element_ty()
+            return TensorHandle(
+                np.zeros_like(ptr.data, dtype=_get_np_dtype(dtype_tt)), dtype_tt
+            )
+
         @self.lock_fn
         def pre_addptr_callback(ptr, offset):
             dtype_tt = ptr.get_element_ty()
@@ -326,6 +340,10 @@ class Profiler(Client):
                 return OpCallbacks(op_overrider=dot_overrider)
         elif op_type is AddPtr:
             return OpCallbacks(before_callback=pre_addptr_callback)
+        elif op_type is AtomicRMW and cfg.virtual_memory:
+            return OpCallbacks(op_overrider=atomic_rmw_overrider)
+        elif op_type is AtomicCas and cfg.virtual_memory:
+            return OpCallbacks(op_overrider=atomic_cas_overrider)
 
         return OpCallbacks()
 

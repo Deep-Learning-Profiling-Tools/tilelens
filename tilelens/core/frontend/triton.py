@@ -231,6 +231,11 @@ class FakeTensor:
     def element_size(self) -> int:
         return self._element_size
 
+    @property
+    def data(self) -> "FakeTensor":
+        # triton.reinterpret wraps tensors in a TensorWrapper, which reads .data
+        return self
+
 
 class TritonFrontend(Frontend):
     def __init__(self):
