@@ -1083,7 +1083,10 @@ def tensor_reduce(
         )
     if negate and op.bitwise:
         raise ValueError("can only negate when reducing with an arithmetic operator")
-    reduced = cast(Any, op._op).reduce(source, axis=axis_tuple, keepdims=keepdims)
+    # SDK tensor_reduce arithmetic converts inputs to FP32 before reducing;
+    # bitwise reductions retain the original integer bit pattern.
+    reduction_source = source if op.bitwise else np.asarray(source, dtype=np.float32)
+    reduced = cast(Any, op._op).reduce(reduction_source, axis=axis_tuple, keepdims=keepdims)
     if negate:
         reduced = -np.asarray(reduced)
     reduced = np.asarray(reduced)

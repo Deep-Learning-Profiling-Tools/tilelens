@@ -1089,6 +1089,17 @@ def test_tensor_reduce_documented_shape_axis_success_cases(
     _assert_tensor_equal(dst.data, expected.reshape(dst.shape))
 
 
+@pytest.mark.parametrize("shape,axis", [((1, 2), 1), ((1, 1, 2), 2)])
+def test_tensor_reduce_arithmetic_accumulates_fp16_input_in_fp32(patched_scope, shape, axis):
+    """SDK arithmetic reductions convert operands to FP32 before reduction."""
+    del patched_scope
+    src = _nd(np.array([2048.0, 1.0], dtype=np.float16).reshape(shape), buffer="sbuf")
+    dst_shape = shape[:-1] + (1,)
+    dst = b2.NDArray(shape=dst_shape, dtype=nl.float32, buffer="sbuf")
+    nisa.tensor_reduce(dst, nl.add, src, axis=axis, keepdims=True)
+    assert np.array_equal(dst.data, np.full(dst_shape, 2049.0, dtype=np.float32))
+
+
 @pytest.mark.parametrize(
     "op",
     (
