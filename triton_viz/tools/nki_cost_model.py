@@ -2772,6 +2772,7 @@ def simulate(
     *,
     routing_source_events: Iterable[dict[str, Any]] | None = None,
     routing_dtype: str | None = None,
+    use_interval_index: bool = True,
 ) -> SimulationResult:
     """Schedule trace events onto per-engine timelines with data dependencies.
 
@@ -3055,6 +3056,19 @@ def simulate(
     # share a storage id) still serialize with the correct RAW/WAR/WAW edge.
     writers: dict[int, list[tuple[float, float, float, str, int | None, float]]] = {}
     readers: dict[int, list[tuple[float, float, float, str, int | None]]] = {}
+    if use_interval_index:
+        from triton_viz.tools.nki_interval_index import IntervalHistory
+    def _history(table, key):
+        existing = table.get(key)
+        if existing is None:
+            existing = IntervalHistory() if use_interval_index else []
+            table[key] = existing
+        return existing
+    def _overlaps(table, key, lo, hi):
+        existing = table.get(key)
+        if existing is None:
+            return ()
+        return existing.overlaps(lo, hi) if use_interval_index else existing
     timeline: dict[str, list[TimelineEntry]] = {}
     engine_busy: dict[str, float] = {}
     # Runtime/setup instructions are part of Explorer's engine ACTIVE counters,
@@ -3168,7 +3182,7 @@ def simulate(
         # RAW: wait for prior writers whose range overlaps a buffer we read; a
         # reader needs the producer's result, i.e. its result-ready time.
         for key, version, _ptr, lo, hi in reads:
-            for w_lo, w_hi, _w_end, w_eng, w_version, w_ready in writers.get(key, ()):
+            for w_lo, w_hi, _w_end, w_eng, w_version, w_ready in _overlaps(writers, key, lo, hi):
                 version_matches = (
                     version is None or w_version is None or version == w_version
                 )
@@ -3180,10 +3194,10 @@ def simulate(
         # writes needs only the earlier one to have been issued and released by
         # its engine, not its result latency.
         for key, _version, _ptr, lo, hi in writes:
-            for w_lo, w_hi, w_end, w_eng, _w_version, _w_ready in writers.get(key, ()):
+            for w_lo, w_hi, w_end, w_eng, _w_version, _w_ready in _overlaps(writers, key, lo, hi):
                 if _ranges_overlap(lo, hi, w_lo, w_hi):
                     earliest = _dep(earliest, w_end, w_eng, engine)
-            for r_lo, r_hi, r_end, r_eng, _r_version in readers.get(key, ()):
+            for r_lo, r_hi, r_end, r_eng, _r_version in _overlaps(readers, key, lo, hi):
                 if _ranges_overlap(lo, hi, r_lo, r_hi):
                     earliest = _dep(earliest, r_end, r_eng, engine)
 
@@ -3222,23 +3236,28 @@ def simulate(
 
         # Publish this op's effects for downstream dependency resolution.
         for key, version, _ptr, lo, hi in reads:
-            readers.setdefault(key, []).append((lo, hi, end, engine, version))
+            _history(readers, key).append((lo, hi, end, engine, version))
         for key, version, _ptr, lo, hi in writes:
             # A new write to a range supersedes prior writers/readers that it
             # fully covers; keep only the non-overlapping history so later
             # disjoint accesses are not spuriously serialized against stale
             # entries, while overlapping history is replaced by this write.
-            writers[key] = [
-                remainder
-                for entry in writers.get(key, ())
-                for remainder in _subtract_interval(entry, lo, hi)
-            ]
-            writers[key].append((lo, hi, end, engine, version, ready))
-            readers[key] = [
-                remainder
-                for entry in readers.get(key, ())
-                for remainder in _subtract_interval(entry, lo, hi)
-            ]
+            if use_interval_index:
+                _history(writers, key).subtract(lo, hi)
+                writers[key].append((lo, hi, end, engine, version, ready))
+                _history(readers, key).subtract(lo, hi)
+            else:
+                writers[key] = [
+                    remainder
+                    for entry in writers.get(key, ())
+                    for remainder in _subtract_interval(entry, lo, hi)
+                ]
+                writers[key].append((lo, hi, end, engine, version, ready))
+                readers[key] = [
+                    remainder
+                    for entry in readers.get(key, ())
+                    for remainder in _subtract_interval(entry, lo, hi)
+                ]
         if op in ("transfer", "load", "store"):
             prior_transfer_end = max(prior_transfer_end, end)
 
