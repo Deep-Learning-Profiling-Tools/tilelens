@@ -1053,7 +1053,9 @@ def tensor_reduce(
     source = _array(data)
     axis_tuple = (axis,) if isinstance(axis, int) else tuple(axis)
     _require(
-        axis_tuple == (1,),
+        0 < len(axis_tuple) <= min(4, source.ndim - 1)
+        and all(type(a) is int for a in axis_tuple)
+        and axis_tuple == tuple(range(source.ndim - len(axis_tuple), source.ndim)),
         f"not a valid dim, received axis={axis_tuple}",
     )
     data_par, _ = _partition_and_free(source)

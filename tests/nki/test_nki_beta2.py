@@ -1068,8 +1068,12 @@ def test_tensor_tensor_rejects_documented_psum_power_dst(patched_scope):
         ((128, 1), (128, 32), 1, False),
         ((128, 1), (128, 32), [1], False),
         ((128, 1), (128, 32), (1,), False),
-        ((32, 6), (32, 5, 6), [1], False),
-        ((32, 1, 6), (32, 5, 6), [1], True),
+        ((32, 5), (32, 5, 6), [2], False),
+        ((32, 5, 1), (32, 5, 6), [2], True),
+        ((32, 1), (32, 5, 6), [1, 2], False),
+        ((32, 1, 1), (32, 5, 6), [1, 2], True),
+        ((8, 2, 3, 1), (8, 2, 3, 4), [3], True),
+        ((8, 2), (8, 2, 3, 4), [2, 3], False),
     ),
 )
 def test_tensor_reduce_documented_shape_axis_success_cases(
@@ -1116,7 +1120,7 @@ def test_tensor_reduce_rejects_documented_illegal_ops(patched_scope, op):
 
 @pytest.mark.parametrize(
     "axis",
-    ([0], [0, 1], [1, 2], [1, 2, 3], [1, 2, 3, 4], [2, 3], [1, 3]),
+    ([], [0], [0, 1], [1, 2], [1, 2, 3], [2, 3], [1, 3], [3, 3], [-1]),
 )
 def test_tensor_reduce_rejects_compiler_invalid_dims(patched_scope, axis):
     """tensor_reduce should match compiler parity for invalid reduction dims."""
@@ -1148,7 +1152,7 @@ def test_tensor_reduce_rejects_mismatch3_reshaped_destinations(
     with pytest.raises(
         ValueError, match="cannot reduce free dim of data into free dim of dst"
     ):
-        nisa.tensor_reduce(dst, nl.add, src, axis=1, keepdims=keepdims)
+        nisa.tensor_reduce(dst, nl.add, src, axis=2, keepdims=keepdims)
 
 
 @pytest.mark.parametrize(
@@ -1168,7 +1172,7 @@ def test_tensor_reduce_rejects_documented_axis_and_shape_failures(
     src = _typed_ndarray(data_shape, "float32", buffer="sbuf")
     dst = b2.NDArray(shape=dst_shape, dtype=nl.float32, buffer="sbuf")
     with pytest.raises(ValueError, match="partition|reduce|shape|128"):
-        nisa.tensor_reduce(dst, nl.add, src, axis=[1])
+        nisa.tensor_reduce(dst, nl.add, src, axis=[2] if len(data_shape)==3 else [1])
 
 
 @pytest.mark.parametrize(
