@@ -137,3 +137,28 @@ class IntervalHistory:
             self._fallback();self._slow=[(r,e) for r,e in self._slow if not (lo<=e[0] and e[1]<=hi)];return
         for n in self._nodes_overlapping(lo,hi):
             if lo<=n.entry[0] and n.entry[1]<=hi:self._root=_delete(self._root,n.key)
+
+    def pop_overlaps(self, lo, hi):
+        """Remove and return overlapping records, in their original order."""
+        if self._slow is not None or _nan(lo) or _nan(hi) or lo >= hi:
+            self._fallback()
+            selected = []
+            remaining = []
+            for rank, entry in self._slow:
+                (selected if lo < entry[1] and entry[0] < hi else remaining).append((rank, entry))
+            self._slow = remaining
+            return [entry for _, entry in selected]
+        nodes = self._nodes_overlapping(lo, hi)
+        for node in nodes:
+            self._root = _delete(self._root, node.key)
+        return [node.entry for node in nodes]
+
+    def __bool__(self):
+        return bool(self._slow) if self._slow is not None else self._root is not None
+
+    def pop_all(self):
+        """Remove and return every remaining record in original order."""
+        self._fallback()
+        entries = [entry for _, entry in self._slow]
+        self._slow = []
+        return entries

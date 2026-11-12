@@ -81,3 +81,23 @@ def test_degenerate_intervals_preserve_original_list_behavior():
     index.discard_contained(4, 6)
     entries = [e for e in entries if not (4 <= e[0] and e[1] <= 6)]
     assert index.overlaps(0, 10) == [e for e in entries if 0 < e[1] and e[0] < 10]
+
+
+def test_pop_overlaps_and_all_match_linear_for_random_histories():
+    for seed in range(50):
+        rng = random.Random(seed)
+        index = IntervalHistory()
+        entries = []
+        for step in range(500):
+            lo = rng.randrange(0, 100)
+            hi = rng.randrange(lo + 1, 120)
+            if rng.randrange(3):
+                item = (lo, hi, step)
+                entries.append(item)
+                index.append(item)
+            else:
+                expected = [entry for entry in entries if lo < entry[1] and entry[0] < hi]
+                entries = [entry for entry in entries if not (lo < entry[1] and entry[0] < hi)]
+                assert index.pop_overlaps(lo, hi) == expected
+        assert index.pop_all() == entries
+        assert index.pop_all() == []
