@@ -172,14 +172,22 @@ def build_region_ir(
 
     indegree = Counter(target for _, target in edges)
     outdegree = Counter(source for source, _ in edges)
-    last_consumer = {
-        source: max(target for edge_source, target in edges if edge_source == source)
-        for source in outdegree
-    }
-    max_live_values = max((
-        sum(source <= index < last for source, last in last_consumer.items())
-        for index in range(len(members))
-    ), default=0)
+    # Each produced value stays live from its source index through the index
+    # before its last consumer. A single edge scan plus a prefix sum gives the
+    # exact original peak without rescanning all edges and values per node.
+    last_consumer: dict[int, int] = {}
+    for source, target in edges:
+        last_consumer[source] = max(last_consumer.get(source, target), target)
+    live_changes = [0] * (len(members) + 1)
+    for source, last in last_consumer.items():
+        if source < last:
+            live_changes[source] += 1
+            live_changes[last] -= 1
+    live = 0
+    max_live_values = 0
+    for change in live_changes[:-1]:
+        live += change
+        max_live_values = max(max_live_values, live)
     depths = [0] * len(members)
     for source, target in edges:
         depths[target] = max(depths[target], depths[source] + 1)
