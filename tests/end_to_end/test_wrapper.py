@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from string import Template
 import shutil
+import pytest
+import torch
 from tilelens.wrapper import (
     SANITIZER_COMMAND,
     PROFILER_COMMAND,
@@ -328,3 +330,50 @@ def test_cli_rejects_trace_decorator(tmp_path: Path):
     assert (
         "CLI wrapper" in proc.stderr
     ), f"Expected error message about CLI wrapper conflict in stderr, got:\n{proc.stderr}"
+
+
+@pytest.mark.parametrize("command", [PROFILER_COMMAND, "triton-profiler"])
+@pytest.mark.parametrize("interpret", [False, True])
+def test_profiler_cli_device_functions(tmp_path: Path, command, interpret):
+    if not interpret and not torch.cuda.is_available():
+        pytest.skip("GPU required for profiler compilation warmup")
+
+    script = tmp_path / "device_functions.py"
+    script.write_text(
+        """import torch
+import triton
+import triton.language as tl
+
+@triton.jit(noinline=False)
+def add_one(value):
+    for _ in range(1):
+        value += 1
+    return value
+
+@triton.jit
+def load_and_add(ptr):
+    return add_one(add_one(tl.load(ptr)))
+
+@triton.jit
+def kernel(ptr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.store(ptr + offsets, load_and_add(ptr + offsets))
+
+"""
+        + f'x = torch.zeros(8, device={"cpu" if interpret else "cuda"!r})\n'
+        + "kernel[(1,)](x, BLOCK=8)\n"
+        + "torch.testing.assert_close(x, torch.full_like(x, 2))\n"
+        + 'print("device functions ok")\n',
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["TRITON_INTERPRET"] = "1" if interpret else "0"
+    env["PROFILER_DISABLE_BUFFER_LOAD_CHECK"] = "0"
+    env["PROFILER_ENABLE_LOAD_STORE_SKIPPING"] = "0"
+    proc = subprocess.run(
+        [command, str(script)], capture_output=True, text=True, env=env, timeout=60
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "device functions ok" in proc.stdout
+    assert "Total mask elements:     8" in proc.stdout
+    assert "Total for-loops detected: 1" in proc.stdout
