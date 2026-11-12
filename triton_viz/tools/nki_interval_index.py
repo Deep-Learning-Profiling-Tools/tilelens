@@ -56,6 +56,26 @@ def _merge(left,right):
     return _update(right)
 
 
+def _split(root, key):
+    """Split by (start, uid); all keys on the left are less than key."""
+    if root is None:return None,None
+    if root.key < key:
+        root.right,right=_split(root.right,key)
+        return _update(root),right
+    left,root.left=_split(root.left,key)
+    return left,_update(root)
+
+
+def _extending_beyond(root, boundary):
+    """Enumerate only intervals whose high endpoint exceeds boundary."""
+    stack=[root] if root and root.max_hi>boundary else []
+    while stack:
+        node=stack.pop()
+        if node.entry[1]>boundary:yield node
+        if node.left and node.left.max_hi>boundary:stack.append(node.left)
+        if node.right and node.right.max_hi>boundary:stack.append(node.right)
+
+
 def _delete(root,key):
     if root is None:raise KeyError(key)
     if key==root.key:return _merge(root.left,root.right)
@@ -125,11 +145,25 @@ class IntervalHistory:
                 if hi<b:fragments.append((max(a,hi),b,*rest))
                 for i,fragment in enumerate(fragments):updated.append((rank+(i,) if len(fragments)>1 else rank,fragment))
             self._slow=updated;return
-        for n in self._nodes_overlapping(lo,hi):
-            self._root=_delete(self._root,n.key);a,b,*rest=n.entry;fragments=[]
-            if a<lo:fragments.append((a,min(b,lo),*rest))
-            if hi<b:fragments.append((max(a,hi),b,*rest))
-            for i,fragment in enumerate(fragments):self._add(fragment,n.rank+(i,) if len(fragments)>1 else n.rank)
+        # Every nonempty interval starting in [lo, hi) overlaps the write.
+        # Split out this entire range at once; only intervals extending beyond
+        # hi can survive it. Earlier starts can still overlap, so preserve their
+        # left/right fragments with the same original rank semantics.
+        left,middle_and_right=_split(self._root,(lo,-math.inf))
+        middle,right=_split(middle_and_right,(hi,-math.inf))
+        self._root=left
+        prefix=self._nodes_overlapping(lo,hi)
+        fragments=[]
+        for node in prefix:
+            self._root=_delete(self._root,node.key)
+            a,b,*rest=node.entry
+            two=hi<b
+            fragments.append(((a,lo,*rest),node.rank+(0,) if two else node.rank))
+            if two:fragments.append(((hi,b,*rest),node.rank+(1,)))
+        fragments.extend(((hi,node.entry[1],*node.entry[2:]),node.rank)
+                         for node in _extending_beyond(middle,hi))
+        self._root=_merge(self._root,right)
+        for entry,rank in fragments:self._add(entry,rank)
 
     def discard_contained(self,lo,hi):
         """Discard only records completely covered by a later write."""

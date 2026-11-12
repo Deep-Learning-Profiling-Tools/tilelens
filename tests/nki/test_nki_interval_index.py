@@ -101,3 +101,20 @@ def test_pop_overlaps_and_all_match_linear_for_random_histories():
                 assert index.pop_overlaps(lo, hi) == expected
         assert index.pop_all() == entries
         assert index.pop_all() == []
+
+
+def test_bulk_subtract_keeps_nested_and_duplicate_fragments_in_original_order():
+    for seed in range(20):
+        rng = random.Random(seed)
+        entries = []
+        index = IntervalHistory()
+        for i in range(1800):
+            lo = rng.randrange(0, 100)
+            hi = rng.randrange(lo + 1, 250)
+            entry = (lo, hi, i)
+            entries.append(entry)
+            index.append(entry)
+        for lo, hi in ((50, 75), (5, 15), (120, 210), (0, 240)):
+            entries = subtract(entries, lo, hi)
+            index.subtract(lo, hi)
+            assert index.overlaps(-math.inf, math.inf) == entries
