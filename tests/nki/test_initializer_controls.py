@@ -37,3 +37,23 @@ def test_each_fill_has_distinct_observable_output(case):
 def test_reject_uncontrolled_parameters(kwargs):
     fields={'partitions':128,'width':64,'engine':'vector','split':'fit'};fields.update(kwargs)
     with pytest.raises(ValueError):FillControl(**fields)
+
+
+def test_instruction_audit_rejects_missing_extra_and_wrong_engine(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from microbench.inf2_nki.tests.initializer_controls.collect import audit_capture
+    source=tmp_path/'kernel.py';table=tmp_path/'instructions.parquet'
+    rows=[{'nki_source_location':str(source)+':'+str(6+2*i),'engine':'Vector',
+           'opcode':'MEMSET','duration_ns':20} for i in range(8)]
+    def run(items):
+        pq.write_table(pa.Table.from_pylist(items),table)
+        return audit_capture(table,source,'vector',8)
+    assert run(rows)['mean_instruction_ns']==20
+    assert run(rows[:-1])['status']=='unusable'
+    extra=dict(rows[0]);extra['engine']='GpSimd'
+    assert run(rows+[extra])['status']=='unusable'
+    wrong=[dict(r) for r in rows];wrong[0]['engine']='GpSimd'
+    assert run(wrong)['status']=='unusable'
+    wrong=[dict(r) for r in rows];wrong[0]['opcode']='COPY'
+    assert run(wrong)['status']=='unusable'
