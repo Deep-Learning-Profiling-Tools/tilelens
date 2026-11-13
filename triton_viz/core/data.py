@@ -161,6 +161,7 @@ class Dot(Op):
     output_version: int | None = None
     input_dtypes: tuple[str, ...] = ()
     output_dtype: str | None = None
+    accumulate: bool | None = None
 
     def update_intermediate(self, row: int, col: int, result: float):
         # Store only the result as a float

@@ -61,6 +61,26 @@ def test_records_to_events_has_perf_model_fields():
     assert dot["fusion_signature"] == "dot"
 
 
+def test_explicit_matmul_accumulation_is_preserved_in_trace():
+    triton_viz.clear()
+    def kernel(a,b,out):
+        x=nl.ndarray((8,4),dtype=a.dtype,buffer=nl.sbuf)
+        y=nl.ndarray((8,3),dtype=b.dtype,buffer=nl.sbuf)
+        acc=nl.ndarray((4,3),dtype=nl.float32,buffer=nl.psum)
+        z=nl.ndarray((4,3),dtype=out.dtype,buffer=nl.sbuf)
+        nisa.dma_copy(dst=x,src=a);nisa.dma_copy(dst=y,src=b)
+        nisa.nc_matmul(dst=acc,stationary=x,moving=y,accumulate=False)
+        nisa.nc_matmul(dst=acc,stationary=x,moving=y,accumulate=True)
+        nisa.tensor_copy(dst=z,src=acc);nisa.dma_copy(dst=out,src=z)
+    a=np.arange(32,dtype=np.float32).reshape(8,4)
+    b=np.arange(24,dtype=np.float32).reshape(8,3)
+    out=np.zeros((4,3),np.float32)
+    triton_viz.trace(client=Tracer(),frontend='nki_beta2')(kernel)[(1,)](a,b,out)
+    np.testing.assert_allclose(out,2*(a.T@b))
+    dots=[e for e in records_to_events(launches[-1].records) if e['op']=='dot']
+    assert [e['accumulate'] for e in dots]==[False,True]
+
+
 def test_fusion_signature_groups_only_contiguous_compute_in_one_grid():
     from triton_viz.tools.nki_trace_dump import _annotate_fusion_signature
 

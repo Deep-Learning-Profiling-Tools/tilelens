@@ -400,6 +400,7 @@ class Tracer(Client):
                     if hasattr(value, "dtype")
                 ),
                 output_dtype=str(ret.dtype) if hasattr(ret, "dtype") else None,
+                accumulate=getattr(ret, "_nki_matmul_accumulate", None),
             )
             rec.call_path = extract_user_frames(num_frames=1)
             ret._trace_record = rec

@@ -107,11 +107,17 @@ def _mark_defined(value: Any) -> None:
 def _store(dst: NDArray, value: TensorOrScalar) -> NDArray:
     """Write a computed value into a destination tensor."""
     # A later write must not retain a prior operation's companion outputs.
-    for attr in ("_nki_extra_outputs", "_nki_scalar_state", "_nki_hardware_engine", "_nki_sdk_setup"):
+    for attr in ("_nki_extra_outputs", "_nki_scalar_state", "_nki_hardware_engine", "_nki_sdk_setup", "_nki_matmul_accumulate"):
         if hasattr(dst, attr):
             delattr(dst, attr)
     dst.data[...] = _cast_value(value, dst.dtype)
     _mark_defined(dst)
+    root = dst
+    while isinstance(root._parent, NDArray):
+        root = root._parent
+    if (root.buffer == 'psum' and dst.data.shape == root.data.shape and
+            dst.data.strides == root.data.strides and dst.data_ptr() == root.data_ptr()):
+        root._nki_psum_fully_initialized = True
     return dst
 
 
@@ -285,6 +291,8 @@ class NDArray:
         self._parent_ndim = self.data.ndim if parent_ndim is None else parent_ndim
         self.partition_axis = partition_axis
         self.dtype = self.data.dtype if dtype is None else dtype
+        if self.buffer == 'psum' and self._parent is None:
+            self._nki_psum_fully_initialized = value is not None
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -594,12 +602,13 @@ def nc_matmul(
     is_stationary_onezero: bool = False,
     is_moving_onezero: bool = False,
     is_transpose: bool = False,
+    accumulate: bool | None = None,
     tile_position: tuple[int, int] | tuple[()] = (),
     tile_size: tuple[int, int] | tuple[()] = (),
     perf_mode: Any = nisa.matmul_perf_mode.none,
     name: str | None = None,
 ) -> NDArray:
-    """Compute ``dst += stationary.T @ moving``.
+    """Compute a matrix product, with explicit overwrite or accumulation.
 
     Args:
         dst: PSUM destination tensor to accumulate into.
@@ -608,6 +617,8 @@ def nc_matmul(
         is_stationary_onezero: Unused beta2 compatibility flag.
         is_moving_onezero: Unused beta2 compatibility flag.
         is_transpose: Unused beta2 compatibility flag.
+        accumulate: False overwrites dst, True adds to an initialized dst,
+            and None preserves the existing interpreter's implicit behavior.
         tile_position: Optional tile origin for documented matmul tiling.
         tile_size: Optional tile shape paired with ``tile_position``.
         perf_mode: Unused beta2 performance-mode token.
@@ -688,11 +699,19 @@ def nc_matmul(
                 start + size <= 128,
                 f"tile extent must not exceed 128, received start={start}, size={size}",
             )
-    result = stationary_value.T @ moving_value.reshape(moving_par, moving_free)
-    return _store(
-        dst,
-        np.asarray(dst.data) + _cast_value(result.reshape(dst.shape), dst.dtype),
-    )
+    _require(accumulate is None or type(accumulate) is bool,
+             f"nc_matmul accumulate must be bool or None, received {accumulate!r}")
+    if accumulate is True:
+        root = dst
+        while isinstance(root._parent, NDArray):
+            root = root._parent
+        if not getattr(root, '_nki_psum_fully_initialized', False):
+            raise RuntimeError(_ERR_UNDEFINED_USE + ': complete PSUM initialization is not known')
+    result = _cast_value((stationary_value.T @ moving_value.reshape(moving_par, moving_free)).reshape(dst.shape), dst.dtype)
+    value = result if accumulate is False else np.asarray(dst.data) + result
+    stored = _store(dst, value)
+    stored._nki_matmul_accumulate = accumulate
+    return stored
 
 
 def reciprocal(dst: NDArray, data: NDArray, name: str | None = None) -> NDArray:

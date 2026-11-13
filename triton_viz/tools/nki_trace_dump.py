@@ -556,6 +556,7 @@ def record_to_event(
             "output_version": record.output_version,
             "input_dtypes": [str(value) for value in record.input_dtypes],
             "output_dtype": record.output_dtype,
+            **({"accumulate": record.accumulate} if record.accumulate is not None else {}),
         }
 
     if isinstance(record, BinaryOp):

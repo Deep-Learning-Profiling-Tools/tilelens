@@ -734,6 +734,34 @@ def test_nc_matmul(patched_scope):
     assert np.allclose(dst.data, stationary.data.T @ moving.data)
 
 
+def test_nc_matmul_explicit_overwrite_and_accumulate(patched_scope):
+    del patched_scope
+    lhs=_nd(np.arange(12,dtype=np.float32).reshape(4,3),buffer='sbuf')
+    rhs=_nd(np.arange(8,dtype=np.float32).reshape(4,2),buffer='sbuf')
+    dst=nl.ndarray((3,2),dtype=nl.float32,buffer=nl.psum)
+    with pytest.raises(RuntimeError,match='undefined use'):
+        nisa.nc_matmul(dst,lhs,rhs,accumulate=True)
+    nisa.nc_matmul(dst,lhs,rhs,accumulate=False)
+    expected=lhs.data.T@rhs.data
+    np.testing.assert_allclose(dst.data,expected)
+    nisa.nc_matmul(dst,lhs,rhs,accumulate=True)
+    np.testing.assert_allclose(dst.data,2*expected)
+    nisa.nc_matmul(dst,lhs,rhs,accumulate=False)
+    np.testing.assert_allclose(dst.data,expected)
+    with pytest.raises(ValueError,match='accumulate must be bool or None'):
+        nisa.nc_matmul(dst,lhs,rhs,accumulate=1)
+
+
+def test_nc_matmul_accumulate_rejects_unverified_partial_psum_initialization(patched_scope):
+    del patched_scope
+    lhs=_nd(np.arange(12,dtype=np.float32).reshape(4,3),buffer='sbuf')
+    rhs=_nd(np.arange(4,dtype=np.float32).reshape(4,1),buffer='sbuf')
+    dst=nl.ndarray((3,2),dtype=nl.float32,buffer=nl.psum)
+    nisa.nc_matmul(dst[:,0:1],lhs,rhs,accumulate=False)
+    with pytest.raises(RuntimeError,match='complete PSUM initialization is not known'):
+        nisa.nc_matmul(dst[:,1:2],lhs,rhs,accumulate=True)
+
+
 def test_nc_matmul_requires_psum_dst_and_sbuf_inputs(patched_scope):
     """nc_matmul should enforce psum dst and sbuf inputs."""
     del patched_scope
