@@ -2903,8 +2903,7 @@ def simulate(
         if event.get("op") == "memory_fill":
             # Validate before optional lowering/routing can hide the event.
             # Their treatment of initializer placement is not calibrated.
-            if (model.structure_schedule is not None or model.structured_control_lowering is not None or
-                    model.whole_program_routing is not None):
+            if model.structure_schedule is not None or model.whole_program_routing is not None:
                 raise ValueError("Unpriced memory initializer: transformed scheduling is not validated")
             model.cost_ns(event)
         if event.get("op") == "compute" and event.get("api_op") in ("nc_n_gather", "iota"):
