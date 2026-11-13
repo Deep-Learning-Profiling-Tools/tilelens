@@ -145,6 +145,27 @@ def test_square_dma_transpose_is_explicitly_marked():
     assert transfer["dma_pattern"] == "transpose"
 
 
+def test_hbm_load_records_onchip_destination_stride_separately():
+    def kernel(src, out):
+        packed=nl.ndarray((128,32),dtype=src.dtype,buffer=nl.sbuf)
+        dense=nl.ndarray((128,16),dtype=src.dtype,buffer=nl.sbuf)
+        nisa.dma_copy(dst=packed[:,0:32:2],src=src)
+        nisa.dma_copy(dst=dense,src=src)
+        nisa.dma_copy(dst=out,src=dense)
+    triton_viz.clear()
+    src=np.arange(128*16,dtype=np.float32).reshape(128,16);out=np.zeros_like(src)
+    triton_viz.trace(client=Tracer(),frontend='nki_beta2')(kernel)[(1,)](src,out)
+    loads=[e for e in records_to_events(launches[-1].records)
+           if e.get('mem_src')=='hbm' and e.get('mem_dst')=='sbuf']
+    assert len(loads)==2 and np.array_equal(src,out)
+    assert loads[0]['sbuf_destination_geometry']['dma_pattern']=='strided'
+    assert loads[0]['sbuf_destination_geometry']['free_stride_items']==2
+    assert loads[1]['sbuf_destination_geometry']['dma_pattern']=='contiguous'
+    assert loads[1]['sbuf_destination_geometry']['free_stride_items']==1
+    # Existing HBM-side geometry remains unchanged.
+    assert loads[0]['free_stride_items']==loads[1]['free_stride_items']==1
+
+
 def test_masked_byte_ranges_ignore_sentinel_and_preserve_disjoint_segments():
     from triton_viz.tools.nki_trace_dump import _byte_ranges, _byte_span
 

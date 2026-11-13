@@ -519,6 +519,15 @@ def record_to_event(
             masks = np.ones(offsets.shape, dtype=bool)
             geometry = _offset_geometry(offsets, masks, src_bytes if "hbm" in mem_src else dst_bytes)
             event.update(geometry)
+        # The HBM-side geometry above does not describe the on-chip target.
+        # A contiguous HBM read may scatter into a strided SBUF view, which
+        # can lower very differently from a contiguous destination. Keep both
+        # descriptions separate; this metadata does not assign a time cost.
+        if mem_src == "hbm" and mem_dst == "sbuf":
+            dst_offsets = np.asarray(record.dst_offsets)
+            if dst_offsets.size:
+                dst_geometry = _offset_geometry(dst_offsets, np.ones(dst_offsets.shape, dtype=bool), dst_bytes)
+                event['sbuf_destination_geometry'] = dst_geometry
         event["dma_pattern"] = dma_pattern
         return event
 
