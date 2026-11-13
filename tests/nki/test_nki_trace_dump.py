@@ -79,6 +79,9 @@ def test_explicit_matmul_accumulation_is_preserved_in_trace():
     np.testing.assert_allclose(out,2*(a.T@b))
     dots=[e for e in records_to_events(launches[-1].records) if e['op']=='dot']
     assert [e['accumulate'] for e in dots]==[False,True]
+    assert len(dots[0]['input_range_lists'])==2
+    assert len(dots[1]['input_range_lists'])==3
+    assert dots[1]['input_range_lists'][-1]==dots[1]['output_range_lists'][0]
 
 
 def test_fusion_signature_groups_only_contiguous_compute_in_one_grid():

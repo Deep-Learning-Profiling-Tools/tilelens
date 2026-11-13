@@ -2188,10 +2188,16 @@ def _read_accesses(
             lo, hi = _access_range({"range": rng}, "range")
             version = versions[index] if index < len(versions) else None
             accesses.append((int(storage), int(version) if version is not None else None, int(ptr), lo, hi))
-        return accesses
-    for ptr in pointers:
-        if ptr is not None:
-            accesses.append((int(ptr), None, int(ptr), 0.0, _RANGE_INF))
+    else:
+        for ptr in pointers:
+            if ptr is not None:
+                accesses.append((int(ptr), None, int(ptr), 0.0, _RANGE_INF))
+    if event.get("op") == "dot" and event.get("accumulate") is True:
+        # Explicit accumulation consumes the old destination value as well as
+        # both matrix operands. The output version represents the new value,
+        # so it must not be used to filter the preceding writer's version.
+        accesses.extend((key, None, ptr, lo, hi)
+                        for key, _version, ptr, lo, hi in _write_accesses(event))
     return accesses
 
 

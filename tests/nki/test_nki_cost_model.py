@@ -1124,3 +1124,41 @@ def test_dma_readiness_partition_law_is_also_engine_scoped():
     event = {"op": "transfer", "partition_count": 128}
     assert model.result_ready_ns(event, "vector", 100.0) == 100.0
     assert model.result_ready_ns(event, "dma", 100.0) == 3100.0
+
+
+def test_explicit_accumulate_reads_prior_psum_result_not_new_version():
+    from triton_viz.tools.nki_cost_model import _read_accesses
+
+    class DelayedVector(CostModel):
+        def result_ready_ns(self, event, engine, duration):
+            return 100.0 if engine == 'vector' else duration
+
+    first = {'seq': 1, 'op': 'compute', 'engine': 'vector', 'api_op': 'add',
+             'scheduler_duration_override_ns': 10.0, 'output_storage': 42,
+             'output_ptr': 42, 'output_range': [0,16], 'output_version': 3}
+    dot = {'seq': 2, 'op': 'dot', 'engine': 'tensor', 'flops': 16,
+           'scheduler_duration_override_ns': 1.0,
+           'input_storages':[11,12], 'input_ptrs':[11,12],
+           'input_ranges':[[0,16],[0,16]], 'input_versions':[0,0],
+           'output_storage':42, 'output_ptr':42, 'output_range':[0,16], 'output_version':4}
+    overwrite = {**dot,'accumulate':False}
+    accumulate = {**dot,'accumulate':True}
+    assert all(read[0] != 42 for read in _read_accesses(overwrite))
+    assert (42,None,42,0.0,16.0) in _read_accesses(accumulate)
+    result_false = simulate([first,overwrite],DelayedVector())
+    result_true = simulate([first,accumulate],DelayedVector())
+    assert result_false.timeline['tensor'][0].start == pytest.approx(10.0)
+    assert result_true.timeline['tensor'][0].start == pytest.approx(100.0)
+
+
+def test_explicit_accumulation_exact_runs_use_accumulator_output_runs():
+    from triton_viz.tools.nki_cost_model import _read_accesses, _exact_runs
+    event={'op':'dot','accumulate':True,'input_storages':[11,12],
+           'input_ptrs':[11,12], 'input_ranges':[[0,16],[0,16]], 'input_versions':[0,0],
+           'output_storage':42,'output_ptr':42,'output_range':[0,100], 'output_version':5}
+    runs=[{'storage':11,'runs':[[0,16]]},{'storage':12,'runs':[[0,16]]},
+          {'storage':42,'runs':[[0,4],[96,100]]}]
+    accesses=_exact_runs(_read_accesses(event),runs)
+    assert (42,None,42,0,4) in accesses
+    assert (42,None,42,96,100) in accesses
+    assert (42,None,42,0,100) not in accesses

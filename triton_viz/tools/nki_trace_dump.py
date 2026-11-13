@@ -823,9 +823,16 @@ def records_to_events(records: Iterable[Any]) -> list[dict[str, Any]]:
                         for r in runs]
             event["input_range_lists"] = _lists(record.input_runs)
             event["output_range_lists"] = _lists(record.output_runs)
+            if isinstance(record, Dot) and record.accumulate is True:
+                # A read of the old accumulator has the same physical byte
+                # runs as the destination, even though it is not a matrix
+                # operand in the NKI source syntax.
+                event["input_range_lists"].extend(event["output_range_lists"])
         if getattr(record, "input_allocations", None) is not None:
             event["input_allocations"] = list(record.input_allocations)
             event["output_allocations"] = list(record.output_allocations)
+            if isinstance(record, Dot) and record.accumulate is True:
+                event["input_allocations"].extend(event["output_allocations"])
         site = _source_site(record)
         if site is not None:
             event["source_site"] = site
