@@ -1170,3 +1170,12 @@ def test_nc_n_gather_does_not_use_unrelated_compute_calibration():
            'input_dtypes':['float32','uint32'],'output_dtype':'float32'}
     with pytest.raises(ValueError,match='Unpriced nc_n_gather'):
         CostModel().cost_ns(event)
+
+
+def test_gather_remains_unpriced_before_optional_schedule_or_fusion():
+    event={'seq':0,'op':'compute','engine':'gpsimd','api_op':'nc_n_gather',
+           'input_shapes':[[128,512],[128,4]],'output_shapes':[[128,4]],
+           'input_dtypes':['float32','uint32'],'output_dtype':'float32',
+           'scheduler_duration_override_ns':1.0,'fusion_group':'opaque'}
+    with pytest.raises(ValueError,match='Unpriced nc_n_gather'):
+        simulate([event],CostModel())

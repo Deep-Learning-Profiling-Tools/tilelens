@@ -2816,6 +2816,12 @@ def simulate(
     """
     model = cost_model or CostModel()
     source_events = list(events)
+    # Guard the original trace before optional fusion/routing rewrites: a
+    # later aggregate must not hide an uncalibrated gather and give it a
+    # plausible-looking score derived from unrelated instructions.
+    if any(event.get("op") == "compute" and event.get("api_op") == "nc_n_gather"
+           for event in source_events):
+        raise ValueError("Unpriced nc_n_gather: independent GpSimd calibration required")
     routing_events = (
         list(routing_source_events)
         if routing_source_events is not None
