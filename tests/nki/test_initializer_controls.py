@@ -57,3 +57,14 @@ def test_instruction_audit_rejects_missing_extra_and_wrong_engine(tmp_path):
     assert run(wrong)['status']=='unusable'
     wrong=[dict(r) for r in rows];wrong[0]['opcode']='COPY'
     assert run(wrong)['status']=='unusable'
+
+
+def test_zero_validation_replaces_only_first_fill_and_expected_slice():
+    from microbench.inf2_nki.tests.initializer_controls.zero_collect import cases,source,task
+    for case in cases():
+        code=source(case)
+        assert code.count('value=0.0,')==1 and code.count('nisa.memset(')==8
+        module={};exec(task(case),module)
+        result=module['reference'](module['make_inputs'](0))
+        assert np.all(result[:case.partitions]==0)
+        assert np.all(result[case.partitions:2*case.partitions]==2)
