@@ -1,3 +1,5 @@
+import importlib
+
 import torch
 import pytest
 
@@ -421,3 +423,40 @@ def test_load_store_skip_enabled(_isolate_profiler_cfg):
     assert torch.allclose(
         y, torch.zeros_like(y)
     ), f"Skipped execution should leave output unchanged, got {y[:10]}"
+
+
+# ======== Buffer Load Check ========
+def test_buffer_load_check_without_active_driver(
+    _isolate_profiler_cfg, monkeypatch, capsys
+):
+    """The default buffer load check must not fail launches on driverless hosts."""
+    # ``triton.runtime.driver`` resolves to the DriverConfig object, not the module.
+    triton_driver = importlib.import_module("triton.runtime.driver")
+
+    def _no_driver():
+        raise RuntimeError("0 active drivers ([]). There should only be one.")
+
+    # Simulate a CPU-only host even when a GPU driver is available.
+    monkeypatch.setattr(triton_driver, "_create_driver", _no_driver)
+    monkeypatch.setattr(triton_driver.driver, "_default", None)
+    monkeypatch.setattr(triton_driver.driver, "_active", None)
+
+    N = 128
+    BLOCK_SIZE = 32
+    x = torch.ones(N, dtype=torch.float32) * 3.0
+    y = torch.zeros(N, dtype=torch.float32)
+
+    cfg.profiler_enable_load_store_skipping = False
+    cfg.profiler_enable_block_sampling = False
+    cfg.profiler_disable_buffer_load_check = False
+
+    profiler = Profiler()
+    traced_kernel = tilelens.trace(profiler)(simple_kernel)
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+    traced_kernel[grid](x, y, N, BLOCK_SIZE)
+
+    assert torch.allclose(y, torch.ones_like(y) * 6.0)
+    assert profiler.buffer_load_check_skipped_no_driver is True
+    assert profiler.disable_buffer_load_check is True
+    assert profiler.potential_buffer_load_issue_found is False
+    assert "Skipped: no active Triton driver" in capsys.readouterr().out
