@@ -1709,6 +1709,57 @@ class WholeProgramRoutingCalibration:
         return None if prediction is None else prediction[0]
 
 
+@dataclass(frozen=True)
+class InitializerCalibration:
+    """Opt-in explicit-engine SBUF fill costs inside the control geometry hull.
+
+    Caller-supplied coefficients must come from separately validated controls;
+    this class never infers a compiler-selected engine or an unknown value.
+    """
+    coefficients: dict[str, tuple[float, float, float]]
+    fit_geometries: dict[str, tuple[tuple[int, int], ...]]
+    admitted_values: frozenset[float]
+
+    @staticmethod
+    def _in_hull(point, vertices):
+        # A 2-D point is in the convex hull iff it is in a triangle of input
+        # points (including its boundary). No dependency on scipy at runtime.
+        from itertools import combinations
+        def cross(a,b,c):return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
+        for a,b,c in combinations(vertices,3):
+            if cross(a,b,c)==0:continue
+            signs=[cross(a,b,point),cross(b,c,point),cross(c,a,point)]
+            if all(v>=0 for v in signs) or all(v<=0 for v in signs):return True
+        return False
+
+    def instruction_ns(self, event):
+        fail='Unpriced memory initializer: outside independently validated SBUF fill controls'
+        engine=event.get('engine');shape=event.get('output_shape');value=event.get('fill_value')
+        if (event.get('op')!='memory_fill' or event.get('api_op')!='memset' or
+            engine not in ('vector','gpsimd') or engine not in self.coefficients or
+            event.get('output_memory')!='sbuf' or event.get('output_dtype')!='float32' or
+            event.get('output_partition_axis')!=0 or event.get('allocation_partition_axis')!=0 or
+            not isinstance(shape,list) or len(shape)!=2 or
+            any(type(x) is not int or x<=0 for x in shape) or shape[0]>128 or
+            event.get('allocation_shape')!=shape or event.get('output_storage') is None or
+            event.get('allocation_storage')!=event.get('output_storage') or
+            event.get('output_ptr')!=event.get('output_storage') or
+            event.get('output_strides')!=[shape[1],1] or
+            event.get('output_range')!=[0,shape[0]*shape[1]*4] or event.get('input_ptrs')!=[] or
+            type(value) not in (int,float) or not math.isfinite(value) or value not in self.admitted_values or
+            event.get('fusion_group') is not None or 'scheduler_duration_override_ns' in event):
+            raise ValueError(fail)
+        vertices=self.fit_geometries.get(engine,())
+        if not self._in_hull(tuple(shape),vertices):raise ValueError(fail)
+        coeff=self.coefficients[engine]
+        if len(coeff)!=3 or any(type(x) not in (int,float) or not math.isfinite(x) or x<0 for x in coeff):
+            raise ValueError('invalid initializer calibration coefficients')
+        p,f=shape
+        value_ns=coeff[0]+coeff[1]*f+coeff[2]*f*p/128.0
+        if not math.isfinite(value_ns) or value_ns<=0:raise ValueError('invalid initializer calibrated cost')
+        return value_ns
+
+
 @dataclass
 class CostModel:
     """Placeholder analytical cost model (units: nanoseconds).
@@ -1737,6 +1788,7 @@ class CostModel:
     # NkiCompute/binary/reduce events cost their lowered-instruction count times
     # the measured single-instruction cost instead of the hardcoded VectorE fit.
     compute_calibration: ComputeCalibration | None = None
+    initializer_calibration: InitializerCalibration | None = None
     # Opt-in consumer-visible instruction latency (dependent chains); None keeps the
     # initiation-interval-only behaviour byte-identical.
     instruction_latency: InstructionLatencyCalibration | None = None
@@ -1989,7 +2041,9 @@ class CostModel:
         """Return the estimated duration in ns for one trace event."""
         op = event.get("op")
         if op == "memory_fill":
-            raise ValueError("Unpriced memory initializer: independent fill calibration required")
+            if self.initializer_calibration is None:
+                raise ValueError("Unpriced memory initializer: independent fill calibration required")
+            return self.initializer_calibration.instruction_ns(event)
         if op == "compute" and event.get("api_op") in ("nc_n_gather", "iota"):
             raise ValueError(f"Unpriced {event['api_op']}: independent GpSimd calibration required")
         engine = _canonical_engine(event.get("engine", ""), op or "")
@@ -2820,6 +2874,13 @@ def simulate(
     # later aggregate must not hide an uncalibrated gather and give it a
     # plausible-looking score derived from unrelated instructions.
     for event in source_events:
+        if event.get("op") == "memory_fill":
+            # Validate before optional lowering/routing can hide the event.
+            # Their treatment of initializer placement is not calibrated.
+            if (model.structure_schedule is not None or model.structured_control_lowering is not None or
+                    model.whole_program_routing is not None):
+                raise ValueError("Unpriced memory initializer: transformed scheduling is not validated")
+            model.cost_ns(event)
         if event.get("op") == "compute" and event.get("api_op") in ("nc_n_gather", "iota"):
             raise ValueError(f"Unpriced {event['api_op']}: independent GpSimd calibration required")
     routing_events = (

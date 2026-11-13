@@ -506,6 +506,7 @@ class Tracer(Client):
                     memory_initializer=True,
                     output_memory=str(getattr(memory, "buffer", memory)),
                     output_partition_axis=output_axis,
+                    output_strides=list(ret.stride()),
                     fill_value=ret._nki_fill_value,
                 )
             mask = getattr(ret, "_nki_compute_mask", None)

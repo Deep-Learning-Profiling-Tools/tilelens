@@ -628,6 +628,8 @@ def record_to_event(
             "output_dtype": record.output_dtype,
             "output_memory": record.attrs["output_memory"],
             "output_partition_axis": record.attrs["output_partition_axis"],
+            **({"output_strides": record.attrs["output_strides"]}
+               if "output_strides" in record.attrs else {}),
             "allocation_storage": record.attrs["allocation_storage"],
             "allocation_shape": record.attrs["allocation_shape"],
             "allocation_partition_axis": record.attrs["allocation_partition_axis"],
