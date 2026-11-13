@@ -306,3 +306,23 @@ def test_nc_n_gather_trace_includes_both_data_and_dynamic_indices():
     event=next(e for e in records_to_events(launches[-1].records) if e.get('api_op')=='nc_n_gather')
     assert event['engine']=='gpsimd' and len(event['input_ptrs'])==2
     assert len(event['input_range_lists'])==2 and len(event['output_range_lists'])==1
+
+
+def test_iota_then_gather_traces_data_and_generated_indices():
+    triton_viz.clear()
+    def kernel(a,out):
+        data=nl.ndarray((2,8),dtype=a.dtype,buffer=nl.sbuf)
+        index=nl.ndarray((2,8),dtype=nl.uint32,buffer=nl.sbuf)
+        dst=nl.ndarray((2,8),dtype=out.dtype,buffer=nl.sbuf)
+        nisa.dma_copy(dst=data,src=a)
+        nisa.iota(dst=index,pattern=[[-1,8]],offset=7)
+        nisa.nc_n_gather(dst=dst,data=data,indices=index)
+        nisa.dma_copy(dst=out,src=dst)
+    a=np.arange(16,dtype=np.float32).reshape(2,8);out=np.zeros_like(a)
+    triton_viz.trace(client=Tracer(),frontend='nki_beta2')(kernel)[(1,)](a,out)
+    np.testing.assert_array_equal(out,a[:,::-1])
+    events=records_to_events(launches[-1].records)
+    iota=next(e for e in events if e.get('api_op')=='iota')
+    gather=next(e for e in events if e.get('api_op')=='nc_n_gather')
+    assert iota['engine']=='gpsimd' and not iota['input_ptrs']
+    assert gather['engine']=='gpsimd' and iota['output_ptr']==gather['input_ptrs'][1]

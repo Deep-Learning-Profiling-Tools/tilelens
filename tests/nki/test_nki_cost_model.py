@@ -1179,3 +1179,10 @@ def test_gather_remains_unpriced_before_optional_schedule_or_fusion():
            'scheduler_duration_override_ns':1.0,'fusion_group':'opaque'}
     with pytest.raises(ValueError,match='Unpriced nc_n_gather'):
         simulate([event],CostModel())
+
+
+def test_iota_never_inherits_unrelated_compute_timing():
+    event={'op':'compute','engine':'gpsimd','api_op':'iota',
+           'output_shapes':[[128,8]],'output_dtype':'uint32'}
+    with pytest.raises(ValueError,match='Unpriced iota'):
+        simulate([event],CostModel())

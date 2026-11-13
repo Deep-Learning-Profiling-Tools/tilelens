@@ -1990,8 +1990,8 @@ class CostModel:
         op = event.get("op")
         if op == "memory_fill":
             raise ValueError("Unpriced memory initializer: independent fill calibration required")
-        if op == "compute" and event.get("api_op") == "nc_n_gather":
-            raise ValueError("Unpriced nc_n_gather: independent GpSimd calibration required")
+        if op == "compute" and event.get("api_op") in ("nc_n_gather", "iota"):
+            raise ValueError(f"Unpriced {event['api_op']}: independent GpSimd calibration required")
         engine = _canonical_engine(event.get("engine", ""), op or "")
         if op == "dot":
             flops = event.get("flops") or 0
@@ -2819,9 +2819,9 @@ def simulate(
     # Guard the original trace before optional fusion/routing rewrites: a
     # later aggregate must not hide an uncalibrated gather and give it a
     # plausible-looking score derived from unrelated instructions.
-    if any(event.get("op") == "compute" and event.get("api_op") == "nc_n_gather"
-           for event in source_events):
-        raise ValueError("Unpriced nc_n_gather: independent GpSimd calibration required")
+    for event in source_events:
+        if event.get("op") == "compute" and event.get("api_op") in ("nc_n_gather", "iota"):
+            raise ValueError(f"Unpriced {event['api_op']}: independent GpSimd calibration required")
     routing_events = (
         list(routing_source_events)
         if routing_source_events is not None

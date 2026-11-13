@@ -2351,3 +2351,25 @@ def test_nc_n_gather_rejects_unsupported_or_undefined_cases(patched_scope, case)
     else:indices=b2.NDArray(shape=(2,2),dtype=nl.uint32,buffer='sbuf',origin='tensor')
     with pytest.raises((ValueError,RuntimeError)):
         nisa.nc_n_gather(dst=dst,data=data,indices=indices)
+
+
+def test_iota_generates_multidimensional_pattern_per_partition(patched_scope):
+    dst=_zeros((2,6),dtype=np.int32)
+    nisa.iota(dst=dst,pattern=[[10,2],[-2,3]],offset=5,channel_multiplier=100)
+    np.testing.assert_array_equal(dst.data,[[5,3,1,15,13,11],[105,103,101,115,113,111]])
+
+
+def test_iota_uses_int32_arithmetic_before_output_cast(patched_scope):
+    dst=_zeros((1,3),dtype=np.uint32)
+    nisa.iota(dst=dst,pattern=[[1,3]],offset=2**31-1)
+    np.testing.assert_array_equal(dst.data,[[2147483647,2147483648,2147483649]])
+
+
+@pytest.mark.parametrize('case',['wrong_size','wrong_buffer','too_many_dims','nonpositive_size'])
+def test_iota_rejects_invalid_pattern_or_buffer(patched_scope,case):
+    dst=_zeros((2,6),dtype=np.int32);pattern=[[1,6]]
+    if case=='wrong_size':pattern=[[1,5]]
+    elif case=='wrong_buffer':dst.buffer='psum'
+    elif case=='too_many_dims':pattern=[[0,1]]*5
+    else:pattern=[[1,0]]
+    with pytest.raises(ValueError):nisa.iota(dst=dst,pattern=pattern)

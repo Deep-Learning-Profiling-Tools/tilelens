@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import itertools
+import math
 from collections.abc import Callable
 from typing import Any, Optional, TypeAlias, cast
 
@@ -1145,6 +1146,45 @@ def memset(dst: NDArray, value: ScalarLike, engine: Any = nisa.engine.unknown,
 
 
 
+
+def iota(dst: NDArray, pattern: Any, offset: int = 0, channel_multiplier: int = 0,
+         name: str | None = None) -> NDArray:
+    """Generate an affine integer pattern independently in each partition."""
+    del name
+    _require(isinstance(dst, NDArray) and _buffer_name(dst) == "sbuf",
+             "iota destination must be an SBUF tile")
+    _require(len(dst.shape) >= 2 and dst.partition_axis in (None, 0),
+             "iota requires a leading partition axis")
+    p, count = _partition_and_free(dst)
+    _require(p <= 128, "iota partition dimension must not exceed 128")
+    def int32(value):
+        return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)) and -(2**31) <= int(value) < 2**31
+    _require(int32(offset) and int32(channel_multiplier), "iota offset and channel_multiplier must be int32 literals")
+    _require(isinstance(pattern, (tuple, list)) and len(pattern) <= 4,
+             "iota pattern must contain at most four dimensions")
+    dims=[]
+    for pair in pattern:
+        _require(isinstance(pair, (tuple, list)) and len(pair)==2 and int32(pair[0]) and
+                 int32(pair[1]) and int(pair[1])>0, "iota pattern requires int32 step and positive size")
+        dims.append((int(pair[0]),int(pair[1])))
+    _require(math.prod(size for _,size in dims) == count,
+             "iota pattern size must equal destination free size")
+    flat=np.arange(count,dtype=np.int64)
+    values=np.full((p,count),int(offset),dtype=np.int64)
+    values+=np.arange(p,dtype=np.int64)[:,None]*int(channel_multiplier)
+    stride=1
+    for step,size in reversed(dims):
+        values+=(flat//stride % size)[None,:]*step
+        stride*=size
+    # SDK specifies 32-bit integer arithmetic before conversion to dst dtype.
+    values=values.astype(np.uint32).view(np.int32)
+    tagged=_store(dst,values.reshape(dst.shape))
+    tagged._nki_api="iota"
+    tagged._nki_engine="gpsimd"
+    tagged._nki_inputs=()
+    return tagged
+
+
 def nc_n_gather(dst: NDArray, data: NDArray, indices: NDArray, name: str | None = None) -> NDArray:
     """Gather values independently within each SBUF partition.
 
@@ -1503,6 +1543,7 @@ def nki_patch_lang(scope: Any = None) -> None:
     set_attr(nisa, "nc_matmul", nc_matmul)
     set_attr(nisa, "nc_transpose", nc_transpose)
     set_attr(nisa, "nc_n_gather", nc_n_gather)
+    set_attr(nisa, "iota", iota)
     set_attr(nisa, "activation", activation)
     set_attr(nisa, "exponential", exponential)
     set_attr(nisa, "reciprocal", reciprocal)
@@ -1521,7 +1562,7 @@ def nki_patch_lang(scope: Any = None) -> None:
 
     if checks_enabled():
         for operation in (
-            "nc_matmul", "nc_transpose", "nc_n_gather", "activation", "exponential", "reciprocal",
+            "nc_matmul", "nc_transpose", "nc_n_gather", "iota", "activation", "exponential", "reciprocal",
             "dma_copy", "dma_transpose", "tensor_copy", "tensor_tensor",
             "tensor_reduce", "tensor_scalar",
         ):
