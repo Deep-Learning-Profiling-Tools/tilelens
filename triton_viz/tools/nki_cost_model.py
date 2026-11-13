@@ -1990,6 +1990,8 @@ class CostModel:
         op = event.get("op")
         if op == "memory_fill":
             raise ValueError("Unpriced memory initializer: independent fill calibration required")
+        if op == "compute" and event.get("api_op") == "nc_n_gather":
+            raise ValueError("Unpriced nc_n_gather: independent GpSimd calibration required")
         engine = _canonical_engine(event.get("engine", ""), op or "")
         if op == "dot":
             flops = event.get("flops") or 0

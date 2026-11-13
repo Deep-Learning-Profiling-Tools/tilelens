@@ -1144,6 +1144,43 @@ def memset(dst: NDArray, value: ScalarLike, engine: Any = nisa.engine.unknown,
     return tagged
 
 
+
+def nc_n_gather(dst: NDArray, data: NDArray, indices: NDArray, name: str | None = None) -> NDArray:
+    """Gather values independently within each SBUF partition.
+
+    The source free axes are flattened, and every uint32 index selects a
+    value in the corresponding partition. Out-of-bounds indices are rejected
+    rather than assigned a value because the hardware result is undefined.
+    """
+    del name
+    for label, tile in (("dst", dst), ("data", data), ("indices", indices)):
+        _require(isinstance(tile, NDArray) and _buffer_name(tile) == "sbuf",
+                 f"nc_n_gather {label} must be an SBUF tile")
+        _require(len(tile.shape) >= 2 and tile.partition_axis in (None, 0),
+                 f"nc_n_gather {label} requires a leading partition axis")
+    data_value, index_value = _array(data), _array(indices)
+    p, width = _partition_and_free(data_value)
+    ip, count = _partition_and_free(index_value)
+    dp, output_count = _partition_and_free(dst)
+    _require(p == ip == dp and p <= 128,
+             f"nc_n_gather partition dimensions must match and be <=128: {p}, {ip}, {dp}")
+    _require(count == output_count,
+             f"nc_n_gather index and output free sizes differ: {count} != {output_count}")
+    _require(_dtype_str(indices.dtype) == "uint32", "nc_n_gather indices must have dtype uint32")
+    _require(_dtype_str(dst.dtype) == _dtype_str(data.dtype),
+             "nc_n_gather destination and data dtypes must match")
+    _require(not np.shares_memory(dst.data, data.data) and not np.shares_memory(dst.data, indices.data),
+             "nc_n_gather aliased output is not supported by the interpreter")
+    flat_indices = index_value.reshape(p, count)
+    _require(bool(np.all(flat_indices < width)), "nc_n_gather index out of bounds")
+    gathered = np.take_along_axis(data_value.reshape(p, width), flat_indices.astype(np.intp), axis=1)
+    tagged = _store(dst, gathered.reshape(dst.shape))
+    tagged._nki_api = "nc_n_gather"
+    tagged._nki_engine = "gpsimd"
+    tagged._nki_inputs = (data, indices)
+    return tagged
+
+
 def tensor_scalar(
     dst: NDArray,
     data: NDArray,
@@ -1465,6 +1502,7 @@ def nki_patch_lang(scope: Any = None) -> None:
 
     set_attr(nisa, "nc_matmul", nc_matmul)
     set_attr(nisa, "nc_transpose", nc_transpose)
+    set_attr(nisa, "nc_n_gather", nc_n_gather)
     set_attr(nisa, "activation", activation)
     set_attr(nisa, "exponential", exponential)
     set_attr(nisa, "reciprocal", reciprocal)
@@ -1483,7 +1521,7 @@ def nki_patch_lang(scope: Any = None) -> None:
 
     if checks_enabled():
         for operation in (
-            "nc_matmul", "nc_transpose", "activation", "exponential", "reciprocal",
+            "nc_matmul", "nc_transpose", "nc_n_gather", "activation", "exponential", "reciprocal",
             "dma_copy", "dma_transpose", "tensor_copy", "tensor_tensor",
             "tensor_reduce", "tensor_scalar",
         ):

@@ -2327,3 +2327,27 @@ def test_dma_copy_contiguous_hbm_block_into_2d_tile(patched_scope):
     nisa.dma_copy(dst=back, src=dst)
     assert np.array_equal(back.data, src.data)
 
+
+
+def test_nc_n_gather_uses_per_partition_indices_and_flattens_free_axes(patched_scope):
+    data=_nd(np.arange(2*3*4,dtype=np.float32).reshape(2,3,4))
+    indices=_nd(np.array([[11,0,5],[1,8,2]],dtype=np.uint32))
+    dst=_zeros((2,3),dtype=np.float32)
+    nisa.nc_n_gather(dst=dst,data=data,indices=indices)
+    expected=np.take_along_axis(data.data.reshape(2,12),indices.data.astype(np.intp),axis=1)
+    np.testing.assert_array_equal(dst.data,expected)
+
+
+@pytest.mark.parametrize('case', ['out_of_bounds','wrong_dtype','wrong_partitions','wrong_output_dtype','wrong_buffer','undefined'])
+def test_nc_n_gather_rejects_unsupported_or_undefined_cases(patched_scope, case):
+    data=_nd(np.arange(24,dtype=np.float32).reshape(2,12))
+    indices=_nd(np.array([[0,3],[7,11]],dtype=np.uint32))
+    dst=_zeros((2,2),dtype=np.float32)
+    if case=='out_of_bounds':indices.data[0,0]=12
+    elif case=='wrong_dtype':indices=_nd(indices.data.astype(np.int32))
+    elif case=='wrong_partitions':indices=_nd(np.zeros((1,2),dtype=np.uint32))
+    elif case=='wrong_output_dtype':dst=_zeros((2,2),dtype=np.float16)
+    elif case=='wrong_buffer':data.buffer='hbm'
+    else:indices=b2.NDArray(shape=(2,2),dtype=nl.uint32,buffer='sbuf',origin='tensor')
+    with pytest.raises((ValueError,RuntimeError)):
+        nisa.nc_n_gather(dst=dst,data=data,indices=indices)

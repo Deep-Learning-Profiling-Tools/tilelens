@@ -288,3 +288,21 @@ def test_dot_input_ptrs_match_producing_transfers_and_serialize():
     dot_start = result.timeline["tensor"][0].start
     dma_end = max(e.end for e in result.timeline["dma"])
     assert dot_start >= dma_end - 1e-9
+
+
+def test_nc_n_gather_trace_includes_both_data_and_dynamic_indices():
+    triton_viz.clear()
+    def kernel(a,indices,out):
+        data=nl.ndarray((2,8),dtype=a.dtype,buffer=nl.sbuf)
+        index=nl.ndarray((2,2),dtype=nl.uint32,buffer=nl.sbuf)
+        dst=nl.ndarray((2,2),dtype=out.dtype,buffer=nl.sbuf)
+        nisa.dma_copy(dst=data,src=a);nisa.dma_copy(dst=index,src=indices)
+        nisa.nc_n_gather(dst=dst,data=data,indices=index)
+        nisa.dma_copy(dst=out,src=dst)
+    a=np.arange(16,dtype=np.float32).reshape(2,8)
+    ind=np.array([[7,0],[1,6]],dtype=np.uint32);out=np.zeros((2,2),np.float32)
+    triton_viz.trace(client=Tracer(),frontend='nki_beta2')(kernel)[(1,)](a,ind,out)
+    np.testing.assert_array_equal(out,[[7,0],[9,14]])
+    event=next(e for e in records_to_events(launches[-1].records) if e.get('api_op')=='nc_n_gather')
+    assert event['engine']=='gpsimd' and len(event['input_ptrs'])==2
+    assert len(event['input_range_lists'])==2 and len(event['output_range_lists'])==1

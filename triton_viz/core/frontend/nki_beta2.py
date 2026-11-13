@@ -93,6 +93,7 @@ if HAS_NKI_BETA2:
             "ndarray": Allocate,
             "nc_matmul": Dot,
             "nc_transpose": TensorTranspose,
+            "nc_n_gather": NkiCompute,
             "dma_copy": Transfer,
             "dma_transpose": DmaTranspose,
             "tensor_copy": Transfer,

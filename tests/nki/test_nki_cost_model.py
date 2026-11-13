@@ -1162,3 +1162,11 @@ def test_explicit_accumulation_exact_runs_use_accumulator_output_runs():
     assert (42,None,42,0,4) in accesses
     assert (42,None,42,96,100) in accesses
     assert (42,None,42,0,100) not in accesses
+
+
+def test_nc_n_gather_does_not_use_unrelated_compute_calibration():
+    event={'op':'compute','engine':'gpsimd','api_op':'nc_n_gather',
+           'input_shapes':[[128,512],[128,4]],'output_shapes':[[128,4]],
+           'input_dtypes':['float32','uint32'],'output_dtype':'float32'}
+    with pytest.raises(ValueError,match='Unpriced nc_n_gather'):
+        CostModel().cost_ns(event)
