@@ -1815,6 +1815,8 @@ class CostModel:
     # the measured single-instruction cost instead of the hardcoded VectorE fit.
     compute_calibration: ComputeCalibration | None = None
     initializer_calibration: InitializerCalibration | None = None
+    # Experimental what-if only: do not interpret as a compiler prediction.
+    full_overwrite_version_scenario: bool = False
     # Opt-in consumer-visible instruction latency (dependent chains); None keeps the
     # initiation-interval-only behaviour byte-identical.
     instruction_latency: InstructionLatencyCalibration | None = None
@@ -2908,6 +2910,14 @@ def simulate(
             model.cost_ns(event)
         if event.get("op") == "compute" and event.get("api_op") in ("nc_n_gather", "iota"):
             raise ValueError(f"Unpriced {event['api_op']}: independent GpSimd calibration required")
+    version_scenario = None
+    if model.full_overwrite_version_scenario:
+        if model.initializer_calibration is None:
+            raise ValueError("Version scenario requires initializer calibration")
+        if model.structure_schedule is not None or model.whole_program_routing is not None:
+            raise ValueError("Version scenario cannot be combined with transformed scheduling")
+        from triton_viz.tools.nki_full_overwrite_versions import apply
+        source_events, version_scenario = apply(source_events)
     routing_events = (
         list(routing_source_events)
         if routing_source_events is not None
@@ -3620,6 +3630,8 @@ def simulate(
             "final": final_ns,
         },
     )
+    if version_scenario is not None:
+        result.components_ns["hypothetical_full_overwrite_version_depth"] = float(version_scenario["depth"])
     if model.structure_schedule is not None:
         result.components_ns["structure_buffer_depth"] = float(structure_depth)
     if schedule_completion_active:
