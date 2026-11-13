@@ -837,6 +837,8 @@ def records_to_events(records: Iterable[Any]) -> list[dict[str, Any]]:
             event["output_allocations"] = list(record.output_allocations)
             if isinstance(record, Dot) and record.accumulate is True:
                 event["input_allocations"].extend(event["output_allocations"])
+        if getattr(record, "unmodeled_explicit_address", False):
+            event["unmodeled_explicit_address"] = True
         site = _source_site(record)
         if site is not None:
             event["source_site"] = site

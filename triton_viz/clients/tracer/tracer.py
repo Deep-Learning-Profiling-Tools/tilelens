@@ -113,6 +113,14 @@ class Tracer(Client):
         def post_allocate_callback(ret):
             assert hasattr(ret, "data")
             self.tensors.append(ret)
+            if self.sample and getattr(ret, "_nki_explicit_address", None) is not None:
+                # Keep the scope guard even if a later callback cannot report
+                # the manually addressed operand or the allocation is unused.
+                rec = Allocate(ptr=int(ret.data_ptr()))
+                rec.unmodeled_explicit_address = True
+                rec.call_path = extract_user_frames(num_frames=1)
+                with self._lock_context():
+                    self.records.append(rec)
 
         def _convert_keys_to_numpy(keys):
             """Convert any NDArrays in keys to numpy arrays."""
@@ -175,9 +183,19 @@ class Tracer(Client):
                 "memory": memory,
             }
 
+        def _mark_explicit_address(rec, operands):
+            for value in operands:
+                root = value
+                while getattr(root, "_parent", None) is not None:
+                    root = root._parent
+                if getattr(root, "_nki_explicit_address", None) is not None:
+                    rec.unmodeled_explicit_address = True
+                    return
+
         def _attach_runs(rec, inputs, outputs):
             # Exact byte runs of each operand view, parallel to input_ranges / output ranges
             # (used only by CostModel.exact_tile_ranges).
+            _mark_explicit_address(rec, (*inputs, *outputs))
             rec.input_runs = tuple(_runs(value) for value in inputs)
             rec.output_runs = tuple(_runs(value) for value in outputs)
             if self.allocation_metadata:
@@ -308,6 +326,7 @@ class Tracer(Client):
                 dst_partition_axis=getattr(dst, "partition_axis", None),
                 dma_pattern=str(dma_pattern),
             )
+            _mark_explicit_address(rec, (src, dst))
             if self.allocation_metadata:
                 _attach_runs(rec, (src,), (dst,))
             if src.element_size() != dst.element_size():

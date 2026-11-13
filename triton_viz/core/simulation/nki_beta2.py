@@ -488,6 +488,7 @@ def ndarray(
     *,
     buffer: BufferLike = None,
     value: Any = None,
+    address: tuple[int, int] | None = None,
 ) -> NDArray:
     """Create an interpreter tensor on the requested NKI buffer.
 
@@ -497,11 +498,18 @@ def ndarray(
         buffer: Buffer token or buffer-like object naming ``sbuf``, ``hbm``, or
             ``psum``.
         value: Optional tensor construction override for a preexisting payload.
+        address: Optional SBUF address. Storage remains virtual and aliasing is not modeled.
     """
     if not isinstance(buffer, Buffer):
         buffer = globals().get(getattr(buffer, "name", buffer or "sbuf"))
         if not isinstance(buffer, Buffer):
             raise TypeError(f"Unsupported buffer type: {type(buffer).__name__}")
+    if address is not None:
+        if (buffer.buffer != "sbuf" or not isinstance(address, tuple) or len(address) != 2
+                or any(type(part) is not int or part < 0 for part in address)):
+            raise ValueError("only nonnegative explicit SBUF address pairs are supported")
+        if value is not None:
+            raise ValueError("explicit SBUF address with value override is unsupported")
     if value is not None:
         concrete_shape, partition_axis = _normalize_shape(shape)
         return NDArray(
@@ -515,6 +523,11 @@ def ndarray(
         )
     concrete_shape, partition_axis = _normalize_shape(shape)
     tensor = buffer.view(dtype, concrete_shape, origin="tensor")
+    if address is not None:
+        # Match the SDK's NumPy simulator: keep logical storage distinct.
+        # Physical address aliasing is not modeled; tracing marks this tensor
+        # and the cost model refuses to price any operation that touches it.
+        tensor._nki_explicit_address = address
     from triton_viz.core.simulation.nki_isa_contracts import checks_enabled
 
     tensor.partition_axis = (

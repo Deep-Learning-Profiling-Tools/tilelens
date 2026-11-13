@@ -2902,6 +2902,8 @@ def simulate(
     # later aggregate must not hide an uncalibrated gather and give it a
     # plausible-looking score derived from unrelated instructions.
     for event in source_events:
+        if event.get("unmodeled_explicit_address"):
+            raise ValueError("Unpriced explicit SBUF address: physical aliasing is not modeled")
         if event.get("op") == "memory_fill":
             # Validate before optional lowering/routing can hide the event.
             # Their treatment of initializer placement is not calibrated.
