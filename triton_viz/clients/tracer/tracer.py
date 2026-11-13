@@ -480,6 +480,8 @@ class Tracer(Client):
                 compute_attrs["sdk_setup"] = ret._nki_sdk_setup
             if self.scalar_state_metadata and hasattr(ret, "_nki_scalar_state"):
                 compute_attrs["scalar_state"] = ret._nki_scalar_state
+            if ret._nki_api == "iota" and hasattr(ret, "_nki_index_generator"):
+                compute_attrs["index_generator"] = ret._nki_index_generator
             if len(outputs) > 1:
                 compute_attrs.update(
                     output_dtypes=[str(x.dtype) for x in outputs],

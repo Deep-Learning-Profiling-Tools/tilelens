@@ -2365,6 +2365,14 @@ def test_iota_uses_int32_arithmetic_before_output_cast(patched_scope):
     np.testing.assert_array_equal(dst.data,[[2147483647,2147483648,2147483649]])
 
 
+def test_iota_metadata_cleared_by_later_writes(patched_scope):
+    dst=_zeros((2,6),dtype=np.int32)
+    nisa.iota(dst=dst,pattern=[[1,6]])
+    assert dst._nki_index_generator['pattern']==[[1,6]]
+    nisa.tensor_copy(dst=dst,src=_nd(np.zeros((2,6),dtype=np.int32)))
+    assert not hasattr(dst,'_nki_index_generator')
+
+
 @pytest.mark.parametrize('case',['wrong_size','wrong_buffer','too_many_dims','nonpositive_size'])
 def test_iota_rejects_invalid_pattern_or_buffer(patched_scope,case):
     dst=_zeros((2,6),dtype=np.int32);pattern=[[1,6]]

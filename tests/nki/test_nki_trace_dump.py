@@ -325,4 +325,5 @@ def test_iota_then_gather_traces_data_and_generated_indices():
     iota=next(e for e in events if e.get('api_op')=='iota')
     gather=next(e for e in events if e.get('api_op')=='nc_n_gather')
     assert iota['engine']=='gpsimd' and not iota['input_ptrs']
+    assert iota['index_generator']=={'pattern':[[-1,8]],'offset':7,'channel_multiplier':0}
     assert gather['engine']=='gpsimd' and iota['output_ptr']==gather['input_ptrs'][1]

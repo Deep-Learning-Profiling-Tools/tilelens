@@ -108,7 +108,7 @@ def _mark_defined(value: Any) -> None:
 def _store(dst: NDArray, value: TensorOrScalar) -> NDArray:
     """Write a computed value into a destination tensor."""
     # A later write must not retain a prior operation's companion outputs.
-    for attr in ("_nki_extra_outputs", "_nki_scalar_state", "_nki_hardware_engine", "_nki_sdk_setup", "_nki_matmul_accumulate"):
+    for attr in ("_nki_extra_outputs", "_nki_scalar_state", "_nki_hardware_engine", "_nki_sdk_setup", "_nki_matmul_accumulate", "_nki_index_generator"):
         if hasattr(dst, attr):
             delattr(dst, attr)
     dst.data[...] = _cast_value(value, dst.dtype)
@@ -1182,6 +1182,8 @@ def iota(dst: NDArray, pattern: Any, offset: int = 0, channel_multiplier: int = 
     tagged._nki_api="iota"
     tagged._nki_engine="gpsimd"
     tagged._nki_inputs=()
+    tagged._nki_index_generator={"pattern":[list(pair) for pair in dims],
+                                 "offset":int(offset),"channel_multiplier":int(channel_multiplier)}
     return tagged
 
 

@@ -682,6 +682,8 @@ def record_to_event(
                if "sdk_setup" in record.attrs else {}),
             **({"scalar_state": record.attrs["scalar_state"]}
                if "scalar_state" in record.attrs else {}),
+            **({"index_generator": record.attrs["index_generator"]}
+               if "index_generator" in record.attrs else {}),
             "compute_mask_provided": bool(
                 record.attrs.get("compute_mask_provided", False)
             ),
