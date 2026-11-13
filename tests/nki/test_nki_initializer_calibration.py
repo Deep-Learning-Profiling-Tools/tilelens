@@ -73,3 +73,19 @@ def test_real_trace_carries_contiguous_geometry_and_dependency():
     assert event['output_strides']==[256,1] and np.all(out==1)
     result=simulate(events,model())
     assert result.timeline['dma'][0].start>=result.timeline['vector'][0].end
+
+
+def test_loader_checks_validation_and_engine_scope(tmp_path):
+    import json
+    shapes=[[128,64],[128,256],[128,1024],[128,4096],[32,512]]
+    entry={'coefficients':[50.0,.7,0.0],'fit_geometries':shapes,'opcode':'MEMSET',
+           'fit_validation':'passed','zero_validation':'passed'}
+    value={'schema':'nki-explicit-sbuf-fp32-initializer-v1','device':'inf2-trn1',
+           'admitted_values':list(range(9)),'engines':{'vector':entry,'gpsimd':dict(entry)},
+           'evidence_sha256':{k:'a'*64 for k in ('registration','raw','fit','zero_registration','zero_result')}}
+    path=tmp_path/'calibration.json';path.write_text(json.dumps(value))
+    calibrated=InitializerCalibration.from_json(path)
+    event=fill();event['fill_value']=0.0
+    assert calibrated.instruction_ns(event)==pytest.approx(50+.7*256)
+    value['engines']['vector']['zero_validation']='failed';path.write_text(json.dumps(value))
+    with pytest.raises(ValueError,match='invalid initializer calibration'):InitializerCalibration.from_json(path)

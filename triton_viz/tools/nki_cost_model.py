@@ -1720,6 +1720,32 @@ class InitializerCalibration:
     fit_geometries: dict[str, tuple[tuple[int, int], ...]]
     admitted_values: frozenset[float]
 
+    @classmethod
+    def from_json(cls, path):
+        value=json.loads(Path(path).read_text())
+        if (value.get('schema')!='nki-explicit-sbuf-fp32-initializer-v1' or
+            value.get('device')!='inf2-trn1' or value.get('admitted_values')!=list(range(9)) or
+            set(value.get('engines') or {})!={'vector','gpsimd'} or
+            not isinstance(value.get('evidence_sha256'),dict)):
+            raise ValueError('invalid initializer calibration schema or scope')
+        evidence=value['evidence_sha256']
+        if (set(evidence)!={'registration','raw','fit','zero_registration','zero_result'} or
+            any(not isinstance(v,str) or len(v)!=64 or any(c not in '0123456789abcdef' for c in v)
+                for v in evidence.values())):
+            raise ValueError('invalid initializer calibration evidence bindings')
+        coefficients={};geometries={}
+        for engine,row in value['engines'].items():
+            coeff=row.get('coefficients');shapes=row.get('fit_geometries')
+            if (row.get('opcode')!='MEMSET' or row.get('fit_validation')!='passed' or
+                row.get('zero_validation')!='passed' or not isinstance(coeff,list) or len(coeff)!=3 or
+                any(type(x) not in (int,float) or not math.isfinite(x) or x<0 for x in coeff) or
+                not isinstance(shapes,list) or len(shapes)!=5 or
+                any(not isinstance(s,list) or len(s)!=2 or
+                    any(type(v) is not int or v<=0 for v in s) or s[0]>128 for s in shapes)):
+                raise ValueError('invalid initializer calibration data: '+engine)
+            coefficients[engine]=tuple(coeff);geometries[engine]=tuple(tuple(s) for s in shapes)
+        return cls(coefficients,geometries,frozenset(value['admitted_values']))
+
     @staticmethod
     def _in_hull(point, vertices):
         # A 2-D point is in the convex hull iff it is in a triangle of input
