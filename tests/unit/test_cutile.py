@@ -577,3 +577,13 @@ def test_astype_accepts_rounding_mode():
     out = np.zeros(2, dtype=np.float16)
     CuTileInterpretedFunction(kernel).run(np.array([1.5, 2.25], np.float32), out)
     np.testing.assert_array_equal(out, [1.5, 2.25])
+
+
+def test_cat_rejects_mismatched_dtypes():
+    def kernel(x, y):
+        ct.cat((ct.load(x, (0,), (2,)), ct.load(y, (0,), (2,))), 0)
+
+    with pytest.raises(TypeError, match="same dtype: float32 != int32"):
+        CuTileInterpretedFunction(kernel).run(
+            np.ones(2, np.float32), np.ones(2, np.int32)
+        )

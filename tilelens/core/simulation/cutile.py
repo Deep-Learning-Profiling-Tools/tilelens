@@ -1084,6 +1084,11 @@ class Builder:
     def cat(self, tiles, /, axis):
         if len(tiles) != 2 or tiles[0].shape != tiles[1].shape:
             raise ValueError("cat requires two tiles of the same shape")
+        if tiles[0].dtype != tiles[1].dtype:
+            raise TypeError(
+                "Expected tiles to have the same dtype: "
+                f"{tiles[0].dtype} != {tiles[1].dtype}"
+            )
         return Tile(np.concatenate([_tile_value(tile) for tile in tiles], axis=axis))
 
     def mma(self, x, y, /, acc, *, use_fast_acc=False):
