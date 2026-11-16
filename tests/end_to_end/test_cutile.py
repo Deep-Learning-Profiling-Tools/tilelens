@@ -371,6 +371,24 @@ def test_concurrent_interpreted_launches_keep_their_own_records():
     assert counts == [counts[0]] * 2 and counts[0] > 200
 
 
+@ct.kernel
+def masked_out_of_range_kernel(src, gathered, scattered):
+    indices = ct.arange(8, dtype=ct.int32) - 6
+    ct.store(gathered, (0,), ct.gather(src, indices))
+    ct.scatter(scattered, indices, ct.load(gathered, (0,), (8,)))
+
+
+def test_traced_indexed_access_skips_out_of_range_lanes():
+    src = np.arange(4, dtype=np.float32)
+    gathered = np.zeros(8, dtype=np.float32)
+    scattered = np.zeros(4, dtype=np.float32)
+    tilelens.trace("tracer", frontend="cutile")(masked_out_of_range_kernel).run(
+        src, gathered, scattered
+    )
+    np.testing.assert_array_equal(gathered, [0, 0, 0, 0, 0, 0, 0, 1])
+    np.testing.assert_array_equal(scattered, [0, 1, 0, 0])
+
+
 def block_copy_kernel(src, dst):
     block = ct.bid(0)
     tile = ct.load(src, index=(block,), shape=(4,), padding_mode=ct.PaddingMode.ZERO)
