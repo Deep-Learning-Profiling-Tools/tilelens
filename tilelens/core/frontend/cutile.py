@@ -234,19 +234,22 @@ def interpreted_launches(client="tracer"):
 
     import cuda.tile as ct
     import tilelens
+    from tilelens.core.simulation.cutile import cutile_execution_lock
     from tilelens.core.trace import CuTileTrace
 
-    def launch(stream, grid, kernel, args):
+    def launch(stream, grid, kernel, args, /, *, programmatic_dependent_launch=False):
+        # The CPU interpreter runs launches in order, so dependent launch is a no-op.
         if isinstance(kernel, CuTileTrace):
-            runner = kernel
-        else:
-            # Each launch gets its own trace, so a reused tracer starts empty
-            # instead of repeating earlier launches' records.
+            return kernel.run(*args, grid=grid)
+        # Reset under the execution lock so concurrent launches sharing this
+        # tracer cannot clear or append to each other's records.
+        with cutile_execution_lock:
             records = getattr(client, "records", None)
             if isinstance(records, list):
                 records.clear()
-            runner = tilelens.trace(client, frontend="cutile")(kernel)
-        return runner.run(*args, grid=grid)
+            return tilelens.trace(client, frontend="cutile")(kernel).run(
+                *args, grid=grid
+            )
 
     # The global entry point can be shared by worker threads. Hold this guard
     # only while changing ownership; each runner serializes its own execution.

@@ -330,6 +330,47 @@ def test_interpreted_launches_keep_records_per_launch():
     np.testing.assert_array_equal(dst, src)
 
 
+def test_interpreted_launches_accept_programmatic_dependent_launch():
+    src = np.arange(4, dtype=np.float32)
+    dst = np.zeros(4, dtype=np.float32)
+    with interpreted_launches(Tracer()):
+        ct.launch(
+            None, (1,), copy_kernel, (src, dst), programmatic_dependent_launch=False
+        )
+    np.testing.assert_array_equal(dst, src)
+
+
+@ct.kernel
+def repeated_copy_kernel(src, dst):
+    for _ in range(200):
+        ct.store(dst, (0,), ct.load(src, (0,), (4,)))
+
+
+def test_concurrent_interpreted_launches_keep_their_own_records():
+    import threading
+    import time
+
+    src = np.arange(4, dtype=np.float32)
+    tracer = Tracer()
+    with interpreted_launches(tracer):
+
+        def launch():
+            ct.launch(None, (1,), repeated_copy_kernel, (src, np.zeros_like(src)))
+
+        first = threading.Thread(target=launch)
+        first.start()
+        # Start the second launch while the first one is still recording.
+        while not tracer.records:
+            time.sleep(0.0001)
+        second = threading.Thread(target=launch)
+        second.start()
+        first.join()
+        second.join()
+
+    counts = [len(launch.records) for launch in launches]
+    assert counts == [counts[0]] * 2 and counts[0] > 200
+
+
 def block_copy_kernel(src, dst):
     block = ct.bid(0)
     tile = ct.load(src, index=(block,), shape=(4,), padding_mode=ct.PaddingMode.ZERO)
