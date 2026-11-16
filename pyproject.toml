@@ -65,6 +65,9 @@ test = [
   "numpy",
   "torch",
 ]
+cutile = [
+  "cuda-tile>=1.0.0,<2",
+]
 nki = [
   "neuronx-cc==2.22.12471.0+b4a00d10; python_version < '3.13'",
   "nki==0.2.0+g82fdb402; python_version < '3.13'"
