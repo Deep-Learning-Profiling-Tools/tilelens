@@ -1,6 +1,7 @@
 """Tests for cuTile values and operations."""
 
 import builtins
+import inspect
 import operator
 
 import numpy as np
@@ -515,3 +516,64 @@ def test_computed_tiles_stay_immutable():
     for result in (x + x, x < x, cutile_builder.exp(x)):
         with pytest.raises(ValueError):
             result.data[0] = 0
+
+
+def test_builder_accepts_cutile_keyword_arguments():
+    from tilelens.core.simulation.cutile import _LANG_SIGNATURES
+
+    kinds = inspect.Parameter
+    for name, signature in _LANG_SIGNATURES.items():
+        method = getattr(cutile_builder, name, None)
+        if method is None:
+            continue
+        parameters = inspect.signature(method).parameters
+        if any(p.kind is kinds.VAR_KEYWORD for p in parameters.values()):
+            continue
+        keywords = [
+            p.name
+            for p in signature.parameters.values()
+            if p.kind in (kinds.POSITIONAL_OR_KEYWORD, kinds.KEYWORD_ONLY)
+        ]
+        # Every keyword cuda.tile documents must reach the interpreter.
+        assert set(keywords) <= set(parameters), name
+
+
+@pytest.mark.skipif(
+    "propagate_nan" not in inspect.signature(ct.max).parameters,
+    reason="propagate_nan needs a newer cuda-tile",
+)
+@pytest.mark.parametrize(
+    "call, expected",
+    [
+        (lambda t: ct.max(t, propagate_nan=True), [np.nan]),
+        (lambda t: ct.min(t, propagate_nan=True), [np.nan]),
+        (lambda t: ct.max(t), [1.0]),
+        (lambda t: ct.maximum(t, 0.0, propagate_nan=True), [1.0, np.nan]),
+        (lambda t: ct.minimum(t, 0.0, propagate_nan=True), [0.0, np.nan]),
+        (lambda t: ct.maximum(t, 0.0), [1.0, 0.0]),
+        (lambda t: ct.argmax(t, propagate_nan=True), [1]),
+        (lambda t: ct.argmin(t, propagate_nan=True), [1]),
+        (lambda t: ct.argmax(t), [0]),
+    ],
+)
+def test_propagate_nan(call, expected):
+    def kernel(x, out):
+        result = call(ct.load(x, (0,), (2,)))
+        ct.store(out, (0,), ct.reshape(result, (len(expected),)))
+
+    dtype = np.int32 if isinstance(expected[0], int) else np.float32
+    out = np.zeros(len(expected), dtype=dtype)
+    CuTileInterpretedFunction(kernel).run(np.array([1.0, np.nan], np.float32), out)
+    np.testing.assert_array_equal(out, expected)
+
+
+def test_astype_accepts_rounding_mode():
+    def kernel(x, out):
+        tile = ct.load(x, (0,), (2,))
+        ct.store(
+            out, (0,), ct.astype(tile, ct.float16, rounding_mode=ct.RoundingMode.RN)
+        )
+
+    out = np.zeros(2, dtype=np.float16)
+    CuTileInterpretedFunction(kernel).run(np.array([1.5, 2.25], np.float32), out)
+    np.testing.assert_array_equal(out, [1.5, 2.25])

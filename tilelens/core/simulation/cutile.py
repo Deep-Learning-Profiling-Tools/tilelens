@@ -905,7 +905,8 @@ class Builder:
             x.dtype if isinstance(x, Tile) else None,
         )
 
-    def astype(self, x, dtype, /):
+    def astype(self, x, dtype, /, *, rounding_mode=None):
+        # The language wrapper validates rounding_mode; RN is NumPy's rounding.
         value, target = _tile_value(x), _numpy_dtype(dtype)
         if _is_float(value.dtype) and target.kind in "iu":
             bounds = np.iinfo(target)
@@ -997,11 +998,11 @@ class Builder:
         x, y, dtype = _binary_values(x, y)
         return Tile(np.where(_tile_value(condition), x, y).astype(dtype))
 
-    def maximum(self, x, y, /, **kwargs):
-        return self._binary(x, y, np.fmax)
+    def maximum(self, x, y, /, *, flush_to_zero=False, propagate_nan=False):
+        return self._binary(x, y, np.maximum if propagate_nan else np.fmax)
 
-    def minimum(self, x, y, /, **kwargs):
-        return self._binary(x, y, np.fmin)
+    def minimum(self, x, y, /, *, flush_to_zero=False, propagate_nan=False):
+        return self._binary(x, y, np.minimum if propagate_nan else np.fmin)
 
     @staticmethod
     def _unary(x, operation):
@@ -1030,23 +1031,39 @@ class Builder:
     def rsqrt(self, x, /, **kwargs):
         return self._unary(x, lambda value: 1 / np.sqrt(value))
 
-    def max(self, x, /, axis=None, *, keepdims=False, **kwargs):
+    def max(
+        self,
+        x,
+        /,
+        axis=None,
+        *,
+        keepdims=False,
+        flush_to_zero=False,
+        propagate_nan=False,
+    ):
         value = _tile_value(x)
         if value.dtype == np.dtype(np.bool_):
             value = value.astype(np.int32)
-        return Tile(np.fmax.reduce(value, axis=axis, keepdims=keepdims))
+        operation = np.maximum if propagate_nan else np.fmax
+        return Tile(operation.reduce(value, axis=axis, keepdims=keepdims))
 
-    def argmax(self, x, /, axis=None, *, keepdims=False):
-        return self._arg_reduce(x, axis, keepdims, maximum=True)
+    def argmax(self, x, /, axis=None, *, keepdims=False, propagate_nan=False):
+        return self._arg_reduce(x, axis, keepdims, propagate_nan, maximum=True)
 
     @staticmethod
-    def _arg_reduce(x, axis, keepdims, *, maximum):
+    def _arg_reduce(x, axis, keepdims, propagate_nan, *, maximum):
         value = _tile_value(x)
         if _is_low_precision(value.dtype):
             value = value.astype(np.float32)
-        operation = np.fmax if maximum else np.fmin
+        if propagate_nan:
+            operation = np.maximum if maximum else np.minimum
+        else:
+            operation = np.fmax if maximum else np.fmin
         extremum = operation.reduce(value, axis=axis, keepdims=True)
         matches = value == extremum
+        if propagate_nan and value.dtype.kind == "f":
+            # A NaN extremum selects the first NaN lane.
+            matches |= np.isnan(value) & np.isnan(extremum)
         if axis is None:
             result = np.argmax(matches.reshape(-1))
             if keepdims:
@@ -1464,7 +1481,16 @@ class Builder:
             raise ValueError("Repeated reduction axis")
         return axes
 
-    def min(self, x, /, axis=None, *, keepdims=False, flush_to_zero=False):
+    def min(
+        self,
+        x,
+        /,
+        axis=None,
+        *,
+        keepdims=False,
+        flush_to_zero=False,
+        propagate_nan=False,
+    ):
         self._check_cpu_math_options(flush_to_zero=flush_to_zero)
         if not isinstance(keepdims, bool):
             raise TypeError("keepdims must be a constant bool")
@@ -1475,8 +1501,9 @@ class Builder:
             raise TypeError("min requires a numeric tile")
         dtype = value.dtype
         compute = value.astype(np.float32) if _is_low_precision(dtype) else value
-        # cuTile MinF uses propagate_nan=False, unlike np.min.
-        result = np.fmin.reduce(
+        # cuTile MinF defaults to propagate_nan=False, unlike np.min.
+        operation = np.minimum if propagate_nan else np.fmin
+        result = operation.reduce(
             compute, axis=self._reduction_axes(axis, value.ndim), keepdims=keepdims
         )
         return Tile(np.asarray(result, dtype=dtype))
@@ -1505,8 +1532,8 @@ class Builder:
             result = self.reduce(result, a, operator.mul, 1, keepdims=keepdims)
         return result
 
-    def argmin(self, x, /, axis=None, *, keepdims=False):
-        return self._arg_reduce(x, axis, keepdims, maximum=False)
+    def argmin(self, x, /, axis=None, *, keepdims=False, propagate_nan=False):
+        return self._arg_reduce(x, axis, keepdims, propagate_nan, maximum=False)
 
     def cumprod(
         self, x, /, axis=0, *, reverse=False, rounding_mode=None, flush_to_zero=False
