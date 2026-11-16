@@ -2148,6 +2148,11 @@ def _execution_scope(fn):
             # through values the static scan cannot see, patching them on call.
             class InterpreterMode(DispatchMode):
                 def call_tile_function_from_host(self, func, args, kwargs):
+                    # cuTile ops reached through tuples, class attributes, or
+                    # default arguments; their stubs have empty bodies.
+                    operation = originals.get(id(func))
+                    if operation is not None:
+                        return _language_operation(operation)(*args, **kwargs)
                     function = inspect.unwrap(func)
                     patch_function(function)
                     return function(*args, **kwargs)

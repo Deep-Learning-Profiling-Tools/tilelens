@@ -587,3 +587,39 @@ def test_cat_rejects_mismatched_dtypes():
         CuTileInterpretedFunction(kernel).run(
             np.ones(2, np.float32), np.ones(2, np.int32)
         )
+
+
+OPERATIONS = (ct.exp, ct.store)
+
+
+class _Operations:
+    exp = ct.exp
+    store = ct.store
+
+
+def _store_with_default(out, tile, op=ct.store):
+    op(out, (0,), tile)
+
+
+def _exp_with_default(tile, op=ct.exp):
+    return op(tile)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        lambda t, out: OPERATIONS[1](out, (0,), OPERATIONS[0](t)),
+        lambda t, out: _Operations.store(out, (0,), _Operations.exp(t)),
+        lambda t, out: _store_with_default(out, ct.exp(t)),
+        lambda t, out: ct.store(out, (0,), _exp_with_default(t)),
+    ],
+    ids=["tuple", "class", "default_store", "default_exp"],
+)
+def test_operations_reached_through_references(body):
+    def kernel(x, out):
+        body(ct.load(x, (0,), (2,)), out)
+
+    x = np.array([0.0, 1.0], np.float32)
+    out = np.zeros(2, np.float32)
+    CuTileInterpretedFunction(kernel).run(x, out)
+    np.testing.assert_allclose(out, np.exp(x), rtol=1e-6)
