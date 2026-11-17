@@ -565,7 +565,7 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
             expr_signature = hash(("expr", expr.signature()))
             if expr_signature in self.access_check_cache:
                 return
-            z3_addr, z3_constraints = expr.eval()
+            z3_addr, z3_constraints = self._bind_loop_indices(expr, *expr.eval())
             z3_signature = hash(("z3", _make_signature(z3_addr, z3_constraints)))
             if z3_signature in self.access_check_cache:
                 self.access_check_cache.add(expr_signature)
@@ -575,26 +575,21 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
             self._check_range_satisfiable(z3_addr, z3_constraints, expr)
             return
 
-        z3_addr, z3_constraints = expr.eval()
+        z3_addr, z3_constraints = self._bind_loop_indices(expr, *expr.eval())
         ctx = self.loop_stack[-1]
         signature = _make_signature(z3_addr, z3_constraints)
-        pending_idx = ctx.signature_cache.get(signature)
-        if pending_idx is None:
-            # Capture source location now while we're still in the user's tl.load/tl.store call.
-            # This is a lightweight operation that only traverses frame objects.
-            # The actual source line will be read later only if an error is detected.
-            source_location = capture_current_source_location()
-            ctx.signature_cache[signature] = len(ctx.pending_checks)
-            pending_check = PendingCheck(
+        # The source location is captured now, while we're still in the user's
+        # tl.load/tl.store call. This only traverses frame objects; the source
+        # line is read later, and only if an error is detected.
+        ctx.defer(
+            signature,
+            lambda: PendingCheck(
                 symbolic_expr=expr,
                 addr_expr=z3_addr,
                 constraints=z3_constraints,
-                source_location=source_location,
-            )
-            ctx.pending_checks.append(pending_check)
-        else:
-            if cfg.verbose:
-                print(f"[{self.LOG_TAG}]  ↪ skip duplicated addr in loop")
+                source_location=capture_current_source_location(),
+            ),
+        )
 
     def _process_pending_check(
         self,
