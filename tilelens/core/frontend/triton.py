@@ -986,6 +986,10 @@ class TritonFrontend(Frontend):
             grid_executor.fn(**call_args)
             return client_manager.post_run_callback(grid_executor.fn)
 
+        if max_workers == 0:
+            # An empty grid runs no blocks, as in Triton.
+            return
+
         if max_workers == 1:
             for x in range(grid[0]):
                 for y in range(grid[1]):

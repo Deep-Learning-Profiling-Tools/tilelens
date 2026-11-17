@@ -167,6 +167,20 @@ def test_tracer_records_are_thread_safe(two_sms):
     assert seen == {(i, 0, 0) for i in range(32)}
 
 
+@pytest.mark.parametrize("num_sms", [1, 2])
+@pytest.mark.parametrize("client", ["tracer", "sanitizer", "race_detector"])
+def test_empty_grid_runs_no_blocks(num_sms, client):
+    """A launch whose grid is empty runs no blocks, as in Triton."""
+    previous = tilelens.config.num_sms
+    tilelens.config.num_sms = num_sms
+    try:
+        out = torch.zeros((4,), dtype=torch.float32)
+        tilelens.trace(client)(_write_pid.fn)[(0,)](out)
+    finally:
+        tilelens.config.num_sms = previous
+    assert torch.equal(out, torch.zeros((4,), dtype=torch.float32))
+
+
 def test_sanitizer_handles_concurrent_blocks(two_sms):
     """Sanitizer should complete and report no OOB even when blocks run concurrently."""
     x = torch.tensor(3.0)
