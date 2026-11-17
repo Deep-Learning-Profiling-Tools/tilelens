@@ -183,6 +183,16 @@ def _range_to_iterator_constraint(
     return And(bounds, (var - start) % abs_step == 0)
 
 
+def _trunc_divide(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Divide like Triton's integer ``//``, which rounds toward zero."""
+    quotient = np.floor_divide(lhs, rhs)
+    if np.issubdtype(np.result_type(lhs, rhs), np.integer):
+        # floor is one below the truncated quotient when the division is
+        # inexact and the signs differ.
+        quotient = quotient + ((quotient * rhs != lhs) & ((lhs < 0) != (rhs < 0)))
+    return quotient
+
+
 def _literal_int(value: Any) -> int | None:
     if isinstance(value, SymbolicExpr):
         if value.op != "const":
@@ -1223,7 +1233,7 @@ class BinarySymbolicExpr(SymbolicExpr):
         if self.concrete_fn is None:
             if self.op == "idiv":
                 return self._to_tensor_value(
-                    np.floor_divide(lhs_concrete.data, rhs_concrete.data)
+                    _trunc_divide(lhs_concrete.data, rhs_concrete.data)
                 )
             if self.op == "ashr":
                 return self._to_tensor_value(
@@ -1291,11 +1301,26 @@ class BinarySymbolicExpr(SymbolicExpr):
     def _op_mul(self, lhs, rhs):
         return self._apply_binop(lambda a, b: a * b, lhs, rhs)
 
+    def _is_unsigned(self) -> bool:
+        np_dtype = getattr(self.dtype, "np_dtype", None)
+        return np_dtype is not None and np.dtype(np_dtype).kind in "ub"
+
+    @staticmethod
+    def _trunc_div(a, b):
+        # Z3's integer division is Euclidean (it rounds down for b > 0), but
+        # Triton's signed `//` rounds toward zero: -63 // 64 == 0.
+        return If(a >= 0, a / b, -((-a) / b))
+
     def _op_idiv(self, lhs, rhs):
-        return self._apply_binop(lambda a, b: a / b, lhs, rhs)
+        if self._is_unsigned():
+            return self._apply_binop(lambda a, b: a / b, lhs, rhs)
+        return self._apply_binop(self._trunc_div, lhs, rhs)
 
     def _op_mod(self, lhs, rhs):
-        return self._apply_binop(lambda a, b: a % b, lhs, rhs)
+        if self._is_unsigned():
+            return self._apply_binop(lambda a, b: a % b, lhs, rhs)
+        # Triton's signed `%` takes the sign of the dividend: -63 % 64 == -63.
+        return self._apply_binop(lambda a, b: a - b * self._trunc_div(a, b), lhs, rhs)
 
     def _op_less(self, lhs, rhs):
         return self._apply_binop(lambda a, b: a < b, lhs, rhs)

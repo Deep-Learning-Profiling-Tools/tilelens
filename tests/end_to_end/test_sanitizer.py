@@ -1615,3 +1615,58 @@ def test_strided_view_warns_on_large_numel(_isolate_per_element_threshold):
 
     # Warning path must not change correctness -- no OOB with correct mask.
     assert len(strided_view_sanitizer.records) == 0
+
+
+# ======== Signed Integer Division ===========
+
+
+signed_division_sanitizer = SymbolicSanitizer(abort_on_error=False)
+
+
+@tilelens.trace(client=signed_division_sanitizer)
+@triton.jit
+def signed_div_window_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    lo = (pid * BLOCK - (BLOCK - 1)) // BLOCK * BLOCK
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr + pid * BLOCK + offs, tl.load(x_ptr + lo + offs))
+
+
+@tilelens.trace(client=signed_division_sanitizer)
+@triton.jit
+def signed_mod_index_kernel(x_ptr, out_ptr, N: tl.constexpr):
+    pid = tl.program_id(0)
+    tl.store(out_ptr + pid, tl.load(x_ptr + (pid - 1) % N))
+
+
+def test_signed_division_rounds_toward_zero():
+    """
+    lo = (pid * BLOCK - (BLOCK - 1)) // BLOCK * BLOCK is 0 for pid 0 in
+    Triton, which truncates; flooring would give -BLOCK.
+
+    Setup: 2 blocks of 8, x holds 16 elements; block 0 loads x[0:8] and
+    block 1 loads x[0:8].
+    """
+    signed_division_sanitizer.records.clear()
+
+    x = torch.zeros((16,), dtype=torch.float32)
+    out = torch.empty((16,), dtype=torch.float32)
+    signed_div_window_kernel[(2,)](x, out, BLOCK=8)
+
+    assert signed_division_sanitizer.records == []
+
+
+def test_signed_modulo_keeps_the_sign_of_the_dividend():
+    """
+    (pid - 1) % N is -1 for pid 0 in Triton, so block 0 loads x[-1];
+    a non-negative remainder would give N - 1.
+
+    Setup: N = 4, 4 blocks, x holds 4 elements.
+    """
+    signed_division_sanitizer.records.clear()
+
+    x = torch.zeros((4,), dtype=torch.float32)
+    out = torch.empty((4,), dtype=torch.float32)
+    signed_mod_index_kernel[(4,)](x, out, N=4)
+
+    assert len(signed_division_sanitizer.records) > 0, "Expected OOB to be detected"
