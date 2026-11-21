@@ -58,7 +58,7 @@ def sanitizer_only(assert_outputs):
 def _new_sanitizer():
     pytest.importorskip("tilelens")
     sanitizer_mod = pytest.importorskip("tilelens.clients.sanitizer.sanitizer")
-    return sanitizer_mod.SymbolicSanitizer(abort_on_error=True)
+    return sanitizer_mod.SymbolicSanitizer()
 
 
 def _trace_kernel(monkeypatch, module, name, sanitizer):

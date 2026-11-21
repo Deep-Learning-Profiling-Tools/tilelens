@@ -14,7 +14,7 @@ from tilelens.clients.sanitizer.sanitizer import SymbolicSanitizer
 
 from .loop_site_cross_file_helper import inner_store_helper
 
-cross_file_loop_sanitizer = SymbolicSanitizer(abort_on_error=False)
+cross_file_loop_sanitizer = SymbolicSanitizer()
 
 
 @tilelens.trace(client=cross_file_loop_sanitizer)

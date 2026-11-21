@@ -60,17 +60,17 @@ def _timeout_handler(signum, frame):
 # Sanitizer instances (one per kernel, following test_sanitizer.py pattern)
 # ---------------------------------------------------------------------------
 
-gemm_sanitizer = SymbolicSanitizer(abort_on_error=False)
-gemm_oob_sanitizer = SymbolicSanitizer(abort_on_error=False)
-indirect_sanitizer = SymbolicSanitizer(abort_on_error=False)
-nested_sanitizer = SymbolicSanitizer(abort_on_error=False)
-block_ptr_sanitizer = SymbolicSanitizer(abort_on_error=False)
-jsd_sanitizer = SymbolicSanitizer(abort_on_error=False)
-element_mul_sanitizer = SymbolicSanitizer(abort_on_error=False)
-flaggems_sanitizer = SymbolicSanitizer(abort_on_error=False)
-swiglu_fwd_sanitizer = SymbolicSanitizer(abort_on_error=False)
-swiglu_bwd_sanitizer = SymbolicSanitizer(abort_on_error=False)
-cross_entropy_sanitizer = SymbolicSanitizer(abort_on_error=False)
+gemm_sanitizer = SymbolicSanitizer()
+gemm_oob_sanitizer = SymbolicSanitizer()
+indirect_sanitizer = SymbolicSanitizer()
+nested_sanitizer = SymbolicSanitizer()
+block_ptr_sanitizer = SymbolicSanitizer()
+jsd_sanitizer = SymbolicSanitizer()
+element_mul_sanitizer = SymbolicSanitizer()
+flaggems_sanitizer = SymbolicSanitizer()
+swiglu_fwd_sanitizer = SymbolicSanitizer()
+swiglu_bwd_sanitizer = SymbolicSanitizer()
+cross_entropy_sanitizer = SymbolicSanitizer()
 
 # ---------------------------------------------------------------------------
 # Kernels

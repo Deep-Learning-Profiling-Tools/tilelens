@@ -794,7 +794,7 @@ def test_gluon_trace_runs_copy_scalar_kernel():
 
 
 def test_gluon_sanitizer_allows_in_bounds_kernel():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     kernel = tilelens.trace(
         client=sanitizer,
         frontend="gluon",
@@ -810,7 +810,7 @@ def test_gluon_sanitizer_allows_in_bounds_kernel():
 
 def test_gluon_sanitizer_reports_real_oob_load_kernel(monkeypatch):
     monkeypatch.setattr(knobs.compilation, "always_compile", True)
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     kernel = tilelens.trace(
         client=sanitizer,
         frontend="gluon",
@@ -831,7 +831,7 @@ def test_gluon_sanitizer_reports_real_oob_load_kernel(monkeypatch):
 
 
 def test_gluon_sanitizer_allows_masked_in_bounds_kernel():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     kernel = tilelens.trace(
         client=sanitizer,
         frontend="gluon",
@@ -1223,8 +1223,7 @@ def test_gluon_tma_oob_example_reports(capsys):
     gluon_tma_oob = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gluon_tma_oob)
 
-    with pytest.raises(SystemExit):
-        gluon_tma_oob.run()
+    gluon_tma_oob.run()
 
     output = capsys.readouterr().out
     assert "ILLEGAL MEMORY ACCESS" in output

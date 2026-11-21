@@ -1042,6 +1042,9 @@ class IndirectSymbolicExprBase(SymbolicExpr):
     ptr: SymbolicExpr
     mask: SymbolicExpr | None
     other: SymbolicExpr | None
+    # Set by the creating client: maps concrete addresses to the lanes a
+    # concretized load may read. The client owns the policy.
+    lane_filter: Callable[[np.ndarray], np.ndarray] | None = None
 
     def _to_z3_impl(self) -> tuple[Z3Expr, ConstraintConjunction]:
         ptr_expr = self.ptr
@@ -1061,6 +1064,11 @@ class IndirectSymbolicExprBase(SymbolicExpr):
             )
         else:
             mask_concrete = self.mask.concretize()
+        if self.lane_filter is not None:
+            mask_concrete = SymbolicTensorValue(
+                np.logical_and(mask_concrete.data, self.lane_filter(ptr_concrete.data)),
+                INT1,
+            )
 
         if self.other is None:
             other_concrete = None

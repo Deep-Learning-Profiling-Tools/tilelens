@@ -81,14 +81,14 @@ def test_pre_run_callback_cache_hit_on_replay(_isolate_fn_symbolic_cache):
     def kernel():
         pass
 
-    first = SymbolicSanitizer(abort_on_error=False)
+    first = SymbolicSanitizer()
     _populate_for_launch(first, (2, 1, 1))
     assert first.pre_run_callback(kernel) is True
     # pre_run_callback clears the cache after hashing, matching production flow.
     assert first.cache_grid is None and first.cache_args == []
     assert len(_isolate_fn_symbolic_cache) == 1
 
-    second = SymbolicSanitizer(abort_on_error=False)
+    second = SymbolicSanitizer()
     _populate_for_launch(second, (2, 1, 1))
     assert second.pre_run_callback(kernel) is False
     assert len(_isolate_fn_symbolic_cache) == 1
@@ -100,11 +100,11 @@ def test_pre_run_callback_cache_miss_on_grid_change(_isolate_fn_symbolic_cache):
     def kernel():
         pass
 
-    a = SymbolicSanitizer(abort_on_error=False)
+    a = SymbolicSanitizer()
     _populate_for_launch(a, (2, 1, 1))
     assert a.pre_run_callback(kernel) is True
 
-    b = SymbolicSanitizer(abort_on_error=False)
+    b = SymbolicSanitizer()
     _populate_for_launch(b, (4, 1, 1))
     assert b.pre_run_callback(kernel) is True
     assert len(_isolate_fn_symbolic_cache) == 2
@@ -114,7 +114,7 @@ def test_post_run_callback_preserves_state_mid_full_grid():
     """When need_full_grid=True and we're NOT on the last block, launch state
     (tensors / tensor_addrs / tensor_names / cache_*) must survive
     post_run_callback so later blocks still see registered tensors."""
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
 
     # Simulate state populated during arg_callback + grid_callback.
     sentinel_tensor = object()
@@ -140,7 +140,7 @@ def test_post_run_callback_preserves_state_mid_full_grid():
 
 def test_post_run_callback_clears_state_on_last_block():
     """On the final block we DO want launch state cleared."""
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
 
     sentinel_tensor = object()
     sanitizer.tensors.append(cast(object, sentinel_tensor))  # type: ignore[arg-type]
@@ -181,7 +181,7 @@ def _make_concrete_ptr_and_mask(
 
 
 def test_concrete_ptr_access_respects_masked_lanes_for_load_and_store():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty(4, dtype=torch.int32)
     base = tensor.data_ptr()
     end = base + tensor.numel() * tensor.element_size() - 1
@@ -220,7 +220,7 @@ def test_concrete_ptr_access_respects_masked_lanes_for_load_and_store():
 
 
 def test_concrete_ptr_router_uses_symbolic_path_inside_loops():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty(4, dtype=torch.int32)
     base = tensor.data_ptr()
     end = base + tensor.numel() * tensor.element_size() - 1
@@ -251,7 +251,7 @@ class _HostTensorDescriptor:
 
 
 def test_symbolic_tensor_descriptor_access_reports_block_oob():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty((4, 4), dtype=torch.int32)
     desc = _HostTensorDescriptor(
         tensor,
@@ -276,7 +276,7 @@ def test_symbolic_tensor_descriptor_access_reports_block_oob():
 
 
 def test_tensor_descriptor_access_record_reports_block_oob():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty((4, 4), dtype=torch.int32)
     desc = _HostTensorDescriptor(
         tensor,
@@ -298,7 +298,7 @@ def test_tensor_descriptor_created_in_kernel_reports_block_oob():
     class _GluonDescriptor:
         pass
 
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty((4, 4), dtype=torch.int32)
     desc = _GluonDescriptor()
     sanitizer.arg_callback("input_desc", tensor, None)
@@ -319,7 +319,7 @@ def test_tensor_descriptor_created_in_kernel_reports_block_oob():
 
 
 def test_tensor_descriptor_access_record_ignores_inactive_predicate():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty((4, 4), dtype=torch.int32)
     desc = _HostTensorDescriptor(
         tensor,
@@ -341,7 +341,7 @@ def test_tensor_descriptor_access_record_ignores_inactive_predicate():
 
 
 def test_symbolic_tensor_descriptor_access_allows_in_bounds_block():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty((4, 4), dtype=torch.int32)
     desc = _HostTensorDescriptor(
         tensor,
@@ -359,7 +359,7 @@ def test_symbolic_tensor_descriptor_access_allows_in_bounds_block():
 
 
 def test_concrete_ptr_router_uses_concrete_path_for_large_multi_range_access():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty(128, dtype=torch.int32)
     base = tensor.data_ptr()
     stride_bytes = tensor.element_size() * 2
@@ -413,7 +413,7 @@ def _make_loop_affine_access(
 
 
 def test_loop_range_summary_skips_z3_for_proven_safe_access():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty(4, dtype=torch.int32)
     base = tensor.data_ptr()
     end = base + tensor.numel() * tensor.element_size() - 1
@@ -439,7 +439,7 @@ def test_loop_range_summary_skips_z3_for_proven_safe_access():
 
 
 def test_loop_range_summary_skips_z3_for_addptr_access():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty(4, dtype=torch.int32)
     base = tensor.data_ptr()
     end = base + tensor.numel() * tensor.element_size() - 1
@@ -471,7 +471,7 @@ def test_loop_range_summary_skips_z3_for_addptr_access():
 
 
 def test_loop_range_summary_skips_z3_for_fma_affine_access():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty(4, dtype=torch.int32)
     base = tensor.data_ptr()
     end = base + tensor.numel() * tensor.element_size() - 1
@@ -502,7 +502,7 @@ def test_loop_range_summary_skips_z3_for_fma_affine_access():
 
 
 def test_loop_range_summary_falls_back_when_interval_can_escape_tensor():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty(4, dtype=torch.int32)
     base = tensor.data_ptr()
     end = base + tensor.numel() * tensor.element_size() - 1
@@ -531,7 +531,7 @@ def test_loop_range_summary_falls_back_when_interval_can_escape_tensor():
 
 
 def test_loop_range_summary_handles_abs_without_sign_flip():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty(4, dtype=torch.int32)
     base = tensor.data_ptr()
     end = base + tensor.numel() * tensor.element_size() - 1
@@ -570,7 +570,7 @@ def test_loop_range_summary_handles_abs_without_sign_flip():
 
 
 def test_loop_range_summary_falls_back_for_forbidden_unary_address_op():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty(4, dtype=torch.int32)
     base = tensor.data_ptr()
     end = base + tensor.numel() * tensor.element_size() - 1
@@ -609,7 +609,7 @@ def test_loop_range_summary_falls_back_for_forbidden_unary_address_op():
 
 
 def test_loop_range_summary_falls_back_for_cast_address_op():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty(4, dtype=torch.int32)
     base = tensor.data_ptr()
     end = base + tensor.numel() * tensor.element_size() - 1
@@ -644,7 +644,7 @@ def test_loop_range_summary_falls_back_for_cast_address_op():
 
 
 def test_loop_range_summary_falls_back_for_left_shift_address_op():
-    sanitizer = SymbolicSanitizer(abort_on_error=False)
+    sanitizer = SymbolicSanitizer()
     tensor = torch.empty(4, dtype=torch.int32)
     base = tensor.data_ptr()
     end = base + tensor.numel() * tensor.element_size() - 1

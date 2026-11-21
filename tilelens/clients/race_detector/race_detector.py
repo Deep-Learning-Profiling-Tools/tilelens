@@ -90,10 +90,6 @@ class RaceDetector(Client):
             return cast(RaceDetectorT, obj)
         return cast(RaceDetectorT, object.__new__(cls))
 
-    def __init__(self, abort_on_error: bool = False, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.abort_on_error: bool = abort_on_error
-
     def pre_run_callback(self, fn: Callable) -> bool:
         return True
 
@@ -128,8 +124,8 @@ class RaceDetector(Client):
 
 
 class SymbolicRaceDetector(RaceDetector, SymbolicClient):
-    def __init__(self, abort_on_error: bool = False):
-        super().__init__(abort_on_error=abort_on_error)
+    def __init__(self) -> None:
+        super().__init__()
         self.records: list[AccessEventRecord] = []
 
     # Explicit forwarders to SymbolicClient: the RaceDetector factory
@@ -278,6 +274,3 @@ class NullRaceDetector(NullSymbolicClient, RaceDetector):
     """A do-nothing object returned when the race detector is off.
     Every callback raises via ``NullSymbolicClient`` so misuse is obvious.
     """
-
-    def __init__(self, abort_on_error: bool = False, *args: Any, **kwargs: Any):
-        super().__init__(abort_on_error=abort_on_error)

@@ -1262,7 +1262,7 @@ def test_gemm():
     tile_size = 16
 
     gemm_kernel[(M // tile_size, N // tile_size)](A, B, C, M, N, K, tile_size)
-    print("GEMM ran without any out-of-bounds errors!")
+    print("GEMM finished")
 
 test_gemm()
 </code></pre>

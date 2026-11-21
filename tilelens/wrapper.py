@@ -2,10 +2,14 @@ import os
 import shutil
 import runpy
 import sys
+from collections.abc import Callable
+from typing import NoReturn
 import triton
 import tilelens
 from triton.experimental import gluon as _gluon
 from tilelens.clients import Profiler, RaceDetector, Sanitizer
+from tilelens.clients.sanitizer.data import OutOfBoundsRecord
+from tilelens.clients.sanitizer.sanitizer import SymbolicSanitizer
 from tilelens.core.config import config as cfg
 
 
@@ -26,14 +30,66 @@ _original_jit = triton.jit
 _original_autotune = triton.autotune
 _original_gluon_jit = _gluon.jit
 
+# Sanitizers created by tile-sanitizer; their findings set the exit status.
+# One per traced kernel definition, kept for the life of the process.
+_sanitizers: list[Sanitizer] = []
+
 
 def sanitizer_wrapper(kernel, *, frontend: str = "triton"):
-    abort_on_error = True
-    tracer = tilelens.trace(
-        client=Sanitizer(abort_on_error=abort_on_error),
-        frontend=frontend,
-    )
+    sanitizer = Sanitizer()
+    _sanitizers.append(sanitizer)
+    tracer = tilelens.trace(client=sanitizer, frontend=frontend)
     return tracer(kernel)
+
+
+def _oob_records() -> list[OutOfBoundsRecord]:
+    return [
+        record
+        for sanitizer in _sanitizers
+        if isinstance(sanitizer, SymbolicSanitizer)
+        for record in sanitizer.records
+        if isinstance(record, OutOfBoundsRecord)
+    ]
+
+
+def _oob_site(record: OutOfBoundsRecord) -> str:
+    frames = record.user_code_tracebacks
+    where = f"{frames[-1].filename}:{frames[-1].lineno}" if frames else "<unknown>"
+    tensor = getattr(record, "tensor_name", None) or "<unknown tensor>"
+    return f"{where}: {record.op_type.__name__} {tensor}"
+
+
+def sanitizer_exit_status() -> int:
+    """Summarize tile-sanitizer's findings on stderr; 1 if there are any."""
+    records = _oob_records()
+    if not records:
+        return 0
+    sites = dict.fromkeys(_oob_site(record) for record in records)
+    sys.stdout.flush()  # keep the summary after the program's own output
+    print(
+        f"{SANITIZER_COMMAND}: {len(records)} out-of-bounds finding(s):",
+        *(f"  {site}" for site in sites),
+        sep="\n",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def sanitizer_pytest_plugins() -> list[object]:
+    """Fail each test whose call added findings, naming it as the old exit did."""
+    import pytest
+
+    class _FailTestsWithFindings:
+        @pytest.hookimpl(wrapper=True)
+        def pytest_runtest_call(self, item):
+            before = len(_oob_records())
+            result = yield
+            if new := len(_oob_records()) - before:
+                msg = f"{SANITIZER_COMMAND}: {new} out-of-bounds finding(s)"
+                pytest.fail(msg, pytrace=False)
+            return result
+
+    return [_FailTestsWithFindings()]
 
 
 def profiler_wrapper(kernel, *, frontend: str = "triton"):
@@ -78,9 +134,28 @@ def create_patched_autotune(wrapper_func):
     return _patched_autotune
 
 
-def _apply_wrapper(wrapper_func, command_name, usage_msg):
+def _run_script(path: str) -> str | int | None:
+    """Run a user script as ``__main__`` and return its exit code."""
+    try:
+        runpy.run_path(path, run_name="__main__")
+    except SystemExit as e:
+        return e.code
+    return 0
+
+
+def _apply_wrapper(
+    wrapper_func,
+    command_name,
+    usage_msg,
+    findings_exit_status: Callable[[], int] = lambda: 0,
+    pytest_plugins: Callable[[], list[object]] = list,
+):
     """
     Generic function to apply a wrapper to triton.jit and run the user script.
+
+    Exits with the program's own non-zero code if it has one, otherwise with
+    ``findings_exit_status()``; an uncaught exception propagates as usual.
+    ``pytest_plugins()`` are passed to ``pytest.main`` on the pytest path.
     """
     legacy_command = LEGACY_COMMANDS[command_name]
     if os.path.basename(sys.argv[0]) not in (command_name, legacy_command):
@@ -120,10 +195,15 @@ def _apply_wrapper(wrapper_func, command_name, usage_msg):
 
     script = sys.argv[1]
 
+    def _exit(code: str | int | None) -> NoReturn:
+        # The program's own non-zero exit wins; otherwise findings decide.
+        status = findings_exit_status()
+        sys.exit(code if code not in (None, 0) else status)
+
     if os.path.isfile(script):
         # It's a Python script file, run it directly
         sys.argv = sys.argv[1:]
-        runpy.run_path(script, run_name="__main__")
+        _exit(_run_script(script))
     else:
         # It might be a command like 'pytest', run it as a subprocess
         cmd = sys.argv[1:]
@@ -135,14 +215,10 @@ def _apply_wrapper(wrapper_func, command_name, usage_msg):
                 # so the CLIs work in a plain `pip install tilelens`.
                 import pytest
 
-                sys.exit(pytest.main(cmd[1:]))
+                _exit(pytest.main(cmd[1:], plugins=pytest_plugins()))
             elif cmd[0] == "python":
                 sys.argv = cmd[1:]
-                try:
-                    runpy.run_path(cmd[1], run_name="__main__")
-                except SystemExit as e:
-                    sys.exit(e.code)
-                sys.exit(0)
+                _exit(_run_script(cmd[1]))
         print(f"Error: '{script}' is neither a valid file nor a command")
         sys.exit(1)
 
@@ -155,6 +231,8 @@ def apply_sanitizer():
         sanitizer_wrapper,
         SANITIZER_COMMAND,
         f"Usage: {SANITIZER_COMMAND} <script.py> [args...]",
+        sanitizer_exit_status,
+        sanitizer_pytest_plugins,
     )
 
 

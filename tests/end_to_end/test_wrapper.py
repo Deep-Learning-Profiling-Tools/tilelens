@@ -5,7 +5,9 @@ import subprocess
 from pathlib import Path
 from string import Template
 import shutil
+import pytest
 from tilelens.wrapper import (
+    LEGACY_COMMANDS,
     SANITIZER_COMMAND,
     PROFILER_COMMAND,
     RACE_DETECTOR_COMMAND,
@@ -328,3 +330,51 @@ def test_cli_rejects_trace_decorator(tmp_path: Path):
     assert (
         "CLI wrapper" in proc.stderr
     ), f"Expected error message about CLI wrapper conflict in stderr, got:\n{proc.stderr}"
+
+
+EXIT_STATUS_PROGRAM = Template(
+    """
+import threading, torch, triton, triton.language as tl
+
+@triton.jit
+def store_kernel(x_ptr, N: tl.constexpr):
+    tl.store(x_ptr + tl.arange(0, N), tl.zeros((N,), tl.float32))
+
+def test_store():
+    store_kernel[(1,)](torch.zeros(8), N=$n)
+
+if __name__ == "__main__":
+    $main
+"""
+)
+KEPT_RUNNING = "test_store(); print('kept running')"
+IN_THREAD = "t = threading.Thread(target=test_store); t.start(); t.join()"
+SAN, LEGACY = SANITIZER_COMMAND, LEGACY_COMMANDS[SANITIZER_COMMAND]
+PYTEST = ["pytest", "-q", "-p", "no:cacheprovider"]
+
+
+@pytest.mark.parametrize(
+    "command, args, n, main, status, stdout",
+    [
+        (SAN, [], 16, KEPT_RUNNING, 1, "kept running"),
+        (SAN, [], 8, KEPT_RUNNING, 0, "kept running"),
+        (SAN, [], 16, "test_store(); raise SystemExit(3)", 3, ""),  # own code wins
+        (SAN, [], 16, IN_THREAD, 1, ""),  # main: 0, the thread's exit was lost
+        (LEGACY, ["python"], 16, KEPT_RUNNING, 1, "kept running"),
+        (SAN, PYTEST, 16, "pass", 1, "FAILED"),  # the finding test fails by name
+    ],
+)
+def test_tile_sanitizer_exit_status(
+    tmp_path: Path, command, args, n, main, status, stdout
+):
+    script = tmp_path / "test_prog.py"
+    script.write_text(EXIT_STATUS_PROGRAM.substitute(n=n, main=main))
+    exe = shutil.which(command)
+    assert exe is not None
+    env = {**os.environ, "TRITON_INTERPRET": "1"}
+    cmd = [exe, *args, str(script)]
+    proc = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert proc.returncode == status, proc.stdout + proc.stderr
+    assert stdout in proc.stdout
+    assert ("ILLEGAL MEMORY ACCESS" in proc.stdout) == (n > 8)
+    assert ("1 out-of-bounds finding(s)" in proc.stderr) == (n > 8)
