@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tilelens"
 version = "3.1.1"
-description = "A visualization tool for Triton"
+description = "A visualization, profiling, and debugging toolkit for tile-based kernel languages (Triton, Gluon, NKI)"
 authors = [
   {name = "Deep Learning Profiling Tools Team", email = "kzhou6@gmu.edu"}
 ]
@@ -18,7 +18,7 @@ requires-python = ">=3.12"
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent",
+  "Operating System :: POSIX :: Linux",
 ]
 dependencies = [
   "setuptools",

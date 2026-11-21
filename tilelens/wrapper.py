@@ -86,7 +86,7 @@ def _apply_wrapper(wrapper_func, command_name, usage_msg):
     if os.path.basename(sys.argv[0]) not in (command_name, legacy_command):
         raise RuntimeError(
             f"{command_name} must be used as a CLI tool, not called from Python. "
-            f"Usage: {usage_msg}"
+            f"{usage_msg}"
         )
 
     cfg.cli_active = True

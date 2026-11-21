@@ -85,7 +85,7 @@ def run_demo():
     ref = a @ b
     assert torch.allclose(c, ref, atol=1e-3), "matmul result mismatch"
 
-    # Launch viz UI in blocking (share=True) mode
+    # Launch the viz UI locally at http://localhost:5001 (blocks until Ctrl+C)
     tilelens.launch(share=False, port=5001)
 
 

@@ -2,12 +2,12 @@
 
 ## Project Structure & Module Organization
 
-TileLens is a Python package with a TypeScript web UI. Core code lives in `tilelens/`: `core/` handles tracing and client lifecycle, `core/frontend/` owns DSL operation adapters, runtime patching, and frontend-local AST rewrites, `core/simulation/` contains NKI simulation runtimes, `clients/` contains visualizer/profiler/sanitizer logic, and `visualizer/` covers visualizer APIs. Web UI source is in `frontend/`; built assets are copied into `tilelens/static/` and `tilelens/templates/`. Tests live in `tests/unit/`, `tests/end_to_end/`, `tests/frontend/`, and `tests/nki/`. Examples are in `examples/`; site docs are in `docs/`.
+TileLens is a Python package with a TypeScript web UI. Core code lives in `tilelens/`: `core/` handles tracing and client lifecycle, `core/frontend/` owns DSL operation adapters, runtime patching, and frontend-local AST rewrites, `core/simulation/` contains Gluon and NKI simulation runtimes, `clients/` contains tracer/profiler/sanitizer/race-detector logic, and `visualizer/` covers visualizer APIs. Web UI source is in `frontend/`; built assets are copied into `tilelens/static/` and `tilelens/templates/`. Tests live in `tests/unit/`, `tests/end_to_end/`, `tests/frontend/`, and `tests/nki/`. Examples are in `examples/`; site docs are in `docs/`.
 
 ## Build, Test, and Development Commands
 
 - `uv sync --extra test`: install Python test dependencies.
-- `uv sync --extra nki --extra test`: install NKI plus test dependencies; specify all extras in one command.
+- `uv sync --python 3.12 --extra nki --extra test`: install NKI plus test dependencies (NKI needs Python 3.12 on Linux x86_64); specify all extras in one command.
 - `uv run pytest tests/`: run the default Python suite, excluding tests marked `nki`.
 - `uv run pytest tests/ -m ""`: run all Python tests, including NKI tests when dependencies are installed.
 - `npm install`: install web UI tooling.
@@ -28,4 +28,4 @@ Recent commits use concise imperative summaries, often with prefixes such as `[F
 
 ## Security & Configuration Tips
 
-Do not commit local traces, credentials, or generated debug artifacts. Runtime behavior is controlled by environment variables such as `TILELENS_VERBOSE`, `TILELENS_PORT`, `ENABLE_SANITIZER`, `ENABLE_PROFILER`, and `SANITIZER_ENABLE_FAKE_TENSOR`; document any new variables in `README.md`.
+Do not commit local traces, credentials, or generated debug artifacts. Runtime behavior is controlled by environment variables such as `TILELENS_VERBOSE`, `TILELENS_PORT`, `ENABLE_SANITIZER`, `PROFILER_ENABLE_BLOCK_SAMPLING`, and `SANITIZER_ENABLE_FAKE_TENSOR`; document any new variables in `README.md`.
