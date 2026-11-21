@@ -3339,7 +3339,8 @@ class SymbolicClient(Client):
         return [(start, end, arg) for start, end in get_physical_addr_per_element(arg)]
 
     def _clear_cache(self) -> None:
-        """Extra cache state to clear inside ``post_run_callback``."""
+        """Extra cache state cleared at the end of a launch, by
+        ``post_run_callback`` or by ``finalize``."""
         pass
 
     def _clear_symbolic_launch_state(self) -> None:
@@ -3356,6 +3357,10 @@ class SymbolicClient(Client):
         self.grid_idx = grid_idx
 
     def finalize(self) -> list:
+        # A launch whose last block never reaches post_run_callback (e.g.
+        # every block was vetoed) would otherwise keep its launch state.
+        self._clear_cache()
+        self._clear_symbolic_launch_state()
         return []
 
     def arg_callback(self, name: str, arg: Any, arg_cvt: Any) -> None:
@@ -3405,10 +3410,10 @@ class SymbolicClient(Client):
     def pre_run_callback(self, fn: Callable) -> bool:
         if self._launch_should_stop:
             return False
-        should_run = True if self.need_full_grid is None else self.need_full_grid
-        if should_run:
-            self._active_blocks += 1
-        return should_run
+        return True if self.need_full_grid is None else self.need_full_grid
+
+    def block_start_callback(self, fn: Callable) -> None:
+        self._active_blocks += 1
 
     def post_run_callback(self, fn: Callable) -> bool:
         if self.need_full_grid is None:
@@ -3416,7 +3421,7 @@ class SymbolicClient(Client):
         if self.grid_idx == self.last_grid or not self.need_full_grid:
             # Under concurrent block execution, another block may already be
             # running in this launch. Defer clearing tensor/solver caches until
-            # every block that passed pre_run_callback has reached post_run.
+            # every block that started has reached post_run.
             self._launch_should_stop = True
             self._pending_launch_clear = True
         self._active_blocks = max(0, self._active_blocks - 1)
