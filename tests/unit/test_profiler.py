@@ -272,6 +272,17 @@ def test_check_32bit_range_no_buffer_load(_isolate_profiler_cfg):
     assert profiler.potential_buffer_load_issue_found is True
 
 
+# ======== Buffer Load Check: Skip Tests =========
+
+
+def test_buffer_load_check_skipped_without_an_amd_kernel(_isolate_profiler_cfg, capsys):
+    cfg.profiler_disable_buffer_load_check = False
+
+    Profiler().finalize()
+
+    assert "Buffer Load check skipped" in capsys.readouterr().out
+
+
 # ======== Pre-run Callback Tests =========
 
 

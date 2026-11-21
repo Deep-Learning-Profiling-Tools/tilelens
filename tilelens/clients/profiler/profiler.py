@@ -78,8 +78,8 @@ class Profiler(Client):
         # Per-operation statistics for detailed analysis
         self.mask_op_stats: list[MaskOpStats] = []
 
-        # Case 4: Buffer Load Check
-        self.has_buffer_load = False
+        # Case 4: Buffer Load Check. AMD only: None until an amdgcn ASM is captured.
+        self.has_buffer_load: bool | None = None
         self.disable_buffer_load_check = cfg.profiler_disable_buffer_load_check
         self.potential_buffer_load_issue_found = False
 
@@ -516,7 +516,9 @@ class Profiler(Client):
                 + "-" * 11
             )
             print("=" * 60)
-            if self.potential_buffer_load_issue_found:
+            if self.has_buffer_load is None:
+                print("Buffer Load check skipped: no AMD (amdgcn) kernel was compiled.")
+            elif self.potential_buffer_load_issue_found:
                 print("\n>>>>>> Warning: Potential Buffer Load Issue Detected! <<<<<<")
                 print(
                     "\nSome memory access offsets are within 32-bit range, "
