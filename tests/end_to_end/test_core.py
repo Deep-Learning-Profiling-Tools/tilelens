@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 import tilelens
-from tilelens.clients import Profiler, Sanitizer
+from tilelens.clients import Profiler, Sanitizer, Tracer
 from tilelens.core.callbacks import ForLoopCallbacks, OpCallbacks
 from tilelens.core.client import Client
 
@@ -16,8 +16,7 @@ def test_trace_decorator_add_clients():
     Test goal:
     1. Apply @trace("sanitizer") and @trace("profiler") to add the Sanitizer and Profiler clients.
     2. Apply @trace("tracer") to append a Tracer client.
-    3. Apply @trace(("sanitizer",)) with a duplicate Sanitizer, which should be
-       ignored by the de-duplication logic.
+    3. Apply @trace("sanitizer") over the Sanitizer instance: a no-op.
 
     The final Trace object should contain exactly one instance each of
     Sanitizer, Profiler, and Tracer (total = 3 clients).
@@ -26,9 +25,7 @@ def test_trace_decorator_add_clients():
     @tilelens.trace("sanitizer")
     @tilelens.trace("profiler")
     @tilelens.trace("tracer")
-    @tilelens.trace(
-        Sanitizer(abort_on_error=True)
-    )  # Duplicate Sanitizer (should be ignored)
+    @tilelens.trace(Sanitizer(abort_on_error=True))  # kept; "sanitizer" is a no-op
     @triton.jit
     def my_kernel(x_ptr, y_ptr, out_ptr, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -46,6 +43,19 @@ def test_trace_decorator_add_clients():
     assert sum(c == "sanitizer" for c in clients) == 1
     assert sum(c == "profiler" for c in clients) == 1
     assert sum(c == "tracer" for c in clients) == 1
+
+
+def test_trace_by_name_refuses_another_class_holding_that_name():
+    class Imposter(Tracer):
+        NAME = "sanitizer"
+
+    @tilelens.trace(Imposter())
+    @triton.jit
+    def kernel(x_ptr):
+        tl.store(x_ptr, 0)
+
+    with pytest.raises(ValueError, match=r"'sanitizer' \(Imposter\)"):
+        tilelens.trace("sanitizer")(kernel)
 
 
 def test_trace_decorator_supports_gluon_frontend():

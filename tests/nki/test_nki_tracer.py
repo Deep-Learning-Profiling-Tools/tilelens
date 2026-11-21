@@ -212,8 +212,7 @@ def test_tracer_records_dot():
     kernel_args = (lhs_small, rhs_small, result)
 
     print("Executing matmul_kernel with NKI interpreter...")
-    traced_kernel = tilelens.trace(client=Tracer(), frontend="nki")(matmul_kernel)
-    kernel_instance = traced_kernel[kernel_grid]
+    kernel_instance = matmul_kernel[kernel_grid]
     kernel_instance(*kernel_args)
 
     records = launches[-1].records
