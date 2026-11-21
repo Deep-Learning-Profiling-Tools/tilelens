@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 
 import tilelens
-from tilelens.core.data import Load, RawLoad
+from tilelens.core.data import Load, RawLoad, Store
 from tilelens.clients.symbolic_engine import (
     SymbolicExpr,
     Z3Expr,
@@ -14,10 +14,12 @@ from tilelens.clients.symbolic_engine import (
     _range_to_iterator_constraint,
 )
 from tilelens.core.symbolic_metadata import is_pointer_dtype
+from tilelens.clients.sanitizer.data import UndecidedAccessRecordZ3
 from tilelens.clients.sanitizer.sanitizer import SymbolicSanitizer
 from tilelens.core.callbacks import ForLoopCallbacks
 from tilelens.core.config import config
 from tilelens.core.patch import LoopSite, loop_file_token
+from z3 import unknown
 from z3.z3 import BoolRef
 
 from .loop_site_cross_file_kernel import (
@@ -519,6 +521,100 @@ def test_loop_oob_reports_correct_line_number():
     assert (
         tb_info.func_name == "oob_in_loop_kernel"
     ), f"Expected func_name to be 'oob_in_loop_kernel', but got: {tb_info.func_name!r}"
+
+
+# ======== Z3 unknown ===========
+
+
+class SolverGivesUpChecker(SymbolicSanitizer):
+    """Z3 answers unknown for every access query: a resource limit of one
+    unit stands in for any query it gives up on, deterministically."""
+
+    def grid_callback(self, grid):
+        super().grid_callback(grid)
+        assert self.solver is not None
+        self.solver.set("rlimit", 1)
+
+
+class SolverInterruptedChecker(SymbolicSanitizer):
+    """Z3 answers unknown because a Ctrl+C reached it during check()."""
+
+    def grid_callback(self, grid):
+        super().grid_callback(grid)
+        solver = self.solver
+        assert solver is not None
+        solver.check = lambda *args: unknown
+        solver.reason_unknown = lambda: "interrupted from keyboard"
+
+
+solver_gives_up_checker = SolverGivesUpChecker(abort_on_error=False)
+solver_gives_up_aborting_checker = SolverGivesUpChecker(abort_on_error=True)
+solver_interrupted_checker = SolverInterruptedChecker(abort_on_error=False)
+
+
+@tilelens.trace(client=solver_gives_up_checker)
+@triton.jit
+def oob_undecided_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs + 1)  # out of bounds in the last program
+    for i in range(2):
+        tl.store(y_ptr + offs + i, x)  # out of bounds in the last program
+
+
+@tilelens.trace(client=solver_gives_up_aborting_checker)
+@triton.jit
+def oob_undecided_store_kernel(y_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(y_ptr + offs + 1, offs)
+
+
+@tilelens.trace(client=solver_interrupted_checker)
+@triton.jit
+def interrupted_store_kernel(y_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(y_ptr + offs, offs)
+
+
+def test_solver_unknown_records_access_as_unchecked():
+    """An access Z3 cannot decide is recorded as unchecked, never taken for
+    in bounds (both accesses are out of bounds; neither has a witness)."""
+    solver_gives_up_checker.records.clear()
+
+    x = torch.zeros((32,), dtype=torch.float32)
+    y = torch.zeros((32,), dtype=torch.float32)
+    oob_undecided_kernel[(2,)](x, y, BLOCK=16)
+
+    records = solver_gives_up_checker.records
+    assert [type(r) for r in records] == [UndecidedAccessRecordZ3] * 2
+    load, store = records
+    assert (load.op_type, load.tensor_name) == (Load, "x_ptr")
+    assert (store.op_type, store.tensor_name) == (Store, "y_ptr")
+    assert load.reason and store.reason
+    # The deferred loop check keeps the location captured at the store.
+    assert "tl.load(x_ptr" in load.user_code_tracebacks[-1].line_of_code
+    assert "tl.store(y_ptr" in store.user_code_tracebacks[-1].line_of_code
+
+
+def test_solver_unknown_warns_without_aborting(capsys):
+    solver_gives_up_aborting_checker.records.clear()
+
+    y = torch.zeros((16,), dtype=torch.int32)
+    oob_undecided_store_kernel[(1,)](y, BLOCK=16)  # no SystemExit
+
+    out = capsys.readouterr().out
+    assert "UNCHECKED MEMORY ACCESS" in out
+    assert "Z3 could not decide whether this Store stays in bounds" in out
+    assert "Tensor Arg: y_ptr" in out
+    assert solver_gives_up_aborting_checker.records == []
+
+
+def test_solver_interrupted_by_ctrl_c_raises_keyboard_interrupt():
+    solver_interrupted_checker.records.clear()
+
+    y = torch.zeros((16,), dtype=torch.int32)
+    with pytest.raises(KeyboardInterrupt):
+        interrupted_store_kernel[(1,)](y, BLOCK=16)
+    assert solver_interrupted_checker.records == []
 
 
 # ---------------------------------------------------------------------------

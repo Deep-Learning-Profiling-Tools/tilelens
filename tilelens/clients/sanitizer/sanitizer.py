@@ -12,7 +12,7 @@ import sys
 import numpy as np
 from torch import Tensor
 from triton.tools.tensor_descriptor import TensorDescriptor
-from z3 import And, BoolVal, Not, Or, sat
+from z3 import And, BoolVal, Not, Or, sat, unknown
 from z3.z3 import BoolRef, IntNumRef
 
 from ...core.client import Client
@@ -34,7 +34,7 @@ from ..symbolic_engine import (
     AccessMode,
     symbolic_tensor_descriptor_value,
 )
-from .data import OutOfBoundsRecordZ3
+from .data import OutOfBoundsRecordZ3, UndecidedAccessRecordZ3
 from ...utils.traceback_utils import (
     extract_user_frames,
     capture_current_source_location,
@@ -43,6 +43,7 @@ from ...utils.traceback_utils import (
 from .report import (
     print_oob_record,
     print_oob_record_pdb_style,
+    print_undecided_record,
 )
 from .range_summary import access_range_proves_in_bounds
 from ...core.config import config as cfg
@@ -156,7 +157,7 @@ _fn_symbolic_cache_set: set[_FnSymbolicCache] = set()
 class SymbolicSanitizer(Sanitizer, SymbolicClient):
     def __init__(self, abort_on_error: bool = True):
         super().__init__(abort_on_error=abort_on_error)
-        self.records: list[OutOfBoundsRecordZ3] = []
+        self.records: list[OutOfBoundsRecordZ3 | UndecidedAccessRecordZ3] = []
         self.cache_args: list[Any] = []
         self.cache_grid: tuple[int, ...] | None = None
 
@@ -438,7 +439,14 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
         addr_ok = self._addr_ok_for_expr(symbolic_expr)
 
         def _report_if_sat() -> None:
-            if solver.check() != sat:
+            status = solver.check()
+            if status == unknown:
+                # Not a proof: the access went unchecked.
+                self._report_undecided(
+                    symbolic_expr, solver.reason_unknown(), source_location
+                )
+                return
+            if status != sat:
                 return
 
             model = solver.model()
@@ -645,6 +653,40 @@ class SymbolicSanitizer(Sanitizer, SymbolicClient):
             sys.exit(1)
         else:
             self.records.append(oob_record)
+
+    def _report_undecided(
+        self,
+        symbolic_expr: SymbolicExpr,
+        reason: str,
+        source_location: tuple[str, int, str] | None = None,
+    ) -> None:
+        # Z3 swallows a Ctrl+C during check() and answers unknown.
+        if reason == "interrupted from keyboard":
+            raise KeyboardInterrupt(f"Z3 query cancelled ({reason})")
+
+        if source_location is not None:
+            traceback_info = [location_to_traceback_info(source_location)]
+        else:
+            traceback_info = extract_user_frames()
+
+        tensor = self._resolve_tensor(symbolic_expr)
+        if symbolic_expr.op in ("store", "tensor_pointer_store"):
+            op_type: type[Load] | type[Store] = Store
+        else:
+            op_type = Load
+        record = UndecidedAccessRecordZ3(
+            op_type=op_type,
+            tensor=tensor,
+            user_code_tracebacks=traceback_info,
+            reason=reason,
+            symbolic_expr=symbolic_expr,
+            tensor_name=None if tensor is None else self._get_tensor_name(tensor),
+        )
+        # Not a finding, so the program runs on even with abort_on_error.
+        if self.abort_on_error:
+            print_undecided_record(record)
+        else:
+            self.records.append(record)
 
 
 class NullSanitizer(NullSymbolicClient, Sanitizer):

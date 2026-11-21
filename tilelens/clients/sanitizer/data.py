@@ -54,3 +54,26 @@ class OutOfBoundsRecordZ3(OutOfBoundsRecord):
     violation_address: int
     symbolic_expr: Any = None  # Optional symbolic expression tree
     tensor_name: str | None = None
+
+
+@dataclass
+class UndecidedAccessRecordZ3:
+    """
+    A memory access Z3 answered ``unknown`` for: it was neither proved in
+    bounds nor shown out of bounds, so it went unchecked. Not a finding.
+
+    Attributes:
+        tensor (torch.Tensor | None):
+            The tensor the pointer expression is based on, or None when it
+            cannot be resolved (there is no witness address to match).
+
+        reason (str):
+            Z3's ``reason_unknown()`` for the query.
+    """
+
+    op_type: type[Store | Load]
+    tensor: torch.Tensor | None
+    user_code_tracebacks: list[TracebackInfo]
+    reason: str
+    symbolic_expr: Any = None
+    tensor_name: str | None = None

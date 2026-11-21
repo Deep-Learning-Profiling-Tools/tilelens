@@ -15,6 +15,7 @@ from .data import (
     OutOfBoundsRecord,
     OutOfBoundsRecordBruteForce,
     OutOfBoundsRecordZ3,
+    UndecidedAccessRecordZ3,
 )
 
 
@@ -129,6 +130,23 @@ def print_oob_record(oob_record: OutOfBoundsRecord, max_display=10):
     print("============================================================")
     print("            End of Out-Of-Bounds Record Details             ")
     print("============================================================")
+
+
+def print_undecided_record(record: UndecidedAccessRecordZ3) -> None:
+    """Print a warning for an access the sanitizer could not check."""
+    op_type = "Store" if issubclass(record.op_type, Store) else "Load"
+    print(
+        f"\n\033[1m\033[93m⚠️  UNCHECKED MEMORY ACCESS\033[0m: Z3 could not decide "
+        f"whether this {op_type} stays in bounds ({record.reason})"
+    )
+    if record.tensor_name:
+        print(f"  Tensor Arg: {record.tensor_name}")
+    for traceback_info in record.user_code_tracebacks:
+        print(
+            f"  File: {traceback_info.filename}, Line: {traceback_info.lineno}, "
+            f"in {traceback_info.func_name}"
+        )
+        print(f"    Code: {traceback_info.line_of_code}")
 
 
 def print_oob_record_pdb_style(
