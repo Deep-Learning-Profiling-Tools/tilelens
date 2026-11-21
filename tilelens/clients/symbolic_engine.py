@@ -3174,6 +3174,9 @@ class SymbolicClient(Client):
         if base is None:
             return None
         base_candidates = base if isinstance(base, list) else [base]
+        # A concretized 2-D (or higher) pointer tile is a nested list.
+        while base_candidates and isinstance(base_candidates[0], list):
+            base_candidates = [c for row in base_candidates for c in row]
         for candidate in base_candidates:
             candidate = int(candidate)
             for tensor in self.tensors:
