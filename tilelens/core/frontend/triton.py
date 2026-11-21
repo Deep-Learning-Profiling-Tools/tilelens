@@ -193,6 +193,10 @@ TRITON_ADAPTERS: dict[type[Op], Callable[..., AdapterResult]] = {
         mask,
         kwargs.get("keys"),
     ),
+    AtomicRMW: lambda _rmw_op, ptr, _val, mask, *_args, **_kwargs: AdapterResult(
+        ptr, mask
+    ),
+    AtomicCas: lambda ptr, *_args, **_kwargs: AdapterResult(ptr),
     Dot: lambda a, b, *_args, **_kwargs: AdapterResult(a, b),
     ReduceSum: lambda input_tensor,
     axis=None,

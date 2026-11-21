@@ -7,6 +7,8 @@ from tilelens.core.callbacks import OpCallbacks
 from tilelens.core.client import Client, ClientManager
 from tilelens.core.data import (
     AddPtr,
+    AtomicCas,
+    AtomicRMW,
     BinaryOp,
     CastImpl,
     Dot,
@@ -169,6 +171,24 @@ def test_triton_addptr_adapter_orders_arguments():
     offset = object()
     result = adapter(ptr, offset)
     assert result.args == (ptr, offset)
+    assert result.kwargs == {}
+
+
+def test_triton_atomic_rmw_adapter_returns_ptr_and_mask():
+    """Adapter maps create_atomic_rmw(rmw_op, ptr, val, mask, sem, scope) to (ptr, mask)."""
+    adapter = TRITON_ADAPTERS[AtomicRMW]
+    rmw_op, ptr, val, mask, sem, scope = (object() for _ in range(6))
+    result = adapter(rmw_op, ptr, val, mask, sem, scope)
+    assert result.args == (ptr, mask)
+    assert result.kwargs == {}
+
+
+def test_triton_atomic_cas_adapter_returns_ptr_only():
+    """Adapter maps create_atomic_cas(ptr, cmp, val, sem, scope) to (ptr,)."""
+    adapter = TRITON_ADAPTERS[AtomicCas]
+    ptr, cmp, val, sem, scope = (object() for _ in range(5))
+    result = adapter(ptr, cmp, val, sem, scope)
+    assert result.args == (ptr,)
     assert result.kwargs == {}
 
 

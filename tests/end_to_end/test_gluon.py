@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from triton import knobs
@@ -103,6 +104,19 @@ def _range_memcpy_kernel(in_ptr, out_ptr, xnumel, BLOCK: gl.constexpr):
     for i in range(start, end):
         value = gl.load(in_ptr + i)
         gl.store(out_ptr + i, value)
+
+
+@gluon.jit
+def _unmasked_store_1d_memcpy_kernel(
+    in_ptr,
+    out_ptr,
+    xnumel,
+    BLOCK: gl.constexpr,
+    layout: gl.constexpr,
+):
+    offsets = gl.program_id(0) * BLOCK + gl.arange(0, BLOCK, layout=layout)
+    value = gl.load(in_ptr + offsets, mask=offsets < xnumel, other=0.0)
+    gl.store(out_ptr + offsets, value)
 
 
 @gluon.jit
@@ -866,6 +880,26 @@ def test_gluon_core_ops_run_masked_1d_memcpy_on_cpu():
     kernel[(1,)](inp, out, inp.numel(), 64, layout, num_warps=1)
 
     torch.testing.assert_close(out, inp, atol=0, rtol=0)
+
+
+def test_gluon_trace_refuses_out_of_bounds_store():
+    # out's storage is exactly 40 floats; the rest of buf is sentinel memory
+    buf = np.full(40 + 128, -7, dtype=np.float32)
+    out = torch.from_numpy(buf[64:104])
+    inp = torch.arange(40, dtype=torch.float32)
+    layout = gl.BlockedLayout([1], [32], [1], [0])
+    kernel = tilelens.trace("tracer", frontend="gluon")(
+        _unmasked_store_1d_memcpy_kernel
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        kernel[(1,)](inp, out, inp.numel(), 64, layout, num_warps=1)
+
+    # Gluon's interpreter wraps the tracer's IndexError in an InterpreterError
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, IndexError)
+    assert "out-of-bounds store" in str(cause)
+    assert (buf[:64] == -7).all() and (buf[104:] == -7).all()
 
 
 def test_gluon_core_ops_run_masked_2d_memcpy_on_cpu():
