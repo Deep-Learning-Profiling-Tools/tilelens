@@ -566,6 +566,11 @@ class GluonFrontend(Frontend):
             namespaces=definition.namespaces,
         )
 
+    def wrap_kernel(self, kernel, client):
+        from ..trace import GluonTrace
+
+        return GluonTrace(kernel, client)
+
     @staticmethod
     def symbolic_ops_for_op_type(op_type: type[Op]) -> tuple[str, ...]:
         return TritonFrontend.symbolic_ops_for_op_type(op_type)

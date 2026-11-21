@@ -8,6 +8,7 @@ from ..clients import Sanitizer, Profiler, RaceDetector, Tracer
 from ..clients.race_detector.race_detector import NullRaceDetector
 from .client import ClientManager, Client
 from .data import Launch
+from .frontend.base import get_frontend
 import types
 
 
@@ -409,7 +410,10 @@ def trace(client: str | Client | None = None, frontend: str = "triton"):
         return isinstance(selected, NullRaceDetector)
 
     def decorator(kernel) -> TritonTrace | NKITrace | GluonTrace | Any:
-        if cfg.cli_active and isinstance(kernel, TraceInterface):
+        if cfg.cli_active and (
+            isinstance(kernel, TraceInterface)
+            or isinstance(getattr(kernel, "_tilelens_trace", None), TraceInterface)
+        ):
             raise RuntimeError(
                 "@tilelens.trace() decorator cannot be used together with "
                 "CLI wrapper (e.g., tile-sanitizer / tile-profiler). "
@@ -435,15 +439,7 @@ def trace(client: str | Client | None = None, frontend: str = "triton"):
 
         trace_source(kernel)
 
-        # First-time wrapping
-        if frontend in ("nki", "nki_beta2"):
-            return NKITrace(kernel, client, beta2=("beta2" in frontend))
-        elif frontend == "gluon":
-            return GluonTrace(kernel, client)
-        elif frontend == "triton":
-            return TritonTrace(kernel, client)
-        else:
-            raise ValueError(f"Unknown frontend: {frontend}")
+        return get_frontend(frontend).wrap_kernel(kernel, client)
 
     return decorator
 

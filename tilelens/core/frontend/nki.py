@@ -93,6 +93,11 @@ class NKIFrontend(Frontend):
             namespaces=definition.namespaces,
         )
 
+    def wrap_kernel(self, kernel, client):
+        from ..trace import NKITrace
+
+        return NKITrace(kernel, client, beta2=False)
+
     def patch_lang(self, fn, client_manager: Any = None) -> _LangPatchScope:
         from tilelens.core.simulation.nki import nki_patch_lang
 
