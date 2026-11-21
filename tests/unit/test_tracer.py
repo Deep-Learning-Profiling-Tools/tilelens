@@ -8,7 +8,7 @@ import triton.language as tl
 from triton.runtime.interpreter import TensorHandle
 
 from tilelens.clients.tracer.tracer import Tracer, _convert_grid_idx
-from tilelens.core.data import Transfer
+from tilelens.core.data import AtomicRMW, IntToPtr, Load, Transfer
 
 
 # ======== _convert_grid_idx Tests ===========
@@ -180,3 +180,31 @@ def test_check_in_bounds_accepts_python_bool_mask():
     tracer._check_in_bounds("load", ptr(0, 4, 8, 12), True)
     with pytest.raises(IndexError, match="out-of-bounds load"):
         tracer._check_in_bounds("load", ptr(8, 12, 16), True)
+
+
+def test_tracer_traces_op_subclasses_as_their_core_op():
+    # frontends subclass a core op to pick another argument adapter (Gluon's
+    # builder atomics, int->pointer casts and async copies)
+    class FrontendLoad(Load):
+        pass
+
+    class FrontendAtomicRMW(AtomicRMW):
+        pass
+
+    class FrontendIntToPtr(IntToPtr):
+        pass
+
+    tracer = Tracer()
+    tensor = torch.zeros(4)
+    tracer.arg_callback("x_ptr", tensor, None)
+    lanes = np.array([tensor.data_ptr() + offset for offset in (8, 12, 16)])
+    ptr = TensorHandle(lanes.astype(np.uint64), tl.pointer_type(tl.float32))
+
+    with pytest.raises(IndexError, match="out-of-bounds load"):
+        tracer.register_op_callback(FrontendLoad).before_callback(ptr, None, None)
+    with pytest.raises(IndexError, match="out-of-bounds atomic"):
+        tracer.register_op_callback(FrontendAtomicRMW).before_callback(ptr, None)
+
+    tracer.grid_idx_callback((0, 0, 0))
+    tracer.register_op_callback(FrontendIntToPtr).after_callback(None)
+    assert tracer._get_thread_local("int_to_ptr") is True

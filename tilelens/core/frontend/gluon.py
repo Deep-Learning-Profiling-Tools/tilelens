@@ -21,6 +21,9 @@ from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
 from triton.experimental.gluon.language.amd.gfx1250 import (  # type: ignore
     tdm as gluon_amd_tdm,
 )
+from triton.experimental.gluon.language.nvidia.ampere import (  # type: ignore
+    async_copy as gluon_ampere_async_copy,
+)
 from triton.experimental.gluon.language.nvidia.blackwell import (  # type: ignore
     tma as gluon_blackwell_tma,
 )
@@ -32,11 +35,14 @@ from triton.runtime.interpreter import TensorHandle
 from ..data import (
     AddPtr,
     Allocate,
+    AtomicCas,
+    AtomicRMW,
     BinaryOp,
     Broadcast,
     Dot,
     ExpandDims,
     Fma,
+    IntToPtr,
     Join,
     Load,
     MakeRange,
@@ -56,6 +62,7 @@ from ..symbolic_metadata import (
     TensorDescriptorAccess,
 )
 
+from ..simulation.gluon import Builder as GluonBuilder
 from .base import AdapterResult, Frontend, _LangPatchScope, register_frontend
 from .triton import TritonFrontend
 
@@ -72,6 +79,26 @@ class GluonAsyncCopyStore(Store):
 
 
 class GluonBufferLoadToShared(Load):
+    pass
+
+
+# Atomics and int->pointer casts that Gluon builds on the simulation builder.
+# Each gets its own subclass for its builder-signature adapter, so clients that
+# match op types exactly (the symbolic clients) still run them concretely, as
+# before; their symbolic results would reach Gluon ops that are not dispatched.
+class GluonAtomicRMW(AtomicRMW):
+    pass
+
+
+class GluonAtomicCas(AtomicCas):
+    pass
+
+
+class GluonBufferAtomicRMW(AtomicRMW):
+    pass
+
+
+class GluonIntToPtr(IntToPtr):
     pass
 
 
@@ -133,14 +160,17 @@ def _gluon_descriptor_load_adapter(
 
 
 def _gluon_async_copy_load_adapter(
-    smem: Any,
-    pointer: Any,
+    smem: Any = None,
+    pointer: Any = None,
     mask: Any = None,
     *_args: Any,
+    ptr: Any = None,
     **_kwargs: Any,
 ) -> AdapterResult:
     # Async copy load traces source global memory, not the destination SMEM.
-    return _gluon_pointer_load_adapter(pointer, mask=mask)
+    # CDNA4 global_load_to_shared names its operands (dest, ptr), not
+    # (smem, pointer), so accept its keyword spelling too.
+    return _gluon_pointer_load_adapter(ptr if pointer is None else pointer, mask=mask)
 
 
 def _gluon_async_copy_store_adapter(
@@ -155,7 +185,7 @@ def _gluon_async_copy_store_adapter(
 
 
 def _gluon_buffer_load_to_shared_adapter(
-    smem: Any,
+    dest: Any,
     ptr: Any,
     offsets: Any,
     *args: Any,
@@ -188,6 +218,48 @@ def _gluon_pointer_store_adapter(
 
 
 _gluon_store_adapter = _gluon_pointer_store_adapter
+
+
+# The builder methods below are patched on the Builder class, so the builder
+# instance arrives first.
+def _gluon_atomic_rmw_adapter(
+    _builder: Any,
+    _rmw_op: Any,
+    ptr: Any,
+    _val: Any,
+    mask: Any,
+    *_args: Any,
+    **_kwargs: Any,
+) -> AdapterResult:
+    return AdapterResult(ptr, mask)
+
+
+def _gluon_atomic_cas_adapter(
+    _builder: Any,
+    ptr: Any,
+    *_args: Any,
+    **_kwargs: Any,
+) -> AdapterResult:
+    return AdapterResult(ptr)
+
+
+def _gluon_buffer_atomic_rmw_adapter(
+    builder: Any,
+    _rmw_op: Any,
+    ptr: Any,
+    offsets: Any,
+    _value: Any,
+    _sem: Any,
+    _scope: Any,
+    mask: Any = None,
+    *_args: Any,
+    **_kwargs: Any,
+) -> AdapterResult:
+    # A buffer atomic addresses a scalar base pointer plus offsets; hand clients
+    # the per-lane pointers. Unmasked calls pass an empty ir.value() as the mask.
+    if not isinstance(mask, TensorHandle):
+        mask = None
+    return AdapterResult(builder.create_addptr(ptr, offsets), mask)
 
 
 def _is_global_tensor_descriptor_like(value: Any) -> bool:
@@ -348,6 +420,12 @@ GLUON_NAMESPACES: dict[Any, dict[str, type[Op]]] = {
         "greater_than": BinaryOp,
         "greater_equal": BinaryOp,
     },
+    GluonBuilder: {
+        "create_atomic_rmw": GluonAtomicRMW,
+        "create_atomic_cas": GluonAtomicCas,
+        "create_buffer_atomic_rmw": GluonBufferAtomicRMW,
+        "create_int_to_ptr": GluonIntToPtr,
+    },
 }
 _TMA_NAMESPACES: tuple[tuple[Any, dict[str, type[Op]]], ...] = (
     (
@@ -459,6 +537,13 @@ _TMA_NAMESPACES: tuple[tuple[Any, dict[str, type[Op]]], ...] = (
             "shared_to_global": GluonAsyncCopyStore,
         },
     ),
+    (
+        gluon_ampere_async_copy,
+        {
+            "async_load": GluonAsyncCopyLoad,
+            "async_copy_global_to_shared": GluonAsyncCopyLoad,
+        },
+    ),
 )
 for namespace, attrs in _TMA_NAMESPACES:
     existing = _existing_ops(namespace, attrs)
@@ -472,6 +557,10 @@ GLUON_ADAPTERS: dict[type[Op], Callable[..., AdapterResult]] = {
     GluonAsyncCopyLoad: _gluon_async_copy_load_adapter,
     GluonAsyncCopyStore: _gluon_async_copy_store_adapter,
     GluonBufferLoadToShared: _gluon_buffer_load_to_shared_adapter,
+    GluonAtomicRMW: _gluon_atomic_rmw_adapter,
+    GluonAtomicCas: _gluon_atomic_cas_adapter,
+    GluonBufferAtomicRMW: _gluon_buffer_atomic_rmw_adapter,
+    GluonIntToPtr: lambda _builder, *args, **kwargs: AdapterResult(*args, **kwargs),
     MakeRange: _gluon_make_range_adapter,
     Splat: lambda shape, value, *_args, **_kwargs: AdapterResult(shape, value),
     Allocate: _gluon_allocate_adapter,
@@ -542,7 +631,10 @@ for namespace, attrs in GLUON_NAMESPACES.items():
                 descriptor_kwarg="src",
                 coords_kwarg="offsets",
             )
-        elif attr in _TMA_LOAD_PRED_ARG_INDICES:
+        elif (
+            namespace in (gluon_hopper_tma, gluon_blackwell_tma)
+            and attr in _TMA_LOAD_PRED_ARG_INDICES
+        ):
             GLUON_CALLABLE_ADAPTERS[original] = _gluon_descriptor_load_adapter(
                 _TMA_LOAD_PRED_ARG_INDICES[attr],
                 descriptor_kwarg="tensor_desc",

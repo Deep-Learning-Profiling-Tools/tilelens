@@ -18,6 +18,7 @@ from ...core.data import (
 from ...utils.traceback_utils import extract_user_frames
 from tilelens.core.masked_load_store import masked_load
 import numpy as np
+from triton.runtime.interpreter import TensorHandle
 
 
 def _convert_grid_idx(grid_idx) -> tuple[int, int, int] | None:
@@ -45,6 +46,27 @@ def _storage_ranges(name, arg):
         if storage.nbytes():
             start = storage.data_ptr()
             yield name, tensor, start, start + storage.nbytes()
+
+
+def _paired_lanes(ptr, mask):
+    """Broadcast pointer and mask lanes together.
+
+    Gluon adapters see a builtin's operands before it broadcasts them, so an
+    async copy can hand over a row or scalar mask for a full block of pointers.
+    """
+    data = getattr(ptr, "data", None)
+    mask_data = getattr(mask, "data", None)
+    if (
+        not isinstance(data, np.ndarray)
+        or not isinstance(mask_data, np.ndarray)
+        or data.shape == mask_data.shape
+    ):
+        return ptr, mask
+    try:
+        data, mask_data = np.broadcast_arrays(data, mask_data)
+    except ValueError:
+        return ptr, mask
+    return TensorHandle(data, ptr.dtype), TensorHandle(mask_data, mask.dtype)
 
 
 class Tracer(Client):
@@ -209,6 +231,7 @@ class Tracer(Client):
         @self.lock_fn
         def pre_load_callback(ptr, mask, keys):
             if keys is None:
+                ptr, mask = _paired_lanes(ptr, mask)
                 self._check_in_bounds("load", ptr, mask)
             if not self.sample:
                 return
@@ -229,6 +252,7 @@ class Tracer(Client):
         @self.lock_fn
         def pre_store_callback(ptr, mask, keys):
             if keys is None:
+                ptr, mask = _paired_lanes(ptr, mask)
                 self._check_in_bounds("store", ptr, mask)
             if not self.sample:
                 return
@@ -344,7 +368,13 @@ class Tracer(Client):
             ReduceSum: OpCallbacks(after_callback=post_reduce_sum_callback),
             Dot: OpCallbacks(after_callback=post_dot_callback),
         }
-        return callbacks.get(op_type, OpCallbacks())
+        # Frontends subclass a core op to pick another argument adapter (Gluon's
+        # builder atomics, int->pointer casts and async copies); the adapter
+        # hands over the core op's arguments, so trace them as that op.
+        for op_class in op_type.__mro__:
+            if op_class in callbacks:
+                return callbacks[op_class]
+        return OpCallbacks()
 
     def register_for_loop_callback(self):
         return ForLoopCallbacks()

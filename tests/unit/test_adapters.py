@@ -367,6 +367,31 @@ def test_gluon_load_store_adapters_keep_first_positional_mask():
     )
 
 
+def test_gluon_async_copy_load_adapters_accept_cdna4_keywords():
+    from tilelens.core.frontend import gluon as gluon_frontend
+
+    async_copy = GLUON_ADAPTERS[gluon_frontend.GluonAsyncCopyLoad]
+    buffer_to_shared = GLUON_ADAPTERS[gluon_frontend.GluonBufferLoadToShared]
+
+    assert async_copy("smem", "ptr", "mask").args == ("ptr", "mask", None)
+    # CDNA4 spells the operands dest, ptr (and offsets for buffer_load_to_shared)
+    assert async_copy(dest="smem", ptr="ptr", mask="mask").args == ("ptr", "mask", None)
+    assert buffer_to_shared(dest="smem", ptr=100, offsets=4, mask="mask").args == (
+        104,
+        "mask",
+        None,
+    )
+
+
+def test_gluon_ampere_async_copies_do_not_get_the_tma_descriptor_adapter():
+    """Ampere async_load shares its name with the TMA load but takes (smem, pointer, mask)."""
+    from triton.experimental.gluon.language.nvidia.ampere import async_copy
+    from tilelens.core.frontend import gluon as gluon_frontend
+
+    for fn in (async_copy.async_load, async_copy.async_copy_global_to_shared):
+        assert fn not in gluon_frontend.GLUON_CALLABLE_ADAPTERS
+
+
 def test_gluon_load_adapter_does_not_treat_pred_as_mask():
     from tilelens.core.frontend import gluon as gluon_frontend
 
@@ -375,6 +400,40 @@ def test_gluon_load_adapter_does_not_treat_pred_as_mask():
         None,
         None,
     )
+
+
+def test_gluon_builder_atomic_adapters_skip_the_builder():
+    """Gluon atomics are patched on the simulation Builder class, so self comes first."""
+    from tilelens.core.frontend import gluon as gluon_frontend
+
+    builder, rmw_op, ptr, cmp, val, mask, sem, scope = (object() for _ in range(8))
+    rmw = GLUON_ADAPTERS[gluon_frontend.GluonAtomicRMW]
+    cas = GLUON_ADAPTERS[gluon_frontend.GluonAtomicCas]
+
+    assert rmw(builder, rmw_op, ptr, val, mask, sem, scope).args == (ptr, mask)
+    assert cas(builder, ptr, cmp, val, sem, scope).args == (ptr,)
+
+
+def test_gluon_buffer_atomic_adapter_returns_per_lane_pointers():
+    """create_buffer_atomic_rmw(rmw_op, ptr, offsets, value, sem, scope, mask) -> (ptrs, mask)."""
+    from tilelens.core.frontend import gluon as gluon_frontend
+    from tilelens.core.simulation.gluon import gluon_builder
+
+    adapter = GLUON_ADAPTERS[gluon_frontend.GluonBufferAtomicRMW]
+    ptr = TensorHandle(np.array([4096], dtype=np.uint64), tl.pointer_type(tl.float32))
+    offsets = TensorHandle(np.arange(4, dtype=np.int32), tl.int32)
+    mask = TensorHandle(np.array([True, True, False, True]), tl.int1)
+
+    ptrs, result_mask = adapter(
+        gluon_builder, "add", ptr, offsets, "value", "sem", "scope", mask
+    ).args
+    assert np.array_equal(ptrs.data, 4096 + 4 * np.arange(4))
+    assert result_mask is mask
+    # unmasked calls pass an empty ir.value() instead of a mask
+    unmasked = adapter(
+        gluon_builder, "add", ptr, offsets, "value", "sem", "scope", object()
+    )
+    assert unmasked.args[1] is None
 
 
 def test_gluon_frontend_routes_tensor_descriptor_access_to_overrider(monkeypatch):
