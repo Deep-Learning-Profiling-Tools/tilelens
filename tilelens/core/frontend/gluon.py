@@ -154,6 +154,17 @@ def _gluon_async_copy_store_adapter(
     return _gluon_pointer_store_adapter(pointer, mask=mask)
 
 
+def _gluon_async_copy_store_overrider_adapter(
+    pointer: Any,
+    smem: Any,
+    mask: Any = None,
+    *_args: Any,
+    **_kwargs: Any,
+) -> AdapterResult:
+    # The stored data stays in SMEM, so overriders get no register value.
+    return _gluon_pointer_store_overrider_adapter(pointer, mask=mask)
+
+
 def _gluon_buffer_load_to_shared_adapter(
     smem: Any,
     ptr: Any,
@@ -169,22 +180,32 @@ def _gluon_buffer_load_to_shared_adapter(
     )
 
 
-def _gluon_pointer_store_adapter(
+def _gluon_pointer_store_operands(
     ptr: Any,
     value: Any = None,
     *_args: Any,
     mask: Any = None,
     **_kwargs: Any,
-) -> AdapterResult:
+) -> tuple[Any, Any, Any]:
     if _is_global_tensor_descriptor_like(ptr) and value is not None:
-        return AdapterResult(TensorDescriptorAccess(ptr, value, mask), mask, None)
+        # Descriptor stores pass coordinates here and read their data from SMEM.
+        return TensorDescriptorAccess(ptr, value, mask), None, mask
     if mask is None and _args:
         mask = _args[0]
     ptr = _gluon_tensor_handle(ptr)
     mask = _gluon_tensor_handle(mask)
     if mask is None and isinstance(ptr, TensorHandle):
         mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
+    return ptr, _gluon_tensor_handle(value), mask
+
+
+def _gluon_pointer_store_adapter(*args: Any, **kwargs: Any) -> AdapterResult:
+    ptr, _value, mask = _gluon_pointer_store_operands(*args, **kwargs)
     return AdapterResult(ptr, mask, None)
+
+
+def _gluon_pointer_store_overrider_adapter(*args: Any, **kwargs: Any) -> AdapterResult:
+    return AdapterResult(*_gluon_pointer_store_operands(*args, **kwargs))
 
 
 _gluon_store_adapter = _gluon_pointer_store_adapter
@@ -512,6 +533,15 @@ _TMA_LOAD_PRED_ARG_INDICES: dict[str, int] = {
     "async_copy_global_to_shared": 3,
     "async_copy_global_to_shared_im2col": 4,
 }
+# Store callbacks use GLUON_ADAPTERS' (ptr, mask, keys) convention; store
+# overriders need (ptr, value, mask) so the mask lands in the right slot.
+# AMD buffer_store/buffer_atomic_* take a base pointer plus offsets in their own
+# argument order, which the pointer store adapter does not parse, so they keep
+# the GLUON_ADAPTERS fallback until they get a dedicated adapter.
+_STORE_OVERRIDER_ADAPTERS: dict[type[Op], Callable[..., AdapterResult]] = {
+    Store: _gluon_pointer_store_overrider_adapter,
+    GluonAsyncCopyStore: _gluon_async_copy_store_overrider_adapter,
+}
 GLUON_CALLABLE_ADAPTERS: dict[Callable, Callable[..., AdapterResult]] = {}
 for namespace, attrs in GLUON_NAMESPACES.items():
     for attr, op_type in attrs.items():
@@ -532,6 +562,8 @@ for namespace, attrs in GLUON_NAMESPACES.items():
             )
         elif op_type is Dot:
             GLUON_CALLABLE_ADAPTERS[original] = _gluon_dot_overrider_adapter
+        elif op_type in _STORE_OVERRIDER_ADAPTERS and not attr.startswith("buffer_"):
+            GLUON_CALLABLE_ADAPTERS[original] = _STORE_OVERRIDER_ADAPTERS[op_type]
         elif op_type is UnaryOp and attr in _GLUON_UNARY_NUMPY_OPS:
             GLUON_CALLABLE_ADAPTERS[original] = _gluon_unary_op_adapter(
                 _GLUON_UNARY_NUMPY_OPS[attr]

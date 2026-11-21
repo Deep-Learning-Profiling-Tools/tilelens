@@ -347,6 +347,44 @@ def test_gluon_load_store_adapters_keep_first_positional_mask():
     )
 
 
+def test_gluon_store_overriders_receive_value_and_mask():
+    from triton.experimental.gluon import language as ttgl
+    from triton.experimental.gluon.language.amd.gfx1250 import async_copy
+    from triton.experimental.gluon.language.nvidia.hopper import tma
+    from tilelens.core.frontend import gluon as gluon_frontend
+
+    calls = []
+
+    def overrider(ptr, value, mask):
+        calls.append((ptr, value, mask))
+
+    def run(op, op_type, *args, **kwargs):
+        GLUON_FRONTEND.run_op_overrider(op, op_type, overrider, args, kwargs)
+        return calls.pop()
+
+    assert run(ttgl.store, Store, "ptr", "value", "mask") == ("ptr", "value", "mask")
+    assert run(ttgl.store, Store, "ptr", "value", mask="mask") == (
+        "ptr",
+        "value",
+        "mask",
+    )
+    assert run(
+        async_copy.shared_to_global,
+        gluon_frontend.GluonAsyncCopyStore,
+        "ptr",
+        "smem",
+        "mask",
+    ) == ("ptr", None, "mask")
+
+    desc = type("TensorDescriptor", (), {"block_shape": (1,)})()
+    access, value, mask = run(tma.async_store, Store, desc, "coord", "src")
+    assert isinstance(access, TensorDescriptorAccess)
+    assert access.descriptor is desc
+    assert access.coords == "coord"
+    assert value is None
+    assert mask is None
+
+
 def test_gluon_load_adapter_does_not_treat_pred_as_mask():
     from tilelens.core.frontend import gluon as gluon_frontend
 
