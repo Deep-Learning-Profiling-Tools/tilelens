@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from tilelens.core.data import Tensor, Transfer
-from tilelens.visualizer.draw import prepare_visualization_data
+from tilelens.core.data import Load, Tensor, Transfer
+from tilelens.visualizer.draw import extract_load_coords, prepare_visualization_data
 
 
 def _tensor(ptr, data):
@@ -67,3 +67,20 @@ def test_prepare_visualization_data_records_transfer_focus(
     assert raw_tensor_data[record_uuid]["transfer_kind"] == expected_kind
     assert raw_tensor_data["__sbuf_events__"] == []
     assert coords == expected_coords
+
+
+def test_extract_load_coords_uses_recorded_element_size():
+    """Unknown dtype names fall back to 4 bytes; the recorded size must win."""
+    data = np.zeros((2, 4), dtype=np.uint8)
+    tensor = Tensor(
+        ptr=0,
+        dtype="cutile_only_dtype",
+        stride=tuple(data.strides),
+        shape=tuple(data.shape),
+        element_size=1,
+        data=data,
+    )
+    record = Load(
+        ptr=0, offsets=np.arange(8).reshape(2, 4), masks=np.ones((2, 4), bool)
+    )
+    assert len(extract_load_coords(record, tensor)) == 8

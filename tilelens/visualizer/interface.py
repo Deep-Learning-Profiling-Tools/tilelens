@@ -5,7 +5,7 @@ from io import BytesIO
 import zipfile
 from flask import Flask, render_template, jsonify, request, send_file
 from .analysis import analyze_records
-from .draw import get_visualization_data
+from .draw import _dtype_element_size, get_visualization_data
 from ..utils.traceback_utils import read_source_segment
 import os
 import torch
@@ -597,36 +597,6 @@ def _build_highlight_descriptor(coords: np.ndarray) -> dict[str, list[int]] | No
         return None
 
     return {"start": starts, "shape": shape, "stride": stride}
-
-
-def _dtype_element_size(dtype: Any) -> int:
-    """Best-effort dtype element size in bytes."""
-    if isinstance(dtype, str):
-        sizes = {
-            "torch.float32": 4,
-            "float32": 4,
-            "torch.float64": 8,
-            "float64": 8,
-            "torch.int32": 4,
-            "int32": 4,
-            "torch.int64": 8,
-            "int64": 8,
-            "torch.float16": 2,
-            "float16": 2,
-            "torch.bfloat16": 2,
-            "bfloat16": 2,
-            "torch.int8": 1,
-            "int8": 1,
-            "torch.uint8": 1,
-            "uint8": 1,
-            "torch.bool": 1,
-            "bool": 1,
-        }
-        return max(1, int(sizes.get(dtype, 4)))
-    try:
-        return max(1, int(dtype.element_ty.primitive_bitwidth // 8))
-    except Exception:
-        return 4
 
 
 def _get_tensor_source_array(

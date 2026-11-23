@@ -1,7 +1,9 @@
 import functools
 import linecache
 import os
+import site
 import sys
+import sysconfig
 from dataclasses import dataclass
 from types import FrameType
 from collections.abc import Callable
@@ -53,6 +55,48 @@ def _is_framework_frame(frame: FrameType) -> bool:
         return True
     resolved = _realpath(fn)
     return any(resolved.startswith(root) for root in _get_framework_roots())
+
+
+# ---------------------------------------------------------------------------
+# Library-code detection (standard library, installed packages, tilelens)
+# ---------------------------------------------------------------------------
+
+_LIBRARY_ROOTS: tuple[str, ...] | None = None
+
+
+def _get_library_roots() -> tuple[str, ...]:
+    global _LIBRARY_ROOTS
+    if _LIBRARY_ROOTS is None:
+        import tilelens as _tilelens
+
+        # The base interpreter's paths cover include-system-site-packages venvs.
+        base = {"base": sys.base_prefix, "platbase": sys.base_exec_prefix}
+        roots = {
+            _realpath(paths[key])
+            for paths in (sysconfig.get_paths(), sysconfig.get_paths(vars=base))
+            for key in ("stdlib", "platstdlib", "purelib", "platlib")
+            if key in paths
+        }
+        # User site-packages and Debian's dist-packages are outside sysconfig.
+        roots.update(_realpath(path) for path in site.getsitepackages())
+        roots.add(_realpath(site.getusersitepackages()))
+        roots.update(
+            _realpath(path)
+            for path in sys.path
+            if os.path.basename(path) in ("site-packages", "dist-packages")
+        )
+        roots.add(_realpath(os.path.dirname(_tilelens.__file__)))
+        _LIBRARY_ROOTS = tuple(os.path.join(root, "") for root in roots)
+    return _LIBRARY_ROOTS
+
+
+def is_library_path(path: str | None) -> bool:
+    """Return whether path is Python's, an installed package's, or tilelens's."""
+    if path is None or path.startswith("<frozen "):
+        return True
+    if path.startswith("<"):
+        return False
+    return _realpath(path).startswith(_get_library_roots())
 
 
 # ---------------------------------------------------------------------------
