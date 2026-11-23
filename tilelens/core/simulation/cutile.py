@@ -8,6 +8,7 @@ from functools import wraps
 import inspect
 import itertools
 import operator
+import os
 import sys
 import threading
 import types
@@ -2063,10 +2064,43 @@ def _code_names(code):
     return names
 
 
+def _kernel_source_root(fn):
+    """The kernel's top-level package directory, or its file outside a package."""
+    code = getattr(fn, "__code__", None)
+    if code is None or code.co_filename.startswith("<"):
+        return None
+    root = os.path.realpath(code.co_filename)
+    module = (getattr(fn, "__module__", None) or "").partition(".")[0]
+    package_file = getattr(sys.modules.get(module), "__file__", None)
+    # Namespace packages such as cuda have no __init__.py and span distributions.
+    if package_file is None or os.path.basename(package_file) != "__init__.py":
+        return root
+    package_root = os.path.join(os.path.dirname(os.path.realpath(package_file)), "")
+    # Never widen to a package that holds cuda.tile or tilelens itself.
+    if any(
+        os.path.realpath(path).startswith(package_root)
+        for path in (ct.__file__, __file__)
+    ):
+        return root
+    return package_root
+
+
 @contextmanager
 def _execution_scope(fn):
     """Patch referenced aliases and helper globals, then restore them."""
     scope, visited = ExitStack(), set()
+    kernel_root = _kernel_source_root(fn)
+
+    def is_user_path(path):
+        # A kernel installed with its package is user code, like its helpers.
+        if (
+            kernel_root is not None
+            and path is not None
+            and os.path.realpath(path).startswith(kernel_root)
+        ):
+            return True
+        return not is_library_path(path)
+
     originals = {
         id(value): name
         for name, value in _LANG_FUNCTIONS.items()
@@ -2103,7 +2137,7 @@ def _execution_scope(fn):
             return
         visited.add(id(function))
         # Only user code is patched, never Python, installed packages, or tilelens.
-        if is_library_path(function.__code__.co_filename):
+        if not is_user_path(function.__code__.co_filename):
             return
         namespace = function.__globals__
         for name, operation in (
@@ -2122,7 +2156,7 @@ def _execution_scope(fn):
                 value = replacement
             if isinstance(value, types.FunctionType):
                 patch_function(value)
-            elif isinstance(value, types.ModuleType) and not is_library_path(
+            elif isinstance(value, types.ModuleType) and is_user_path(
                 getattr(value, "__file__", None)
             ):
                 for attribute in names:

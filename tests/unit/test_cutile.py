@@ -1,8 +1,10 @@
 """Tests for cuTile values and operations."""
 
 import builtins
+import functools
 import inspect
 import operator
+import os
 
 import numpy as np
 import pytest
@@ -447,6 +449,64 @@ def test_kernel_setup_leaves_library_modules_alone():
     CuTileInterpretedFunction(kernel).run(src, dst)
     np.testing.assert_array_equal(dst, src)
     assert seen["max"] is builtins.max
+
+
+def test_kernel_source_root_never_covers_cutile_or_tilelens():
+    from tilelens.core.simulation.cutile import _kernel_source_root
+
+    def kernel():
+        pass
+
+    # cuda is a namespace package shared with cuda.tile; tilelens is ours.
+    for module in ("cuda.tile_samples", "tilelens.examples"):
+        kernel.__module__ = module
+        assert _kernel_source_root(kernel) == os.path.realpath(__file__)
+    assert _kernel_source_root(functools.partial(kernel)) is None
+
+
+def test_kernel_from_installed_package_is_patched(monkeypatch, tmp_path):
+    import importlib
+    import sys
+
+    from tilelens.utils import traceback_utils
+
+    package = tmp_path / "site-packages" / "installed_kernels"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "helpers.py").write_text(
+        "import cuda.tile as ct\n"
+        "\n"
+        "\n"
+        "@ct.function\n"
+        "def larger(a, b):\n"
+        "    return max(a, b)\n"
+    )
+    (package / "kernels.py").write_text(
+        "import cuda.tile as ct\n"
+        "from cuda.tile import load\n"
+        "\n"
+        "from .helpers import larger\n"
+        "\n"
+        "\n"
+        "def kernel(a, b, out):\n"
+        "    x, y = load(a, (0,), (4,)), load(b, (0,), (4,))\n"
+        "    ct.store(out, (0,), larger(max(x, y), y))\n"
+    )
+    monkeypatch.syspath_prepend(str(package.parent))
+    # Rebuild the cached roots so the fake site-packages counts as a library.
+    monkeypatch.setattr(traceback_utils, "_LIBRARY_ROOTS", None)
+    try:
+        kernels = importlib.import_module("installed_kernels.kernels")
+        assert traceback_utils.is_library_path(kernels.__file__)
+        a = np.array([1.0, 5.0, 2.0, 0.0], dtype=np.float32)
+        b = np.array([3.0, 4.0, 2.0, 1.0], dtype=np.float32)
+        out = np.zeros(4, dtype=np.float32)
+        CuTileInterpretedFunction(kernels.kernel).run(a, b, out)
+        np.testing.assert_array_equal(out, np.maximum(a, b))
+    finally:
+        for name in list(sys.modules):
+            if name.partition(".")[0] == "installed_kernels":
+                del sys.modules[name]
 
 
 def test_approx_rounding_and_flush_to_zero():
