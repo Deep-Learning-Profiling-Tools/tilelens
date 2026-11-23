@@ -286,3 +286,20 @@ def test_is_library_path_separates_user_code():
     assert is_library_path(None)
     assert not is_library_path(__file__)
     assert not is_library_path("<string>")
+    assert is_library_path("<frozen os>")
+
+
+def test_is_library_path_covers_site_directories(monkeypatch, tmp_path):
+    import site
+    import sys
+
+    user_site = tmp_path / "user" / "site-packages"
+    dist_packages = tmp_path / "usr" / "lib" / "python3" / "dist-packages"
+    monkeypatch.setattr(site, "getusersitepackages", lambda: str(user_site))
+    monkeypatch.setattr(sys, "path", [*sys.path, str(dist_packages)])
+    # Rebuild the cached roots; monkeypatch restores them afterwards.
+    monkeypatch.setattr(traceback_utils, "_LIBRARY_ROOTS", None)
+
+    assert is_library_path(str(user_site / "torch" / "__init__.py"))
+    assert is_library_path(str(dist_packages / "numpy" / "__init__.py"))
+    assert not is_library_path(str(tmp_path / "kernels.py"))
