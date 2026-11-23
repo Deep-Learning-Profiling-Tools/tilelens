@@ -89,7 +89,10 @@ def extract_load_coords(record, global_tensor: Tensor) -> list[tuple[float, ...]
     if offsets.shape != masks.shape:
         offsets = np.broadcast_to(offsets, masks.shape)
 
-    element_size = _dtype_element_size(global_tensor.dtype)
+    # Prefer the recorded size; dtype names from other DSLs may be unknown here.
+    element_size = global_tensor.element_size or _dtype_element_size(
+        global_tensor.dtype
+    )
     linear_indices = offsets // element_size
     flat_mask = masks.reshape(-1)
     flat_linear = linear_indices.reshape(-1)
